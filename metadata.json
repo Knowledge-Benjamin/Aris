@@ -1,0 +1,6 @@
+{
+  "name": "Aris Brain Translator",
+  "description": "A 1:1 translation of Aris' cognitive state and actions, powered by his real-time neural core and interactive biological feedback loop.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
