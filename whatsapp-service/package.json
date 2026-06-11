@@ -1,0 +1,29 @@
+{
+  "name": "aris-whatsapp-service",
+  "private": true,
+  "version": "0.1.0",
+  "main": "dist/src/index.js",
+  "scripts": {
+    "dev": "ts-node-dev --respawn --transpile-only src/index.ts",
+    "dev:schedule": "ts-node-dev --respawn --transpile-only src/index.ts schedule",
+    "dev:once": "ts-node --transpile-only src/index.ts once",
+    "dev:clear-auth": "ts-node-dev --respawn --transpile-only src/index.ts clear-auth",
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/src/index.js"
+  },
+  "dependencies": {
+    "@whiskeysockets/baileys": "^7.0.0-rc13",
+    "dotenv": "^16.3.1",
+    "node-cron": "^3.0.2",
+    "pg": "^8.11.0",
+    "postgres-baileys": "^1.0.0",
+    "qrcode-terminal": "^0.12.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.0",
+    "@types/node-cron": "^3.0.11",
+    "@types/qrcode-terminal": "^0.12.2",
+    "ts-node-dev": "^2.0.0",
+    "typescript": "^5.5.4"
+  }
+}
