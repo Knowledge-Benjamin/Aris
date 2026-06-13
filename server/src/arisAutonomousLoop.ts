@@ -237,6 +237,8 @@ export const exampleToolExecutor = {
     switch (tool) {
       case "google_calendar_events":
         return { events: [{ id: "evt_1", summary: "Team sync", start: "2026-06-14T09:00:00Z", end: "2026-06-14T09:30:00Z" }], requested: payload };
+      case "google_calendar_create":
+        return { event: { id: "evt_1", summary: (payload as any).event?.summary || "New Event", start: (payload as any).event?.start, end: (payload as any).event?.end }, requested: payload };
       case "google_gmail_messages":
         return { messages: [{ id: "msg_1", subject: "Pitch deck", from: "sam@example.com", snippet: "Here is the pitch deck..." }], requested: payload };
       case "google_gmail_draft_create":

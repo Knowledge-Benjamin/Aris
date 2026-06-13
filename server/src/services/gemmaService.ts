@@ -70,6 +70,76 @@ function extractTextFromNode(node: any): string {
   return "";
 }
 
+function extractJsonObject(text: string): string | undefined {
+  const start = text.indexOf("{");
+  if (start === -1) {
+    return undefined;
+  }
+
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+
+  for (let i = start; i < text.length; i += 1) {
+    const char = text[i];
+    if (escaped) {
+      escaped = false;
+      continue;
+    }
+    if (char === "\\") {
+      escaped = true;
+      continue;
+    }
+    if (char === '"') {
+      inString = !inString;
+      continue;
+    }
+    if (inString) {
+      continue;
+    }
+    if (char === "{") {
+      depth += 1;
+    } else if (char === "}") {
+      depth -= 1;
+      if (depth === 0) {
+        return text.slice(start, i + 1);
+      }
+    }
+  }
+
+  return undefined;
+}
+
+function extractToolJsonBlock(text: string): string | undefined {
+  let index = 0;
+
+  while (index < text.length) {
+    const braceIndex = text.indexOf("{", index);
+    if (braceIndex === -1) {
+      return undefined;
+    }
+
+    const jsonText = extractJsonObject(text.slice(braceIndex));
+    if (!jsonText) {
+      index = braceIndex + 1;
+      continue;
+    }
+
+    try {
+      const parsed = JSON.parse(jsonText);
+      if (parsed && typeof parsed === "object" && typeof parsed.tool === "string") {
+        return jsonText;
+      }
+    } catch {
+      // ignore invalid JSON
+    }
+
+    index = braceIndex + 1;
+  }
+
+  return undefined;
+}
+
 function cleanReplyText(text: string): string {
   const normalized = text.replace(/\r/g, "");
   const preprocessed = normalized
@@ -77,7 +147,14 @@ function cleanReplyText(text: string): string {
     .replace(/[`"'“”‘’]*RESPONSE_END[`"'“”‘’]*/gi, "RESPONSE_END");
   const markerMatch = preprocessed.match(/RESPONSE_START\s*([\s\S]*?)\s*RESPONSE_END/i);
   if (markerMatch) {
-    return markerMatch[1].trim();
+    const markerText = markerMatch[1].trim();
+    const markerToolJsonBlock = extractToolJsonBlock(markerText);
+    return markerToolJsonBlock ? markerToolJsonBlock.trim() : markerText;
+  }
+
+  const toolJsonBlock = extractToolJsonBlock(preprocessed);
+  if (toolJsonBlock) {
+    return toolJsonBlock.trim();
   }
 
   const lines = preprocessed
@@ -88,7 +165,7 @@ function cleanReplyText(text: string): string {
   const markerLineRegex = /^\*+\s*(?:Response:|Aris:)\s*$/i;
   const finalAnswerRegex = /^(?:["'“‘`\s]*)(?:FINAL ANSWER|ANSWER)\s*:\s*(.*)$/i;
   const toolLineRegex = /^(?:TOOL_SEARCH|SEARCH_TOOL|SEARCH_QUERY)\s*[:=]\s*.+$/i;
-  const toolJsonRegex = /^\{[^\n]*"tool"\s*:\s*"search"[^\n]*\}$/i;
+  const toolJsonRegex = /^(?:Action\s*:\s*)?\{[^\n]*"tool"\s*:\s*"[^"]+"[^\n]*\}$/i;
   const instructionLineRegex = /^(?:\*+\s*)?(?:constraint|constraints|task:|the user:|user asks:|user says:|user:|query:|does the query|if the query|format:|observation:|the instructions|this looks like|the prompt contains|should respond|memory:|memories:|role:|roleplaying:|assistant:|system:|context:|i should|does it require a tool\?|is it a direct answer\?|is it well-organized\?|since i am|maintain the persona|acknowledge the name|sections?\/headings\?|blank lines\?|no tool call\?|no restating question\?|no metadata in visible answer\?|revised plan\*?|sections\*?:|output:|plan:|wait,|yes\.?|no\.?|persona:|constraints:|greeting:|section 1:|section 2:|section 3:|section 4:|section 5:)(?:\s|:|$)/i;
 
   const extractAnswerBlock = (startIndex: number) => {

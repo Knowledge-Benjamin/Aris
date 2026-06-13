@@ -354,7 +354,8 @@ export class ArisService {
         return;
       }
       if (typeof value === "object" && typeof value.tool === "string") {
-        invocations.push({ tool: value.tool.trim(), payload: value });
+        const { tool, ...payload } = value;
+        invocations.push({ tool: tool.trim(), payload });
       }
     };
 
@@ -367,6 +368,14 @@ export class ArisService {
       }
     }
 
+    const fullTextJson = this.parseToolJsonFromLine(normalizedText);
+    if (fullTextJson && typeof fullTextJson.tool === "string") {
+      const { tool, ...payload } = fullTextJson;
+      if (!invocations.some((inv) => inv.tool === tool.trim() && JSON.stringify(inv.payload) === JSON.stringify(payload))) {
+        invocations.push({ tool: tool.trim(), payload });
+      }
+    }
+
     const lines = normalizedText.split(/\r?\n/);
     for (const rawLine of lines) {
       const line = this.normalizeToolLine(rawLine);
@@ -376,8 +385,9 @@ export class ArisService {
 
       const parsedJson = this.parseToolJsonFromLine(line);
       if (parsedJson && typeof parsedJson.tool === "string") {
-        if (!invocations.some((inv) => JSON.stringify(inv.payload) === JSON.stringify(parsedJson))) {
-          invocations.push({ tool: parsedJson.tool.trim(), payload: parsedJson });
+        const { tool, ...payload } = parsedJson;
+        if (!invocations.some((inv) => inv.tool === tool.trim() && JSON.stringify(inv.payload) === JSON.stringify(payload))) {
+          invocations.push({ tool: tool.trim(), payload });
         }
         continue;
       }
@@ -404,14 +414,43 @@ export class ArisService {
       google_calendar_update_event: "google_calendar_update",
       google_calendar_deleteevent: "google_calendar_delete",
       google_calendar_delete_event: "google_calendar_delete",
+      google_calendar_getevents: "google_calendar_events",
+      google_calendar_get_events: "google_calendar_events",
+      google_calendar_getevent: "google_calendar_event",
+      google_calendar_get_event: "google_calendar_event",
       google_calendar_quickadd: "google_calendar_quickAdd",
       google_calendar_quick_add: "google_calendar_quickAdd",
-      google_calendar_get_events: "google_calendar_events",
-      google_calendar_getevents: "google_calendar_events",
+      google_calendar_list: "google_calendar_list_calendar_list",
+      google_calendar_get_calendar_list: "google_calendar_get_calendar_list",
+      google_calendar_get_calendar: "google_calendar_get_calendar",
+      google_calendar_create_calendar: "google_calendar_create_calendar",
+      google_calendar_update_calendar: "google_calendar_update_calendar",
+      google_calendar_patch_calendar: "google_calendar_patch_calendar",
+      google_calendar_delete_calendar: "google_calendar_delete_calendar",
+      google_calendar_clear: "google_calendar_clear_calendar",
       google_gmail_messageget: "google_gmail_message",
       google_gmail_message_get: "google_gmail_message",
+      google_gmail_get_message: "google_gmail_message",
+      google_gmail_getmessage: "google_gmail_message",
+      google_gmail_get: "google_gmail_message",
+      google_gmail_messages_list: "google_gmail_messages",
+      google_gmail_list_messages: "google_gmail_messages",
       google_gmail_threadget: "google_gmail_thread",
       google_gmail_thread_get: "google_gmail_thread",
+      google_gmail_get_thread: "google_gmail_thread",
+      google_gmail_getthread: "google_gmail_thread",
+      google_gmail_draftcreate: "google_gmail_draft_create",
+      google_gmail_draft_create: "google_gmail_draft_create",
+      google_gmail_draftupdate: "google_gmail_draft_update",
+      google_gmail_draft_update: "google_gmail_draft_update",
+      google_gmail_draftsend: "google_gmail_draft_send",
+      google_gmail_draft_send: "google_gmail_draft_send",
+      google_gmail_send_email: "google_gmail_send",
+      google_gmail_sendmessage: "google_gmail_send",
+      google_gmail_find_labels: "google_gmail_label",
+      google_gmail_label_list: "google_gmail_label",
+      google_gmail_settings_get: "google_gmail_settings",
+      google_gmail_settings_update: "google_gmail_settings",
     };
     return aliases[normalized] || toolName.trim();
   }
@@ -444,6 +483,10 @@ export class ArisService {
     };
   }
 
+  private isTerminalTool(toolName: string): boolean {
+    return toolName === "whatsapp_summary";
+  }
+
   private validateToolName(toolName: string): string | undefined {
     const normalized = this.normalizeToolName(toolName);
     if (this.supportedToolNames.has(normalized)) {
@@ -470,8 +513,10 @@ export class ArisService {
         }
         break;
       case "google_calendar_create":
-        if (!payload.event && typeof payload.event !== "object") {
-          return "google_calendar_create requires a top-level \"event\" object.";
+        if (!payload.event || typeof payload.event !== "object") {
+          if (!payload.summary || !payload.start || !payload.end) {
+            return "google_calendar_create requires either a top-level \"event\" object or summary/start/end fields.";
+          }
         }
         break;
       case "google_calendar_update":
@@ -1415,7 +1460,7 @@ export class ArisService {
   }
 
   private parseToolJsonFromLine(line: string): any | undefined {
-    const actionMatch = line.match(/Action\s*:\s*(.*)$/i);
+    const actionMatch = line.match(/Action\s*:\s*([\s\S]*)/i);
     if (!actionMatch || !actionMatch[1]) {
       return this.extractJsonObject(line);
     }
@@ -1566,6 +1611,8 @@ export class ArisService {
       `Continue the chain until the user's request is fully resolved or until you must stop for approval on a destructive action.`,
       `For each step, output a Thought line describing your progress and then a single Action line with one valid JSON tool call.`,
       `If you are finished, output a final response as JSON exactly like this: {"final_answer":"...","memory_entries":[]} .`,
+      `If the previous tool result already satisfies the user's request, do not invoke any further tools.`,
+      `If the most recent tool invocation was {"tool":"whatsapp_summary"}, use the returned summary directly as your final answer unless additional tool data is needed.`,
       `Do not include markdown, code fences, or any extra text outside the expected format.`,
       ``,
       `Recent conversation history:`,
@@ -1643,6 +1690,15 @@ export class ArisService {
         };
       }
 
+      if (this.isTerminalTool(normalizedInvocation.tool)) {
+        const summary = String(result.data?.summary || "").trim();
+        return {
+          status: "finished",
+          reply: summary || "No new WhatsApp messages were received.",
+          memoryEntries: [],
+        };
+      }
+
       prompt = this.buildToolChainPromptFromResults(userMessage, userProfile, memories, conversationHistory, toolResults, includeSearch);
     }
 
@@ -1657,10 +1713,33 @@ export class ArisService {
     const normalizedTool = this.normalizeToolName(invocation.tool);
     const destructiveToolPatterns = [
       /^google_calendar_(create|update|delete|import|move|patch|clear_calendar|delete_calendar|update_acl|delete_acl)$/,
-      /^google_gmail_(send|draft_send|draft_create|draft_update|draft_delete)$/,
+      /^google_gmail_(send|draft_send)$/,
     ];
 
-    return destructiveToolPatterns.some((pattern) => pattern.test(normalizedTool));
+    if (destructiveToolPatterns.some((pattern) => pattern.test(normalizedTool))) {
+      return true;
+    }
+
+    if (normalizedTool === "google_gmail_message") {
+      const action = String(invocation.payload?.action || "").toLowerCase();
+      return [
+        "delete",
+        "trash",
+        "untrash",
+        "modify",
+        "batch_delete",
+        "batch_modify",
+        "import",
+        "insert",
+      ].includes(action);
+    }
+
+    if (normalizedTool === "google_gmail_draft") {
+      const action = String(invocation.payload?.action || "").toLowerCase();
+      return action === "delete";
+    }
+
+    return false;
   }
 
   private rewriteUserMessageForCoreference(userMessage: string, userId: number | undefined, sessionId: string | undefined, conversationHistory: string[]) {

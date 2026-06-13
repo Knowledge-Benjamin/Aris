@@ -19,7 +19,12 @@ if (!databaseUrl) {
 }
 
 const normalizedDataSource = normalizeConnectionString(databaseUrl);
-const pool = new Pool({ connectionString: normalizedDataSource });
+const pool = new Pool({
+  connectionString: normalizedDataSource,
+  max: Number(process.env.PG_POOL_MAX) || 20,
+  idleTimeoutMillis: 60000,
+  connectionTimeoutMillis: Number(process.env.PG_CONNECTION_TIMEOUT_MS) || 15000,
+});
 
 export function getDatabasePool() {
   return pool;

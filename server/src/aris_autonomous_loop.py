@@ -90,7 +90,12 @@ def extract_json_object(text: str) -> Optional[str]:
         elif ch == "}":
             depth -= 1
             if depth == 0:
-                return text[start:i + 1]
+                candidate = text[start:i + 1]
+                try:
+                    json.loads(candidate)
+                    return candidate
+                except json.JSONDecodeError:
+                    continue
     return None
 
 
@@ -128,7 +133,7 @@ def needs_human_approval(tool_call: Dict[str, Any]) -> bool:
         return True
     if tool_name == "google_gmail_message":
         action = str(tool_call["payload"].get("action", "")).lower()
-        return action in {"delete", "trash", "untrash", "modify", "batch_delete", "batch_modify"}
+        return action in {"delete", "trash", "untrash", "modify", "batch_delete", "batch_modify", "import", "insert"}
     if tool_name == "google_gmail_draft":
         action = str(tool_call["payload"].get("action", "")).lower()
         return action == "delete"

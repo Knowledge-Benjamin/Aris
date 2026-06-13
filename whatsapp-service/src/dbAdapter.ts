@@ -60,6 +60,29 @@ export async function getPendingWhatsappMessages(limit = 100) {
   }));
 }
 
+export async function getPendingWhatsappMessagesByRemoteJid(remoteJid: string, limit = 100) {
+  const query = `
+    SELECT id, sender_id, message_id, message_text, whatsapp_timestamp, received_at, is_analyzed, metadata
+    FROM whatsapp_messages
+    WHERE is_analyzed = FALSE
+      AND metadata->>'remoteJid' = $1
+    ORDER BY received_at ASC
+    LIMIT $2
+  `;
+
+  const result = await pool.query(query, [remoteJid, limit]);
+  return result.rows.map((row) => ({
+    id: row.id,
+    senderId: row.sender_id,
+    messageId: row.message_id,
+    messageText: row.message_text,
+    whatsappTimestamp: Number(row.whatsapp_timestamp),
+    receivedAt: row.received_at,
+    isAnalyzed: row.is_analyzed,
+    metadata: row.metadata || undefined,
+  }));
+}
+
 export async function markWhatsappMessagesAnalyzed(ids: number[]) {
   if (!ids.length) {
     return;
