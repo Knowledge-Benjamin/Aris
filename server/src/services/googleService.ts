@@ -22,6 +22,7 @@ const DEFAULT_SCOPES = [
   "https://mail.google.com",
   "https://www.googleapis.com/auth/calendar",
   "https://www.googleapis.com/auth/calendar.events",
+  "https://www.googleapis.com/auth/contacts.readonly",
   "openid",
   "email",
 ];
@@ -1764,4 +1765,107 @@ export class GoogleService {
 
     return response.data;
   }
+
+  // --- People API (Contacts) ---
+
+  /**
+   * Fetches ALL contacts from Google People API with pagination.
+   * Returns a normalized array ready for upsertContacts().
+   */
+  async syncAllContacts(
+    account: GoogleAccountRecord,
+    tokenUpdateHandler?: (tokens: {
+      access_token?: string | null;
+      refresh_token?: string | null;
+      expiry_date?: number | null;
+      scope?: string | null;
+    }) => Promise<void>
+  ): Promise<Array<{
+    resourceName?: string;
+    displayName?: string;
+    givenName?: string;
+    familyName?: string;
+    phoneNumbers?: string[];
+    emailAddresses?: string[];
+  }>> {
+    const authClient = this.buildAuthenticatedClient(account, tokenUpdateHandler);
+    const people = google.people({ version: "v1", auth: authClient });
+
+    const allContacts: Array<{
+      resourceName?: string;
+      displayName?: string;
+      givenName?: string;
+      familyName?: string;
+      phoneNumbers?: string[];
+      emailAddresses?: string[];
+    }> = [];
+
+    let pageToken: string | undefined = undefined;
+
+    do {
+      const response: any = await people.people.connections.list({
+        resourceName: "people/me",
+        pageSize: 1000,
+        personFields: "names,emailAddresses,phoneNumbers",
+        sortOrder: "LAST_MODIFIED_DESCENDING",
+        ...(pageToken ? { pageToken } : {}),
+      });
+
+      const connections = response.data.connections || [];
+      for (const person of connections) {
+        const name = person.names?.[0];
+        const phones = person.phoneNumbers?.map((p: any) => p.canonicalForm || p.value || "").filter(Boolean) || [];
+        const emails = person.emailAddresses?.map((e: any) => e.value || "").filter(Boolean) || [];
+
+        allContacts.push({
+          resourceName: person.resourceName || undefined,
+          displayName: name?.displayName || undefined,
+          givenName: name?.givenName || undefined,
+          familyName: name?.familyName || undefined,
+          phoneNumbers: phones as string[],
+          emailAddresses: emails as string[],
+        });
+      }
+
+      pageToken = response.data.nextPageToken ?? undefined;
+    } while (pageToken);
+
+    return allContacts;
+  }
+
+  /**
+   * Search contacts by query string using Google People API search endpoint.
+   */
+  async searchContactsByQuery(
+    account: GoogleAccountRecord,
+    query?: string,
+    tokenUpdateHandler?: (tokens: {
+      access_token?: string | null;
+      refresh_token?: string | null;
+      expiry_date?: number | null;
+      scope?: string | null;
+    }) => Promise<void>
+  ) {
+    const authClient = this.buildAuthenticatedClient(account, tokenUpdateHandler);
+    const people = google.people({ version: "v1", auth: authClient });
+
+    if (query) {
+      const response = await people.people.searchContacts({
+        query,
+        readMask: "names,emailAddresses,phoneNumbers",
+        pageSize: 10,
+      });
+      return response.data.results?.map(r => r.person) || [];
+    } else {
+      const response = await people.people.connections.list({
+        resourceName: "people/me",
+        pageSize: 30,
+        personFields: "names,emailAddresses,phoneNumbers",
+        sortOrder: "LAST_MODIFIED_DESCENDING",
+      });
+      return response.data.connections || [];
+    }
+  }
 }
+
+export const googleService = new GoogleService();

@@ -191,7 +191,7 @@ export class MemoryStore {
         LIMIT $2
       `;
       const result = await this.pool.query(query, [userId, limit]);
-      return result.rows.map((row) => `${row.role === 'user' ? 'User' : 'Aris'}: ${row.content}`);
+      return result.rows.reverse().map((row) => `${row.role === 'user' ? 'User' : 'Aris'}: ${row.content}`);
     }
 
     if (sessionId) {
@@ -203,7 +203,7 @@ export class MemoryStore {
         LIMIT $2
       `;
       const result = await this.pool.query(query, [sessionId, limit]);
-      return result.rows.map((row) => `${row.role === 'user' ? 'User' : 'Aris'}: ${row.content}`);
+      return result.rows.reverse().map((row) => `${row.role === 'user' ? 'User' : 'Aris'}: ${row.content}`);
     }
 
     return [];

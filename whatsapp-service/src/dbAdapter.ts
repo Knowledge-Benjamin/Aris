@@ -97,3 +97,14 @@ export async function markWhatsappMessagesAnalyzed(ids: number[]) {
 
   await pool.query(query, [ids]);
 }
+
+/**
+ * Upsert a WhatsApp group's subject/name so we can resolve @g.us JIDs.
+ */
+export async function saveWhatsappGroup(jid: string, subject: string) {
+  await pool.query(`
+    INSERT INTO whatsapp_groups (jid, subject, updated_at)
+    VALUES ($1, $2, NOW())
+    ON CONFLICT (jid) DO UPDATE SET subject = EXCLUDED.subject, updated_at = NOW()
+  `, [jid, subject]);
+}

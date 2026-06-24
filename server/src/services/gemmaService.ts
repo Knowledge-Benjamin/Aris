@@ -8,6 +8,10 @@ const apiKey = process.env.GEMMA_API_KEY;
 const apiUrl = process.env.GEMMA_API_URL;
 const model = process.env.GEMMA_MODEL || "gemma-4-26b-a4b-it";
 
+// Raised from 1400 to 3000 to prevent truncation of long Gmail threads,
+// calendar listings, and multi-step tool chain responses.
+const MAX_OUTPUT_TOKENS = 3000;
+
 function buildGemmaUrl() {
   if (!apiUrl) {
     return "";
@@ -71,7 +75,12 @@ function extractTextFromNode(node: any): string {
 }
 
 function extractJsonObject(text: string): string | undefined {
-  const start = text.indexOf("{");
+  const startBrace = text.indexOf("{");
+  const startBracket = text.indexOf("[");
+  let start = startBrace;
+  if (startBracket !== -1 && (startBrace === -1 || startBracket < startBrace)) {
+    start = startBracket;
+  }
   if (start === -1) {
     return undefined;
   }
@@ -79,6 +88,8 @@ function extractJsonObject(text: string): string | undefined {
   let depth = 0;
   let inString = false;
   let escaped = false;
+  const openChar = text[start];
+  const closeChar = openChar === "{" ? "}" : "]";
 
   for (let i = start; i < text.length; i += 1) {
     const char = text[i];
@@ -97,9 +108,9 @@ function extractJsonObject(text: string): string | undefined {
     if (inString) {
       continue;
     }
-    if (char === "{") {
+    if (char === openChar) {
       depth += 1;
-    } else if (char === "}") {
+    } else if (char === closeChar) {
       depth -= 1;
       if (depth === 0) {
         return text.slice(start, i + 1);
@@ -115,26 +126,36 @@ function extractToolJsonBlock(text: string): string | undefined {
 
   while (index < text.length) {
     const braceIndex = text.indexOf("{", index);
-    if (braceIndex === -1) {
+    const bracketIndex = text.indexOf("[", index);
+    let startIndex = braceIndex;
+    if (bracketIndex !== -1 && (braceIndex === -1 || bracketIndex < braceIndex)) {
+      startIndex = bracketIndex;
+    }
+
+    if (startIndex === -1) {
       return undefined;
     }
 
-    const jsonText = extractJsonObject(text.slice(braceIndex));
+    const jsonText = extractJsonObject(text.slice(startIndex));
     if (!jsonText) {
-      index = braceIndex + 1;
+      index = startIndex + 1;
       continue;
     }
 
     try {
       const parsed = JSON.parse(jsonText);
-      if (parsed && typeof parsed === "object" && typeof parsed.tool === "string") {
+      if (Array.isArray(parsed)) {
+        if (parsed.some((item) => typeof item === "object" && typeof item.tool === "string")) {
+          return jsonText;
+        }
+      } else if (parsed && typeof parsed === "object" && typeof parsed.tool === "string") {
         return jsonText;
       }
     } catch {
       // ignore invalid JSON
     }
 
-    index = braceIndex + 1;
+    index = startIndex + 1;
   }
 
   return undefined;
@@ -143,8 +164,8 @@ function extractToolJsonBlock(text: string): string | undefined {
 function cleanReplyText(text: string): string {
   const normalized = text.replace(/\r/g, "");
   const preprocessed = normalized
-    .replace(/[`"'“”‘’]*RESPONSE_START[`"'“”‘’]*/gi, "RESPONSE_START")
-    .replace(/[`"'“”‘’]*RESPONSE_END[`"'“”‘’]*/gi, "RESPONSE_END");
+    .replace(/[`"'""'']*RESPONSE_START[`"'""'']*/gi, "RESPONSE_START")
+    .replace(/[`"'""'']*RESPONSE_END[`"'""'']*/gi, "RESPONSE_END");
   const markerMatch = preprocessed.match(/RESPONSE_START\s*([\s\S]*?)\s*RESPONSE_END/i);
   if (markerMatch) {
     const markerText = markerMatch[1].trim();
@@ -163,7 +184,7 @@ function cleanReplyText(text: string): string {
     .filter(Boolean);
 
   const markerLineRegex = /^\*+\s*(?:Response:|Aris:)\s*$/i;
-  const finalAnswerRegex = /^(?:["'“‘`\s]*)(?:FINAL ANSWER|ANSWER)\s*:\s*(.*)$/i;
+  const finalAnswerRegex = /^(?:["'"'`\s]*)(?:FINAL ANSWER|ANSWER)\s*:\s*(.*)$/i;
   const toolLineRegex = /^(?:TOOL_SEARCH|SEARCH_TOOL|SEARCH_QUERY)\s*[:=]\s*.+$/i;
   const toolJsonRegex = /^(?:Action\s*:\s*)?\{[^\n]*"tool"\s*:\s*"[^"]+"[^\n]*\}$/i;
   const instructionLineRegex = /^(?:\*+\s*)?(?:constraint|constraints|task:|the user:|user asks:|user says:|user:|query:|does the query|if the query|format:|observation:|the instructions|this looks like|the prompt contains|should respond|memory:|memories:|role:|roleplaying:|assistant:|system:|context:|i should|does it require a tool\?|is it a direct answer\?|is it well-organized\?|since i am|maintain the persona|acknowledge the name|sections?\/headings\?|blank lines\?|no tool call\?|no restating question\?|no metadata in visible answer\?|revised plan\*?|sections\*?:|output:|plan:|wait,|yes\.?|no\.?|persona:|constraints:|greeting:|section 1:|section 2:|section 3:|section 4:|section 5:)(?:\s|:|$)/i;
@@ -204,7 +225,7 @@ function cleanReplyText(text: string): string {
   const finalAnswerIndex = strippedLines.findIndex((line) => finalAnswerRegex.test(line));
   if (finalAnswerIndex >= 0) {
     const match = strippedLines[finalAnswerIndex].match(finalAnswerRegex);
-    const firstLine = (match?.[1] || "").replace(/^['"“‘]+|['"”’]+$/g, "").trim();
+    const firstLine = (match?.[1] || "").replace(/^['\""']+|['\""']+$/g, "").trim();
     const rest = extractAnswerBlock(finalAnswerIndex + 1);
     if (firstLine && rest) {
       return `${firstLine}\n${rest}`.trim();
@@ -221,11 +242,7 @@ function cleanReplyText(text: string): string {
     if (markerLineRegex.test(strippedLines[i])) {
       const rest = strippedLines.slice(i + 1).filter((line) => !isInstructionLine(line));
       if (rest.length) {
-        const quoteLine = rest.slice().reverse().find((line) => /^['"“‘].+['"”’]$/.test(line));
-        if (quoteLine) {
-          return quoteLine.replace(/^['"“‘]+|['"”’]+$/g, "").trim();
-        }
-        return rest.join("\n").replace(/^['"“‘]+|['"”’]+$/g, "").trim();
+        return rest.join("\n").replace(/^['\""']+|['\""']+$/g, "").trim();
       }
       return "";
     }
@@ -233,16 +250,12 @@ function cleanReplyText(text: string): string {
 
   const toolLines = strippedLines.filter((line) => toolLineRegex.test(line) || toolJsonRegex.test(line));
   if (toolLines.length) {
-    return toolLines[0].replace(/^['"“‘]+|['"”’]+$/g, "").trim();
+    return toolLines[0].replace(/^['\""']+|['\""']+$/g, "").trim();
   }
 
   const candidateLines = strippedLines.filter((line) => !isInstructionLine(line));
   if (candidateLines.length) {
-    const quoteLine = candidateLines.slice().reverse().find((line) => /^['"“‘].+['"”’]$/.test(line));
-    if (quoteLine) {
-      return quoteLine.replace(/^['"“‘]+|['"”’]+$/g, "").trim();
-    }
-    return candidateLines.join("\n").replace(/^['"“‘]+|['"”’]+$/g, "").trim();
+    return candidateLines.join("\n").replace(/^['\""']+|['\""']+$/g, "").trim();
   }
 
   return "";
@@ -252,7 +265,7 @@ function isPlaceholderFinalAnswer(text: string): boolean {
   if (!text || !text.trim()) {
     return true;
   }
-  const normalized = text.trim().replace(/^['"“”‘’]+|['"“”‘’]+$/g, "").trim().toLowerCase();
+  const normalized = text.trim().replace(/^['\"""'']+|['\"""'']+$/g, "").trim().toLowerCase();
   if (/^\.{1,3}$/.test(normalized)) {
     return true;
   }
@@ -353,8 +366,8 @@ function extractPseudoJsonFromText(text: string): { final_answer: string; memory
 
   const normalized = text
     .replace(/\r/g, "")
-    .replace(/[‘’]/g, "'")
-    .replace(/[“”]/g, '"')
+    .replace(/['']/g, "'")
+    .replace(/[""]/g, '"')
     .replace(/`/g, "")
     .trim();
 
@@ -430,7 +443,7 @@ function parsePseudoMemoryEntries(lines: string[]): string[] {
       }
     }
 
-    const joined = arrayLines.join(" ").replace(/([\"'])\s*,\s*([\"'])/g, "$1,$2");
+    const joined = arrayLines.join(" ").replace(/(["'])\s*,\s*(["'])/g, "$1,$2");
     try {
       const parsed = JSON.parse(joined);
       if (Array.isArray(parsed)) {
@@ -454,7 +467,7 @@ function parsePseudoMemoryEntries(lines: string[]): string[] {
     if (/^[A-Za-z_]+\s*:\s*/.test(normalizedLine)) {
       break;
     }
-    const entry = normalizedLine.replace(/[`"'“”’]+$/, "").trim();
+    const entry = normalizedLine.replace(/[`"'""']+$/, "").trim();
     if (entry) {
       entries.push(entry);
     }
@@ -532,7 +545,7 @@ function extractMemoryEntriesFromText(text: string): string[] {
       if (/^(?:FINAL ANSWER|ANSWER)\s*:/i.test(rawLine)) {
         break;
       }
-      const entry = rawLine.replace(/^[`"'“‘\-\*\s>]+/, "").replace(/[`"'”’]+$/, "").trim();
+      const entry = rawLine.replace(/^[`"'"'\-\*\s>]+/, "").replace(/[`"'"']+$/, "").trim();
       if (entry) {
         entries.push(entry);
       }
@@ -558,7 +571,7 @@ function extractMemoryEntriesFromText(text: string): string[] {
         // ignore invalid JSON
       }
     } else {
-      return [inlineValue.replace(/^[`"'“‘]+|[`"'”’]+$/g, "").trim()].filter(Boolean);
+      return [inlineValue.replace(/^[`"'"']+|[`"'"']+$/g, "").trim()].filter(Boolean);
     }
   }
 
@@ -568,6 +581,7 @@ function extractMemoryEntriesFromText(text: string): string[] {
 export interface ArisAdviceResponse {
   reply: string;
   memoryEntries: string[];
+  isFinalAnswer: boolean;
 }
 
 export class GemmaService {
@@ -576,6 +590,7 @@ export class GemmaService {
       return {
         reply: "[Aris advisor unavailable: missing Gemma API config.]",
         memoryEntries: [],
+        isFinalAnswer: false,
       };
     }
 
@@ -592,7 +607,7 @@ export class GemmaService {
         },
       ],
       generationConfig: {
-        maxOutputTokens: 1400,
+        maxOutputTokens: MAX_OUTPUT_TOKENS,
         temperature: 0,
       },
     };
@@ -617,20 +632,42 @@ export class GemmaService {
       info(`[gemma] request succeeded status=${response.status} statusText=${response.statusText}`);
       info(`[gemma] response keys=${Object.keys(response.data || {}).join(",")}`);
     } catch (requestError: any) {
-      error("[gemma] request failed", {
+      error("[gemma] request failed, attempting fallback to Gemini 3.5 Flash", {
         url,
         method: requestError.config?.method,
         status: requestError.response?.status,
         statusText: requestError.response?.statusText,
-        headers: requestError.response?.headers,
-        body: requestError.response?.data,
         message: requestError.message,
-        requestPayloadPreview: JSON.stringify(requestPayload).slice(0, 1000),
       });
-      return {
-        reply: "[Aris advisor unavailable: failed to contact Gemma API.]",
-        memoryEntries: [],
-      };
+
+      try {
+        const fallbackModel = "gemini-3.5-flash";
+        const fallbackUrl = apiUrl.replace(/\/+$/, "") + `/models/${encodeURIComponent(fallbackModel)}:generateContent`;
+        info(`[gemma] sending fallback request to ${fallbackUrl}`);
+        
+        response = await axios.post(
+          fallbackUrl,
+          requestPayload,
+          {
+            headers: {
+              "x-goog-api-key": apiKey,
+              "Content-Type": "application/json",
+            },
+          }
+        );
+
+        info(`[gemma] fallback request succeeded status=${response.status}`);
+      } catch (fallbackError: any) {
+        error("[gemma] fallback request also failed", {
+          status: fallbackError.response?.status,
+          message: fallbackError.message,
+        });
+        return {
+          reply: "I'm experiencing a bit of a technical hiccup connecting to my brain right now! It seems the upstream servers are taking a little nap. Could we try that again in a few minutes?",
+          memoryEntries: [],
+          isFinalAnswer: false,
+        };
+      }
     }
 
     const rawText = extractTextFromNode(response.data);
@@ -645,10 +682,12 @@ export class GemmaService {
     const jsonResponse = extractJsonFromText(cleanedText) || extractPseudoJsonFromText(cleanedText);
     let generated: string;
     let memoryEntries: string[];
+    let isFinalAnswer = false;
 
     if (jsonResponse) {
       generated = jsonResponse.final_answer;
       memoryEntries = jsonResponse.memory_entries;
+      isFinalAnswer = true;
       info("[gemma] parsed JSON response.");
     } else {
       memoryEntries = extractMemoryEntriesFromText(cleanedText);
@@ -663,6 +702,7 @@ export class GemmaService {
     return {
       reply: generated || "[Aris advisor returned no response.]",
       memoryEntries,
+      isFinalAnswer,
     };
   }
 }

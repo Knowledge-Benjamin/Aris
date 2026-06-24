@@ -8,6 +8,18 @@ const ttsLanguageCode = process.env.VOICE_LANGUAGE_CODE || "en-US";
 const ttsVoiceName = process.env.VOICE_TTS_VOICE || "en-US-Wavenet-D";
 const ttsAudioEncoding = process.env.VOICE_TTS_AUDIO_ENCODING || "MP3";
 
+/**
+ * Build Google API auth headers.
+ * The API key is sent in the `x-goog-api-key` header rather than a URL query
+ * parameter so it does not appear in server logs or proxy access logs.
+ */
+function buildGoogleAuthHeaders(apiKey: string): Record<string, string> {
+  return {
+    "Content-Type": "application/json",
+    "x-goog-api-key": apiKey,
+  };
+}
+
 function getWavAudioMetadata(audioBase64: string) {
   try {
     const buffer = Buffer.from(audioBase64, "base64");
@@ -149,10 +161,8 @@ export class VoiceService {
     info(`[voice] final STT config ${JSON.stringify(config)}`);
     try {
       info(`[voice] transcribing audio with mimeType=${mimeType} base64Length=${audioBase64.length}`);
-      const response = await axios.post(`${sttUrl}?key=${encodeURIComponent(voiceApiKey)}`, requestBody, {
-        headers: {
-          "Content-Type": "application/json",
-        },
+      const response = await axios.post(sttUrl, requestBody, {
+        headers: buildGoogleAuthHeaders(voiceApiKey),
       });
 
       const results = response.data?.results;
@@ -199,10 +209,8 @@ export class VoiceService {
 
     try {
       info(`[voice] synthesizing speech with voice=${ttsVoiceName} audioEncoding=${encoding}`);
-      const response = await axios.post(`${ttsUrl}?key=${encodeURIComponent(voiceApiKey)}`, requestBody, {
-        headers: {
-          "Content-Type": "application/json",
-        },
+      const response = await axios.post(ttsUrl, requestBody, {
+        headers: buildGoogleAuthHeaders(voiceApiKey),
       });
 
       const audioContent = response.data?.audioContent;

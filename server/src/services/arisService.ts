@@ -1,4 +1,5 @@
 import { MemoryStore, UserProfileEntry } from "../db/memoryStore";
+import { ContextStore } from "../db/contextStore";
 import { getDatabasePool } from "../db/db";
 import { GoogleAccountStore } from "../db/googleAccountStore";
 import { GemmaService } from "./gemmaService";
@@ -7,7 +8,12 @@ import { ExtractClient, ExtractResponse } from "./extractClient";
 import { GoogleService } from "./googleService";
 import { WhatsappService } from "./whatsappService";
 import { TomTomService } from "./tomtomService";
+import { upsertContacts, getContactCount, searchContacts as searchContactsDb, getAllContacts, resolveNameToPhones, updateContactProfileSummary } from "../db/contactsStore";
 import { info } from "../utils/logger";
+import { LocationService } from "./locationService";
+import { WeatherService } from "./weatherService";
+import { SunbirdService } from "./sunbirdService";
+import { NewsService } from "./newsService";
 
 const searchToolEnabled = process.env.SEARCH_TOOL_ENABLED?.trim().toLowerCase() !== "false" &&
   process.env.SEARCH_TOOL_ENABLED?.trim() !== "0";
@@ -18,6 +24,7 @@ interface ChatInput {
   message: string;
   sessionId?: string;
   userId?: number;
+  approvedAction?: ToolInvocation;
 }
 
 interface ToolInvocation {
@@ -42,6 +49,8 @@ interface ToolChainResult {
 interface ArisResponse {
   arisReply: string;
   memoryUpdates: string[];
+  status?: "finished" | "awaiting_approval" | "max_iterations_reached" | "error";
+  pendingAction?: ToolInvocation;
 }
 
 export class ArisService {
@@ -50,19 +59,33 @@ export class ArisService {
   private googleService = new GoogleService();
   private googleAccountStore = new GoogleAccountStore(getDatabasePool());
   private whatsappService = new WhatsappService(new GemmaService());
+
   private tomtomService = new TomTomService();
-  private recentGmailMessagesByUser = new Map<string, Array<{ id: string; subject: string; from: string; date?: string }>>();
-  private lastToolInvocationByUser = new Map<string, { tool: string; payload: any }>();
+  private locationService = new LocationService();
+  private weatherService = new WeatherService();
+  private sunbirdService = new SunbirdService();
+  private newsService = new NewsService();
   private readonly supportedToolNames = new Set<string>([
     "search",
     "whatsapp_summary",
+    "whatsapp_conversation",
+    "whatsapp_history",
+
     "tomtom_route",
     "tomtom_flow",
     "tomtom_incidents",
     "tomtom_traffic",
+    "weather_geocoding",
+    "weather_forecast",
+    "weather_historical",
+    "weather_air_quality",
+    "weather_marine",
+    "location_ip_details",
+    "fetch_news",
     "google_calendar_events",
     "google_calendar_event",
     "google_calendar_create",
+    "google_calendar_batch_create",
     "google_calendar_update",
     "google_calendar_delete",
     "google_calendar_import",
@@ -112,9 +135,17 @@ export class ArisService {
     "google_gmail_watch",
     "google_gmail_attachment",
     "google_gmail_user_profile",
+    "google_contacts_search",
+    "google_contacts_sync",
+    "contact_add_note",
+    "sunbird_translate",
   ]);
 
-  constructor(private memoryStore: MemoryStore, private gemmaService: GemmaService) {}
+  constructor(
+    private memoryStore: MemoryStore,
+    private contextStore: ContextStore,
+    private gemmaService: GemmaService
+  ) {}
 
   private getContextKey(userId: number | undefined, sessionId: string | undefined) {
     if (userId !== undefined && userId !== null) {
@@ -123,24 +154,68 @@ export class ArisService {
     return sessionId ? `session:${sessionId}` : "unknown";
   }
 
-  private recordRecentGmailMessages(userId: number | undefined, sessionId: string | undefined, messages: Array<{ id: string; subject: string; from: string; date?: string }>) {
+  private async recordRecentGmailMessages(userId: number | undefined, sessionId: string | undefined, messages: Array<{ id: string; subject: string; from: string; date?: string }>) {
     const key = this.getContextKey(userId, sessionId);
-    this.recentGmailMessagesByUser.set(key, messages);
+    await this.contextStore.setRecentGmailMessages(key, messages);
   }
 
   private getRecentGmailMessages(userId: number | undefined, sessionId: string | undefined) {
     const key = this.getContextKey(userId, sessionId);
-    return this.recentGmailMessagesByUser.get(key) || [];
+    return this.contextStore.getRecentGmailMessages(key);
   }
 
-  private recordLastToolInvocation(userId: number | undefined, sessionId: string | undefined, invocation: { tool: string; payload: any }) {
+  private async recordLastToolInvocation(userId: number | undefined, sessionId: string | undefined, invocation: { tool: string; payload: any }) {
     const key = this.getContextKey(userId, sessionId);
-    this.lastToolInvocationByUser.set(key, invocation);
+    await this.contextStore.setLastToolInvocation(key, invocation);
   }
 
   private getLastToolInvocation(userId: number | undefined, sessionId: string | undefined) {
     const key = this.getContextKey(userId, sessionId);
-    return this.lastToolInvocationByUser.get(key);
+    return this.contextStore.getLastToolInvocation(key);
+  }
+
+  /**
+   * Sync contacts from Google People API into the local DB.
+   * Runs automatically in the background on first chat if contacts table is empty.
+   * Can also be triggered explicitly via the google_contacts_sync tool.
+   */
+  private syncContactsLock = new Set<number>();
+  async ensureContactsSynced(userId: number, force = false): Promise<{ synced: number; skipped: boolean }> {
+    // Debounce: only one sync per user at a time
+    if (this.syncContactsLock.has(userId)) {
+      return { synced: 0, skipped: true };
+    }
+
+    if (!force) {
+      const count = await getContactCount(userId).catch(() => -1);
+      if (count > 0) {
+        return { synced: 0, skipped: true }; // already have contacts
+      }
+    }
+
+    this.syncContactsLock.add(userId);
+    try {
+      const account = await this.googleAccountStore.getGoogleAccount(userId);
+      if (!account) return { synced: 0, skipped: true };
+
+      const persistTokens = async (tokens: any) => {
+        await this.googleAccountStore.updateGoogleTokens(
+          userId,
+          tokens.access_token,
+          tokens.refresh_token,
+          tokens.expiry_date,
+          tokens.scope
+        );
+      };
+
+      info(`[arisService] Syncing contacts for userId=${userId}...`);
+      const contacts = await this.googleService.syncAllContacts(account, persistTokens);
+      const synced = await upsertContacts(userId, contacts);
+      info(`[arisService] Contacts sync complete: ${synced} contacts upserted for userId=${userId}`);
+      return { synced, skipped: false };
+    } finally {
+      this.syncContactsLock.delete(userId);
+    }
   }
 
   async generateWelcomeMessage(userId: number, sessionId?: string): Promise<string> {
@@ -175,9 +250,18 @@ export class ArisService {
     return generated.reply.trim() || fallback;
   }
 
-  async handleChat(input: ChatInput): Promise<ArisResponse> {
+  async handleChat(input: ChatInput, onProgress?: (msg: string) => void): Promise<ArisResponse> {
     const sessionId = input.sessionId || "default";
     info(`[arisService] handleChat start sessionId=${sessionId} query="${input.message}" searchToolEnabled=${searchToolEnabled}`);
+
+    await this.contextStore.warmCache(this.getContextKey(input.userId, sessionId));
+
+    // Auto-sync contacts on first use (when table is empty for this user)
+    if (input.userId) {
+      this.ensureContactsSynced(input.userId).catch(err =>
+        console.error("[arisService] Background contacts sync failed:", err)
+      );
+    }
 
     const saveUserMessagePromise = this.memoryStore.saveConversationMessage({
       userId: input.userId,
@@ -196,13 +280,40 @@ export class ArisService {
       this.memoryStore.storeMemoryEntry(input.userId, sessionId, entry)
     );
 
-    const userProfilePromise = input.userId ? this.memoryStore.getUserProfile(input.userId) : Promise.resolve([] as UserProfileEntry[]);
-    const conversationHistoryPromise = this.memoryStore.getRecentConversationHistory(input.userId, sessionId, 12);
+    const userProfilePromise = input.userId 
+      ? this.memoryStore.getUserProfile(input.userId).catch(err => {
+          console.error("[arisService] Failed to load user profile:", err);
+          return [] as UserProfileEntry[];
+        }) 
+      : Promise.resolve([] as UserProfileEntry[]);
+      
+    // Optimization: If the user just says "hey", "hi", "thanks", we don't need 12 messages of history.
+    // This dramatically shrinks the payload size to the LLM and speeds up inference.
+    const isShortConversational = /^(hey|hi|hello|thanks|thank you|ok|okay|cool|got it)[\s\p{P}]*$/iu.test(input.message.trim());
+    const historyLimit = isShortConversational ? 2 : 12;
+    
+    const conversationHistoryPromise = this.memoryStore.getRecentConversationHistory(input.userId, sessionId, historyLimit).catch(err => {
+      console.error("[arisService] Failed to load conversation history:", err);
+      return [] as string[];
+    });
 
     const [userProfile, conversationHistory] = await Promise.all([userProfilePromise, conversationHistoryPromise]);
     const effectiveMessage = this.rewriteUserMessageForCoreference(input.message, input.userId, sessionId, conversationHistory);
-    const memoryContext = await this.memoryStore.getRelevantMemories(input.userId, sessionId, effectiveMessage, 12);
-    await Promise.all([saveUserMessagePromise, ...profileSavePromises, ...directMemorySavePromises]);
+    
+    // Similarly, don't fetch heavy semantic memories for basic greetings
+    let memoryContext: string[] = [];
+    if (!isShortConversational) {
+      try {
+        memoryContext = await this.memoryStore.getRelevantMemories(input.userId, sessionId, effectiveMessage, 12);
+      } catch (err) {
+        console.error("[arisService] Failed to load relevant memories:", err);
+      }
+    }
+      
+    // Catch initial save errors so they don't block the chain
+    Promise.all([saveUserMessagePromise, ...profileSavePromises, ...directMemorySavePromises]).catch(err => {
+      console.error("[arisService] Background save failed for user message:", err);
+    });
 
     const toolChainResult = await this.executeToolChain(
       input.userId,
@@ -211,7 +322,9 @@ export class ArisService {
       memoryContext,
       conversationHistory,
       sessionId,
-      searchToolEnabled
+      searchToolEnabled,
+      onProgress,
+      input.approvedAction
     );
 
     let arisReply = toolChainResult.reply;
@@ -236,11 +349,17 @@ export class ArisService {
       this.memoryStore.storeMemoryEntry(input.userId, sessionId, entry)
     );
 
-    await Promise.all([saveArisReplyPromise, ...memoryStorePromises]);
+    // Fire-and-forget saving to the database to prevent database timeouts 
+    // from crashing the chat response stream
+    Promise.all([saveArisReplyPromise, ...memoryStorePromises]).catch(err => {
+      console.error("[arisService] Background save failed for chat reply/memories:", err);
+    });
 
     return {
       arisReply,
       memoryUpdates: memoryEntries,
+      status: toolChainResult.status,
+      pendingAction: toolChainResult.pendingAction,
     };
   }
 
@@ -251,7 +370,7 @@ export class ArisService {
       [/(?:my pronouns are|pronouns:?\s*)(he\/him|she\/her|they\/them|any|xe|ze|hir)/i, (m) => `User's pronouns are ${m[1].trim().toLowerCase()}`],
       [/(?:i prefer|i'd prefer|i like|i love|i enjoy)\s+(.+?)(?:[.!?]|$)/i, (m) => `User prefers ${m[1].trim()}`],
       [/(?:i am|i'm|i'm a|i am a|i am an)\s+(.+?)(?:[.!?]|$)/i, (m) => {
-        const value = m[2].trim();
+        const value = m[1].trim();
         if (/\b(name|sure|okay|yes|no)\b/i.test(value)) {
           return "";
         }
@@ -280,7 +399,7 @@ export class ArisService {
       [/(?:my pronouns are|pronouns:?\s*)(he\/him|she\/her|they\/them|any|xe|ze|hir)/i, (m) => ({ key: "pronouns", value: m[1].trim().toLowerCase() })],
       [/(?:i prefer|i'd prefer|i like|i love|i enjoy)\s+(.+?)(?:[.!?]|$)/i, (m) => ({ key: "preference", value: m[1].trim() })],
       [/(?:i am|i'm|i'm a|i am a|i am an)\s+(.+?)(?:[.!?]|$)/i, (m) => {
-        const value = m[2].trim();
+        const value = m[1].trim();
         if (/\b(name|sure|okay|yes|no)\b/i.test(value)) {
           return { key: "", value: "" };
         }
@@ -410,6 +529,8 @@ export class ArisService {
     const aliases: Record<string, string> = {
       google_calendar_createevent: "google_calendar_create",
       google_calendar_create_event: "google_calendar_create",
+      google_calendar_batch_create_events: "google_calendar_batch_create",
+      google_calendar_create_events: "google_calendar_batch_create",
       google_calendar_updateevent: "google_calendar_update",
       google_calendar_update_event: "google_calendar_update",
       google_calendar_deleteevent: "google_calendar_delete",
@@ -461,6 +582,8 @@ export class ArisService {
     }
 
     const flattened = { ...payload };
+
+    // Flatten nested 'payload' or 'arguments' wrappers the model sometimes emits
     if (typeof flattened.payload === "object" && flattened.payload !== null) {
       const nested = flattened.payload;
       delete flattened.payload;
@@ -471,6 +594,51 @@ export class ArisService {
       const nested = flattened.arguments;
       delete flattened.arguments;
       Object.assign(flattened, nested);
+    }
+
+    // Normalize common field aliases so handlers always see canonical names
+    // 'id' -> 'messageId' for Gmail message fetching
+    if (flattened.id !== undefined && flattened.messageId === undefined) {
+      flattened.messageId = flattened.id;
+      delete flattened.id;
+    }
+    // 'message_id' alias
+    if (flattened.message_id !== undefined && flattened.messageId === undefined) {
+      flattened.messageId = flattened.message_id;
+      delete flattened.message_id;
+    }
+    // 'event_id' alias
+    if (flattened.event_id !== undefined && flattened.eventId === undefined) {
+      flattened.eventId = flattened.event_id;
+      delete flattened.event_id;
+    }
+    // 'thread_id' alias
+    if (flattened.thread_id !== undefined && flattened.threadId === undefined) {
+      flattened.threadId = flattened.thread_id;
+      delete flattened.thread_id;
+    }
+    // 'draft_id' alias
+    if (flattened.draft_id !== undefined && flattened.draftId === undefined) {
+      flattened.draftId = flattened.draft_id;
+      delete flattened.draft_id;
+    }
+
+    // Normalize snake_case calendar field aliases
+    if (flattened.time_min !== undefined && flattened.timeMin === undefined) {
+      flattened.timeMin = flattened.time_min;
+      delete flattened.time_min;
+    }
+    if (flattened.time_max !== undefined && flattened.timeMax === undefined) {
+      flattened.timeMax = flattened.time_max;
+      delete flattened.time_max;
+    }
+    if (flattened.calendar_id !== undefined && flattened.calendarId === undefined) {
+      flattened.calendarId = flattened.calendar_id;
+      delete flattened.calendar_id;
+    }
+    if (flattened.max_results !== undefined && flattened.maxResults === undefined) {
+      flattened.maxResults = flattened.max_results;
+      delete flattened.max_results;
     }
 
     return flattened;
@@ -484,7 +652,7 @@ export class ArisService {
   }
 
   private isTerminalTool(toolName: string): boolean {
-    return toolName === "whatsapp_summary";
+    return false;
   }
 
   private validateToolName(toolName: string): string | undefined {
@@ -507,6 +675,11 @@ export class ArisService {
     }
 
     switch (toolName) {
+      case "fetch_news":
+        if (payload.topic && typeof payload.topic !== "string") {
+          return "fetch_news requires an optional 'topic' string.";
+        }
+        break;
       case "google_calendar_quickAdd":
         if (!payload.text || typeof payload.text !== "string" || !payload.text.trim()) {
           return "google_calendar_quickAdd requires a top-level \"text\" field with the event description.";
@@ -558,6 +731,21 @@ export class ArisService {
       };
     }
 
+    if (toolName === "fetch_news") {
+      try {
+        const topic = invocation.payload?.topic;
+        const limit = invocation.payload?.limit || 5;
+        const newsData = await this.newsService.getTopNews(topic, limit);
+        return {
+          success: true,
+          tool: toolName,
+          data: newsData,
+        };
+      } catch (e: any) {
+        return { success: false, tool: toolName, error: e.message };
+      }
+    }
+
     if (toolName === "search") {
       if (!searchToolEnabled) {
         return { success: false, tool: toolName, error: "Search tool is disabled." };
@@ -590,7 +778,7 @@ export class ArisService {
 
     if (toolName === "whatsapp_summary") {
       try {
-        const data = await this.whatsappService.summarizePendingMessages();
+        const data = await this.whatsappService.summarizePendingMessages(userId);
         const result = { success: true, tool: toolName, data };
         this.recordLastToolInvocation(userId, sessionId, invocation);
         return result;
@@ -598,6 +786,40 @@ export class ArisService {
         return { success: false, tool: toolName, error: err?.message || "WhatsApp summary execution failed." };
       }
     }
+
+    if (toolName === "whatsapp_conversation") {
+      try {
+        if (!userId) return { success: false, tool: toolName, error: "User not authenticated." };
+        const contactName = invocation.payload?.contact || invocation.payload?.name || invocation.payload?.from || "";
+        if (!contactName) return { success: false, tool: toolName, error: "whatsapp_conversation requires a 'contact' field with the person's name." };
+        const { found, result: convResult } = await this.whatsappService.getConversationByContact(userId, contactName);
+        if (!found) {
+          return { success: true, tool: toolName, data: { summary: convResult as string, messages: [] } };
+        }
+        const conv = convResult as any;
+        // Format into a readable summary for the LLM
+        const summary = `Conversation with ${conv.contactName} (${conv.messages.length} messages):\n\n${conv.raw}`;
+        const result = { success: true, tool: toolName, data: { summary, contactName: conv.contactName, messages: conv.messages } };
+        this.recordLastToolInvocation(userId, sessionId, invocation);
+        return result;
+      } catch (err: any) {
+        return { success: false, tool: toolName, error: err?.message || "WhatsApp conversation read failed." };
+      }
+    }
+
+    if (toolName === "whatsapp_history") {
+      try {
+        if (!userId) return { success: false, tool: toolName, error: "User not authenticated." };
+        const limit = invocation.payload?.limit || 100;
+        const history = await this.whatsappService.getRecentHistory(userId, limit);
+        const result = { success: true, tool: toolName, data: { summary: history.raw, messages: history.messages } };
+        this.recordLastToolInvocation(userId, sessionId, invocation);
+        return result;
+      } catch (err: any) {
+        return { success: false, tool: toolName, error: err?.message || "WhatsApp history read failed." };
+      }
+    }
+
 
     if (toolName === "tomtom_route") {
       try {
@@ -687,6 +909,33 @@ export class ArisService {
       }
     }
 
+    if (toolName.startsWith("weather_") || toolName === "location_ip_details") {
+      try {
+        const payload = invocation.payload || {};
+        let resultData: any;
+        
+        if (toolName === "location_ip_details") {
+          resultData = await this.locationService.getCurrentLocation(true);
+        } else if (toolName === "weather_geocoding") {
+          resultData = await this.weatherService.geocode(payload.name, payload.count);
+        } else if (toolName === "weather_forecast") {
+          resultData = await this.weatherService.getForecast(payload.lat, payload.lon, payload.current, payload.hourly, payload.daily);
+        } else if (toolName === "weather_historical") {
+          resultData = await this.weatherService.getHistorical(payload.lat, payload.lon, payload.start_date, payload.end_date, payload.hourly, payload.daily);
+        } else if (toolName === "weather_air_quality") {
+          resultData = await this.weatherService.getAirQuality(payload.lat, payload.lon, payload.hourly);
+        } else if (toolName === "weather_marine") {
+          resultData = await this.weatherService.getMarine(payload.lat, payload.lon, payload.hourly);
+        }
+
+        const result = { success: true, tool: toolName, data: resultData };
+        this.recordLastToolInvocation(userId, sessionId, invocation);
+        return result;
+      } catch (err: any) {
+        return { success: false, tool: toolName, error: err?.message || "Weather/Location execution failed." };
+      }
+    }
+
     if (!userId) {
       return { success: false, tool: toolName, error: "Unauthorized user." };
     }
@@ -739,12 +988,96 @@ export class ArisService {
             tool: toolName,
             data: await this.googleService.getCalendarEvent(account, invocation.payload?.eventId, persistTokens),
           };
-        case "google_calendar_create":
+        case "google_calendar_create": {
+          const eventPayload = invocation.payload?.event || invocation.payload;
+          
+          // Programmatic Dedup Check
+          const startStr = eventPayload?.start?.dateTime || eventPayload?.start?.date;
+          if (startStr) {
+            const startOfDay = new Date(startStr);
+            startOfDay.setHours(0, 0, 0, 0);
+            const endOfDay = new Date(startStr);
+            endOfDay.setHours(23, 59, 59, 999);
+            
+            const existingEvents = await this.googleService.getCalendarEvents(
+              account,
+              50,
+              startOfDay.toISOString(),
+              endOfDay.toISOString(),
+              persistTokens
+            );
+            
+            const reqSummary = (eventPayload.summary || "").toLowerCase().trim();
+            const duplicate = existingEvents.find((e: any) => 
+              (e.summary || "").toLowerCase().trim() === reqSummary ||
+              (e.summary || "").toLowerCase().trim().includes(reqSummary) ||
+              reqSummary.includes((e.summary || "").toLowerCase().trim())
+            );
+            
+            if (duplicate && reqSummary.length > 0) {
+              return {
+                success: true,
+                tool: toolName,
+                data: { message: "Event skipped (already exists on this date)", existingEvent: duplicate }
+              };
+            }
+          }
+
           return {
             success: true,
             tool: toolName,
-            data: await this.googleService.createCalendarEvent(account, invocation.payload?.event || invocation.payload, persistTokens),
+            data: await this.googleService.createCalendarEvent(account, eventPayload, persistTokens),
           };
+        }
+        case "google_calendar_batch_create": {
+          const events: any[] = Array.isArray(invocation.payload?.events)
+            ? invocation.payload.events
+            : Array.isArray(invocation.payload)
+              ? invocation.payload
+              : [];
+          if (events.length === 0) {
+            return { success: false, tool: toolName, error: "google_calendar_batch_create requires an 'events' array." };
+          }
+          
+          const createdEvents = [];
+          const skippedEvents = [];
+
+          for (const ev of events) {
+            let isDuplicate = false;
+            const startStr = ev.start?.dateTime || ev.start?.date;
+            if (startStr) {
+              const startOfDay = new Date(startStr);
+              startOfDay.setHours(0, 0, 0, 0);
+              const endOfDay = new Date(startStr);
+              endOfDay.setHours(23, 59, 59, 999);
+              
+              const existingEvents = await this.googleService.getCalendarEvents(account, 50, startOfDay.toISOString(), endOfDay.toISOString(), persistTokens);
+              const reqSummary = (ev.summary || "").toLowerCase().trim();
+              
+              const duplicate = existingEvents.find((e: any) => 
+                (e.summary || "").toLowerCase().trim() === reqSummary ||
+                (e.summary || "").toLowerCase().trim().includes(reqSummary) ||
+                reqSummary.includes((e.summary || "").toLowerCase().trim())
+              );
+              
+              if (duplicate && reqSummary.length > 0) {
+                isDuplicate = true;
+                skippedEvents.push({ summary: ev.summary, reason: "Already exists" });
+              }
+            }
+
+            if (!isDuplicate) {
+              const created = await this.googleService.createCalendarEvent(account, ev, persistTokens);
+              createdEvents.push(created);
+            }
+          }
+
+          return {
+            success: true,
+            tool: toolName,
+            data: { created: createdEvents.length, skipped: skippedEvents.length, events: createdEvents, skippedEvents },
+          };
+        }
         case "google_calendar_update":
           return {
             success: true,
@@ -1308,6 +1641,88 @@ export class ArisService {
             tool: toolName,
             data: await this.googleService.getMessageAttachment(account, invocation.payload?.messageId, invocation.payload?.attachmentId, persistTokens),
           };
+        case "google_contacts_search": {
+          const query = invocation.payload?.query as string | undefined;
+          if (query) {
+            // Search local DB first (fast)
+            const localResults = await searchContactsDb(userId!, query).catch(() => []);
+            if (localResults.length > 0) {
+              return { success: true, tool: toolName, data: localResults };
+            }
+          }
+          // Fall back to live Google People API search
+          const liveResults = await this.googleService.searchContactsByQuery(account, query, persistTokens);
+          return { success: true, tool: toolName, data: liveResults };
+        }
+        case "contact_add_note": {
+          if (!userId) {
+            return { success: false, tool: toolName, error: "No user ID." };
+          }
+          const contactName = invocation.payload?.name?.trim();
+          const note = invocation.payload?.note?.trim();
+          if (!contactName || !note) {
+            return { success: false, tool: toolName, error: "Missing name or note." };
+          }
+          
+          const resolved = await resolveNameToPhones(userId, contactName);
+          if (!resolved) {
+            return { success: false, tool: toolName, error: `Could not find contact '${contactName}'` };
+          }
+
+          const currentSummary = resolved.profileSummary || "";
+          
+          // Synthesize new summary
+          const condensationPrompt = [
+            `You are a profile synthesis assistant.`,
+            `Update the existing profile summary with the new fact(s).`,
+            `Keep the summary concise (max 2-3 paragraphs) and written in third-person.`,
+            `If the new fact contradicts an old fact (e.g. changed jobs), silently drop the old fact and use the new one.`,
+            `Do NOT add filler text. Just return the raw text of the new summary.`,
+            `Current Profile for ${resolved.displayName}:`,
+            currentSummary ? currentSummary : "(No profile exists yet)",
+            ``,
+            `New Fact(s) to add:`,
+            note
+          ].join('\n');
+
+          const synthesisResult = await this.gemmaService.requestArisAdvice(condensationPrompt);
+          const newSummary = synthesisResult.reply.trim();
+
+          await updateContactProfileSummary(userId, resolved.contactId, newSummary);
+          return { 
+            success: true, 
+            tool: toolName, 
+            data: { message: `Profile updated for ${resolved.displayName}.`, newSummary } 
+          };
+        }
+        case "sunbird_translate": {
+          const source = invocation.payload?.source?.toString()?.trim();
+          const target = invocation.payload?.target?.toString()?.trim();
+          const text = invocation.payload?.text?.toString()?.trim();
+          if (!source || !target || !text) {
+            return { success: false, tool: toolName, error: "Missing source, target, or text for translation." };
+          }
+          const translatedText = await this.sunbirdService.translateText({
+            source_language: source,
+            target_language: target,
+            text,
+          });
+          return { success: true, tool: toolName, data: { translated_text: translatedText } };
+        }
+        case "google_contacts_sync": {
+          if (!userId) {
+            return { success: false, tool: toolName, error: "No user ID — cannot sync contacts." };
+          }
+          const force = invocation.payload?.force === true;
+          const result = await this.ensureContactsSynced(userId, force);
+          return {
+            success: true,
+            tool: toolName,
+            data: result.skipped
+              ? { message: "Contacts are already up to date.", synced: 0 }
+              : { message: `Contacts synced successfully.`, synced: result.synced },
+          };
+        }
         default:
           return { success: false, tool: toolName, error: `Unsupported tool: ${toolName}` };
       }
@@ -1343,7 +1758,7 @@ export class ArisService {
       `memory_entries must be a JSON array of strings.`,
       `If you learn a stable personal detail about the user, include it only inside memory_entries.`,
       "Recent conversation history:",
-      ...conversationHistory.map((item) => `${item}`),
+      ...conversationHistory.map((item) => item.length > 500 ? item.substring(0, 500) + '...[truncated]' : item),
       "",
       ...profileLines,
       "Relevant memories:",
@@ -1394,7 +1809,7 @@ export class ArisService {
       `memory_entries must be a JSON array of strings.`,
       `If you learn a stable personal detail about the user, include it only inside memory_entries.`,
       "Recent conversation history:",
-      ...conversationHistory.map((item) => `${item}`),
+      ...conversationHistory.map((item) => item.length > 500 ? item.substring(0, 500) + '...[truncated]' : item),
       "",
       ...profileLines,
       "Relevant memories:",
@@ -1475,7 +1890,33 @@ export class ArisService {
     }
 
     const normalized = userMessage.trim().toLowerCase();
-    const whatsappKeywords = /\b(whatsapp|wa|what?s app|messages from whatsapp|whatsapp messages|whatsapp summary|summarize whatsapp)\b/i;
+    
+    // Smart WhatsApp routing: detect if user is asking about a SPECIFIC contact
+    // If so, use whatsapp_conversation to read from history instead of running the service
+    const contactConvoMatch = normalized.match(
+      /(?:what did|what(?:'s| was)? said|messages? from|read(?:\s+(?:my|the))? (?:chat|conversation|messages?) (?:with|from)|show (?:me )?(?:messages?|chat|conversation) (?:from|with)|check (?:messages?|whatsapp) (?:from|with))\s+([a-z][a-z\s'-]{1,40})(?:\s+(?:on whatsapp|(?:say|said|send|sent|write|wrote)))?/i
+    );
+    if (contactConvoMatch) {
+      const contactName = contactConvoMatch[1].trim();
+      return [{ tool: "whatsapp_conversation", payload: { contact: contactName } }];
+    }
+    
+    // Also catch simpler patterns: "Grace's whatsapp", "grace whatsapp messages", "grace on whatsapp"
+    const simpleContactMatch = normalized.match(
+      /^([a-z][a-z\s'-]{1,30})(?:'s)?\s+(?:whatsapp|message|messages|chat|texts?)(?:\s+messages?)?$/i
+    );
+    if (simpleContactMatch) {
+      return [{ tool: "whatsapp_conversation", payload: { contact: simpleContactMatch[1].trim() } }];
+    }
+
+    // History read — no specific contact, but not asking for new messages
+    const historyKeywords = /\b(recent whatsapp|whatsapp history|past messages|all messages|show (?:all|recent) whatsapp|what(?:'s| was| has) (?:been )?(going on|happening) (?:on )?whatsapp)\b/i;
+    if (historyKeywords.test(normalized)) {
+      return [{ tool: "whatsapp_history", payload: {} }];
+    }
+
+    // Default: new/pending message summary (runs the WhatsApp service if needed)
+    const whatsappKeywords = /\b(whatsapp|wa|what.?s app|messages from whatsapp|whatsapp messages|whatsapp summary|summarize whatsapp|new messages|any messages|new whatsapp|unread)\b/i;
     if (whatsappKeywords.test(normalized)) {
       return [{ tool: "whatsapp_summary", payload: {} }];
     }
@@ -1607,16 +2048,18 @@ export class ArisService {
     }
 
     const prompt = [
-      `You are Aris, a dependable assistant that chains tools using a Thought-Action-Observation process.`,
+      `You are Aris, an extremely conversational digital friend, an expert advisor, and a life coach. You chain tools using a Thought-Action-Observation process.`,
+      `When you provide your final answer, your tone should be warm, friendly, insightful, and highly conversational.`,
       `Continue the chain until the user's request is fully resolved or until you must stop for approval on a destructive action.`,
       `For each step, output a Thought line describing your progress and then a single Action line with one valid JSON tool call.`,
       `If you are finished, output a final response as JSON exactly like this: {"final_answer":"...","memory_entries":[]} .`,
       `If the previous tool result already satisfies the user's request, do not invoke any further tools.`,
       `If the most recent tool invocation was {"tool":"whatsapp_summary"}, use the returned summary directly as your final answer unless additional tool data is needed.`,
+      `CRITICAL DEDUPLICATION RULE: Before creating ANY calendar event, you MUST first call 'google_calendar_events' to fetch existing events for the relevant time range. Compare the event summaries. If an event with the same or very similar title already exists on the calendar for the same date, you MUST skip creating it and report it as already existing. Only call 'google_calendar_create' for events that do NOT already exist. If you are adding multiple events, check ALL first, skip duplicates, and only create genuinely new ones.`,
       `Do not include markdown, code fences, or any extra text outside the expected format.`,
       ``,
       `Recent conversation history:`,
-      ...conversationHistory.map((item) => `${item}`),
+      ...conversationHistory.map((item) => item.length > 500 ? item.substring(0, 500) + '...[truncated]' : item),
       "",
       ...profileLines,
       `Relevant memories:`,
@@ -1640,6 +2083,99 @@ export class ArisService {
     return prompt.join("\n");
   }
 
+  private levenshteinDistance(a: string, b: string): number {
+    if (a.length === 0) return b.length;
+    if (b.length === 0) return a.length;
+    const matrix = [];
+    for (let i = 0; i <= b.length; i++) { matrix[i] = [i]; }
+    for (let j = 0; j <= a.length; j++) { matrix[0][j] = j; }
+    for (let i = 1; i <= b.length; i++) {
+      for (let j = 1; j <= a.length; j++) {
+        if (b.charAt(i - 1) === a.charAt(j - 1)) {
+          matrix[i][j] = matrix[i - 1][j - 1];
+        } else {
+          matrix[i][j] = Math.min(matrix[i - 1][j - 1] + 1, Math.min(matrix[i][j - 1] + 1, matrix[i - 1][j] + 1));
+        }
+      }
+    }
+    return matrix[b.length][a.length];
+  }
+
+  private hasFuzzyMatch(words: string[], keywords: string[], maxDistance: number = 1): boolean {
+    for (const word of words) {
+      if (word.length < 3) {
+        if (keywords.includes(word)) return true;
+        continue;
+      }
+      for (const keyword of keywords) {
+        if (keyword.length < 3) {
+          if (word === keyword) return true;
+          continue;
+        }
+        // Allow higher distance for longer words
+        const allowedDistance = keyword.length > 5 ? maxDistance + 1 : maxDistance;
+        if (Math.abs(word.length - keyword.length) > allowedDistance) continue;
+        if (this.levenshteinDistance(word, keyword) <= allowedDistance) {
+          return true;
+        }
+      }
+    }
+    return false;
+  }
+
+  private determineToolCategories(userMessage: string, conversationHistory: string[]): Set<string> {
+    const categories = new Set<string>();
+    const msgOnly = userMessage.toLowerCase().trim();
+    const words = msgOnly.split(/[^a-z0-9]+/);
+    const textToAnalyze = [userMessage, ...conversationHistory].join(" ").toLowerCase();
+    const allWords = textToAnalyze.split(/[^a-z0-9]+/);
+
+    // --- Conversational / emotional intent detection ---
+    // If the message is clearly casual chat, emotional venting, small talk, or
+    // a simple greeting, return an empty set so Aris responds conversationally.
+    const conversationalPatterns = [
+      /^(hey|hi|hello|sup|yo|howdy|hiya)[\s!?.,]*$/i,
+      /^(thanks|thank you|thx|ty)[\s!?.,]*$/i,
+      /^(ok|okay|got it|sure|cool|alright|yep|nope)[\s!?.,]*$/i,
+      /^i(?:'?m| am) (just )?(bored|tired|sad|happy|excited|stressed|anxious|lonely|down|upset|fine|good|great|okay)[\s!?.,]*/i,
+      /^(i feel|feeling|just feeling|i'm feeling)[\s.,]*/i,
+      /^(lol|lmao|haha|hehe|xD)[\s!?.,]*$/i,
+      /^(good morning|good night|good evening|good afternoon)[\s!?.,]*$/i,
+      /^(how are you|how's it going|what's up|wassup)[\s!?.,]*$/i,
+      /^(nothing|not much|same old|just chilling|just relaxing)[\s!?.,]*/i,
+    ];
+
+    const isConversational = conversationalPatterns.some(p => p.test(msgOnly));
+    if (isConversational) {
+      // Return empty set — Aris will respond directly without any tools
+      return categories;
+    }
+
+    if (this.hasFuzzyMatch(allWords, ["brief", "summary", "overview", "update", "happening", "catch"])) {
+      categories.add("briefing");
+      categories.add("gmail");
+      categories.add("calendar");
+      categories.add("whatsapp");
+      categories.add("traffic");
+      categories.add("weather");
+    }
+
+    if (this.hasFuzzyMatch(allWords, ["email", "gmail", "inbox", "message", "draft", "send", "mail"])) categories.add("gmail");
+    if (this.hasFuzzyMatch(allWords, ["contact", "person", "phone", "number", "address", "profile"])) categories.add("contact");
+    if (this.hasFuzzyMatch(allWords, ["calendar", "schedule", "meeting", "event", "appointment", "invite"])) categories.add("calendar");
+    if (this.hasFuzzyMatch(allWords, ["whatsapp", "wa", "chat"])) categories.add("whatsapp");
+    if (this.hasFuzzyMatch(allWords, ["traffic", "route", "commute", "drive", "directions", "eta"])) categories.add("traffic");
+    if (this.hasFuzzyMatch(allWords, ["weather", "forecast", "air", "quality", "marine", "ocean", "rain", "temperature", "temp", "cold", "hot"])) categories.add("weather");
+
+    // Only fall back to search+generic tools if no specific category was detected
+    // and this is clearly NOT a casual conversational message.
+    if (categories.size === 0) {
+      categories.add("search");
+    }
+
+    return categories;
+  }
+
   private async executeToolChain(
     userId: number | undefined,
     userMessage: string,
@@ -1647,18 +2183,90 @@ export class ArisService {
     memories: string[],
     conversationHistory: string[],
     sessionId: string,
-    includeSearch: boolean
+    includeSearch: boolean,
+    onProgress?: (msg: string) => void,
+    approvedAction?: ToolInvocation
   ): Promise<ToolChainResult> {
     const toolResults: Array<{ invocation: ToolInvocation; result: ToolExecutionResult }> = [];
-    let prompt = this.buildToolChainPrompt(userMessage, userProfile, memories, conversationHistory, includeSearch);
+    
+    // Execute the approved action and seed toolResults, then fall through into
+    // the main chain loop so the model can continue with remaining tasks.
+    if (approvedAction) {
+      onProgress?.(`Executing ${approvedAction.tool.replace(/_/g, ' ')}...`);
+      const result = await this.executeToolCall(userId, approvedAction, sessionId);
+      toolResults.push({ invocation: approvedAction, result });
+    }
+    const activeCategories = this.determineToolCategories(userMessage, conversationHistory);
+    if (includeSearch) activeCategories.add("search");
+    
+    // Inject Live Location Awareness
+    const locationData = await this.locationService.getCurrentLocation();
+    const locationContext = this.locationService.formatLocationContext(locationData);
+    
+    // If we have seeded tool results (from an approved action), build a focused
+    // post-approval continuation prompt that strips old conversation history
+    // to prevent the model from getting confused by stale failed tool attempts.
+    let prompt: string;
+    if (toolResults.length > 0) {
+      const lastResult = toolResults[toolResults.length - 1];
+      const toolName = lastResult.invocation.tool;
+      const wasSuccess = lastResult.result.success;
+      const approvalNote = wasSuccess
+        ? `You just successfully executed '${toolName}'. The action completed.`
+        : `Execution of '${toolName}' failed: ${lastResult.result.error}`;
+      prompt = [
+        `You are Aris, an extremely conversational digital friend, an expert advisor, and a life coach. ${approvalNote}`,
+        locationContext,
+        `Original user request: ${userMessage}`,
+        ``,
+        `Tool results so far:`,
+        ...toolResults.map(tr => `- ${tr.invocation.tool}: ${tr.result.success ? 'SUCCESS' : 'FAILED'}`),
+        ``,
+        `If there are remaining tasks from the original request that are not yet done, continue with the next step using a single JSON tool call.`,
+        `If everything is done, output your final summary using ONLY this exact JSON format: {"final_answer":"<your message>","memory_entries":[]}. Do not output raw text.`,
+        `Do NOT repeat or re-fetch data that was already retrieved. Do NOT invent tool names.`,
+        ``,
+        `Aris:`,
+        `Thought:`
+      ].join('\n');
+    } else {
+      prompt = this.buildToolChainPrompt(userMessage, userProfile, memories, conversationHistory, activeCategories, locationContext);
+    }
     let lastModelReply = "";
 
-    for (let iteration = 0; iteration < 10; iteration += 1) {
+    const MAX_ITERATIONS = 10;
+
+    for (let iteration = 0; iteration < MAX_ITERATIONS; iteration += 1) {
+
+      onProgress?.("Thinking...");
       const modelResponse = await this.gemmaService.requestArisAdvice(prompt);
       lastModelReply = modelResponse.reply.trim();
 
-      const invocation = this.parseToolInvocation(lastModelReply);
-      if (!invocation) {
+      const invocations = this.parseToolInvocations(lastModelReply);
+      if (!invocations || invocations.length === 0) {
+        // Detect "thinking wall" — model outputting raw reasoning instead of final_answer JSON
+        // If reply is very long and has no final_answer structure, it's stuck in a loop.
+        // We increase this to 4000 to allow sufficient reasoning over large datasets (like calendar lists).
+        const hasFinalAnswer = modelResponse.isFinalAnswer || lastModelReply.includes('"final_answer"') || lastModelReply.includes("final_answer");
+        const isThinkingWall = !hasFinalAnswer && lastModelReply.length > 4000;
+
+        if (isThinkingWall) {
+          // Inject a recovery nudge — tell the model to stop reasoning and give its answer
+          const completedTools = toolResults
+            .filter(r => r.result.success && r.invocation.tool !== '_system')
+            .map(r => r.invocation.tool)
+            .join(', ');
+          
+          prompt = [
+            `You are Aris. You have been completing tasks. Stop all internal reasoning now.`,
+            completedTools ? `You have successfully executed: ${completedTools}.` : `No tools were needed.`,
+            `User's original request: ${userMessage}`,
+            `Output ONLY a final answer in this exact JSON format and nothing else:`,
+            `{"final_answer":"<your concise reply to the user>","memory_entries":[]}`,
+          ].join('\n');
+          continue;
+        }
+
         return {
           status: "finished",
           reply: lastModelReply || "I completed the task.",
@@ -1666,45 +2274,179 @@ export class ArisService {
         };
       }
 
-      const normalizedInvocation = this.normalizeToolInvocation(invocation);
+      const normalizedInvocations = invocations.map((inv) => this.normalizeToolInvocation(inv));
 
-      if (this.needsHumanApproval(normalizedInvocation)) {
+      const pendingIndex = normalizedInvocations.findIndex((inv) => this.needsHumanApproval(inv));
+      if (pendingIndex !== -1) {
         return {
           status: "awaiting_approval",
           reply: lastModelReply,
           memoryEntries: modelResponse.memoryEntries || [],
-          pendingAction: normalizedInvocation,
+          pendingAction: normalizedInvocations[pendingIndex],
         };
       }
 
-      const result = await this.executeToolCall(userId, normalizedInvocation, sessionId);
-      toolResults.push({ invocation: normalizedInvocation, result });
+      const results = await Promise.all(
+        normalizedInvocations.map((inv) => {
+          let toolName = "tool";
+          if (inv.tool.includes("gmail")) toolName = "email";
+          else if (inv.tool.includes("calendar")) toolName = "calendar";
+          else if (inv.tool.includes("search")) toolName = "the web";
+          onProgress?.(`Checking ${toolName}...`);
+          return this.executeToolCall(userId, inv, sessionId);
+        })
+      );
 
-      if (!result.success) {
-        const failurePrompt = this.buildMultiToolResultPrompt(userMessage, userProfile, memories, conversationHistory, toolResults);
-        const finalPass = await this.gemmaService.requestArisAdvice(failurePrompt);
-        return {
-          status: "finished",
-          reply: finalPass.reply,
-          memoryEntries: finalPass.memoryEntries || [],
-        };
+      for (let i = 0; i < normalizedInvocations.length; i++) {
+        toolResults.push({ invocation: normalizedInvocations[i], result: results[i] });
       }
 
-      if (this.isTerminalTool(normalizedInvocation.tool)) {
-        const summary = String(result.data?.summary || "").trim();
+      const currentFailures = results.map((r, i) => r.success ? null : { inv: normalizedInvocations[i], err: r.error }).filter(Boolean) as Array<{inv: any, err: any}>;
+      let stuckCount = 0;
+      for (const fail of currentFailures) {
+         const previousIdenticalFailure = toolResults.slice(0, -normalizedInvocations.length).find(
+           (tr) => !tr.result.success && 
+                   tr.invocation.tool === fail.inv.tool && 
+                   JSON.stringify(tr.invocation.payload) === JSON.stringify(fail.inv.payload)
+         );
+         if (previousIdenticalFailure) {
+           stuckCount++;
+         }
+      }
+      // Only bail after 2 consecutive stuck cycles; let the model try to self-correct once
+      if (stuckCount > 0 && stuckCount === currentFailures.length && currentFailures.length > 0) {
+        // Inject the error as an observation so the model can recover
+        const errorFeedback = currentFailures.map(f => `Tool ${f.inv.tool} failed repeatedly: ${f.err || 'unknown error'}. Try a different approach or use different parameters.`).join(' ');
+        toolResults.push({
+          invocation: { tool: "_system", payload: {} },
+          result: { success: false, tool: "_system", error: errorFeedback }
+        });
+      }
+
+      // --- Detect repeated identical tool calls (success loop prevention) ---
+      // If the model just called the same tool with the same payload that already
+      // succeeded earlier in this chain, it's stuck. Force a final_answer instead.
+      const repeatedSuccessfulCall = normalizedInvocations.find(inv => {
+        const previousSuccessful = toolResults
+          .slice(0, toolResults.length - normalizedInvocations.length)
+          .find(tr => tr.result.success && tr.invocation.tool === inv.tool &&
+                      JSON.stringify(tr.invocation.payload) === JSON.stringify(inv.payload));
+        return !!previousSuccessful;
+      });
+
+      if (repeatedSuccessfulCall) {
+        // Force a synthesis pass with all data collected so far
+        const dataLines = toolResults
+          .filter(tr => tr.result.success && tr.invocation.tool !== '_system')
+          .map(tr => {
+            const rawData = tr.result.data;
+            const dataSummary = rawData?.summary ?? rawData?.text ?? JSON.stringify(rawData).slice(0, 3000);
+            return `--- Result from ${tr.invocation.tool} ---\n${dataSummary}`;
+          });
+        const forceSynthesisPrompt = [
+          `You are Aris. You have already collected all the data you need. Do NOT call any more tools.`,
+          `User's original request: "${userMessage}"`,
+          ``,
+          `Data you collected:`,
+          ...dataLines,
+          ``,
+          `Now write a warm, detailed, conversational response to the user's request.`,
+          `CRITICAL INSTRUCTION: Your entire response must be a single, valid JSON object and NOTHING ELSE.`,
+          `Do NOT include any reasoning, bullet points, or markdown formatting before the JSON.`,
+          `{"final_answer": "your warm, detailed conversational response here", "memory_entries": []}`,
+        ].join('\n');
+        prompt = forceSynthesisPrompt;
+        continue;
+      }
+
+      const hasFailure = results.some((r) => !r.success);
+
+      const terminalIndex = normalizedInvocations.findIndex((inv) => this.isTerminalTool(inv.tool));
+      if (terminalIndex !== -1) {
+        const summary = String(results[terminalIndex].data?.summary || "").trim();
         return {
           status: "finished",
-          reply: summary || "No new WhatsApp messages were received.",
+          reply: summary || "Task completed.",
           memoryEntries: [],
         };
       }
 
-      prompt = this.buildToolChainPromptFromResults(userMessage, userProfile, memories, conversationHistory, toolResults, includeSearch);
+      // Build continuation prompt with actual tool data embedded
+      const successResults = toolResults.filter(tr => tr.result.success && tr.invocation.tool !== '_system');
+      const dataLines = successResults.map(tr => {
+        const rawData = tr.result.data;
+        const dataSummary = rawData?.summary ?? rawData?.text ?? JSON.stringify(rawData).slice(0, 4000);
+        return `--- Data from ${tr.invocation.tool} ---\n${dataSummary}`;
+      });
+
+      const failureLines = toolResults
+        .filter(tr => !tr.result.success && tr.invocation.tool !== '_system')
+        .map(tr => `--- ${tr.invocation.tool} FAILED: ${tr.result.error} ---`);
+
+      if (hasFailure) {
+        prompt = [
+          `You are Aris. A tool call failed. Adapt and continue.`,
+          `User's request: "${userMessage}"`,
+          ...failureLines,
+          ...dataLines,
+          `If you can try a different tool or approach, output a JSON tool call.`,
+          `If you have enough data to answer (or no other approach), write a final answer.`,
+          `CRITICAL INSTRUCTION: Your entire response must be a single, valid JSON object and NOTHING ELSE.`,
+          `Do NOT include any reasoning, bullet points, or markdown formatting before the JSON.`,
+          `If calling a tool: {"tool": "tool_name", "param1": "value"}`,
+          `If answering the user: {"final_answer": "your warm, detailed conversational response here", "memory_entries": []}`,
+        ].join('\n');
+        continue;
+      }
+
+      prompt = [
+        `You are Aris. You just completed a tool call and retrieved the following data.`,
+        `User's original request: "${userMessage}"`,
+        locationContext,
+        ``,
+        ...dataLines,
+        ``,
+        `If you need more information to fully answer the request, output a JSON object to call the next tool.`,
+        `If you have gathered all necessary information, write a warm, detailed, conversational response to the user.`,
+        `CRITICAL INSTRUCTION: Your entire response must be a single, valid JSON object and NOTHING ELSE.`,
+        `Do NOT include any reasoning, bullet points, or markdown formatting before the JSON.`,
+        `If calling a tool: {"tool": "tool_name", "param1": "value"}`,
+        `If answering the user: {"final_answer": "your warm, detailed conversational response here", "memory_entries": []}`,
+      ].join('\n');
+    }
+
+    // Max iterations reached — synthesize answer from whatever data was collected
+    const collectedData = toolResults
+      .filter(tr => tr.result.success && tr.invocation.tool !== '_system')
+      .map(tr => {
+        const rawData = tr.result.data;
+        const dataSummary = rawData?.summary ?? rawData?.text ?? JSON.stringify(rawData).slice(0, 3000);
+        return `--- ${tr.invocation.tool} ---\n${dataSummary}`;
+      });
+
+    if (collectedData.length > 0) {
+      // We have data — make one final synthesis call
+      const finalSynthesisPrompt = [
+        `You are Aris. Synthesize the following data into a warm, detailed response for the user.`,
+        `User's request: "${userMessage}"`,
+        ``,
+        ...collectedData,
+        ``,
+        `CRITICAL INSTRUCTION: Your entire response must be a single, valid JSON object and NOTHING ELSE.`,
+        `Do NOT include any reasoning, bullet points, or markdown formatting before the JSON.`,
+        `{"final_answer": "your warm, detailed conversational response here", "memory_entries": []}`,
+      ].join('\n');
+      const finalResponse = await this.gemmaService.requestArisAdvice(finalSynthesisPrompt);
+      return {
+        status: "finished",
+        reply: finalResponse.reply || "I reached the limit but gathered some data.",
+        memoryEntries: finalResponse.memoryEntries || [],
+      };
     }
 
     return {
       status: "max_iterations_reached",
-      reply: lastModelReply || "I reached the maximum number of tool chain iterations.",
+      reply: "I hit my processing limit on that one. Could you try rephrasing or narrowing the request?",
       memoryEntries: [],
     };
   }
@@ -1712,7 +2454,7 @@ export class ArisService {
   private needsHumanApproval(invocation: ToolInvocation) {
     const normalizedTool = this.normalizeToolName(invocation.tool);
     const destructiveToolPatterns = [
-      /^google_calendar_(create|update|delete|import|move|patch|clear_calendar|delete_calendar|update_acl|delete_acl)$/,
+      /^google_calendar_(create|batch_create|update|delete|import|move|patch|clear_calendar|delete_calendar|update_acl|delete_acl)$/,
       /^google_gmail_(send|draft_send)$/,
     ];
 
@@ -1799,25 +2541,37 @@ export class ArisService {
     }
   }
 
-  private buildPrompt(userMessage: string, userProfile: UserProfileEntry[], memories: string[], conversationHistory: string[]) {
+  private buildPrompt(userMessage: string, userProfile: UserProfileEntry[], memories: string[], conversationHistory: string[], locationContext: string) {
     const profileLines = userProfile.length
       ? ["User profile:", ...userProfile.map((item) => `- ${item.profileKey}: ${item.profileValue}`), ""]
       : [];
+    const currentDateTime = new Date().toLocaleString("en-US", { weekday: "long", year: "numeric", month: "long", day: "numeric", hour: "numeric", minute: "numeric", timeZoneName: "short" });
 
     return [
-      `You are Aris, a persistent digital brain with a memory database.`,
+      `You are Aris — a warm, deeply empathetic digital companion. You are a trusted friend, life coach, emotional comforter, and expert advisor all in one.`,
+      `You have a persistent digital brain with a memory database.`,
+      `Current Date and Time: ${currentDateTime}`,
+      locationContext,
+      `CORE IDENTITY GUIDELINES:`,
+      `1. You are as much a conversational companion as you are an agentic assistant. Not every message needs a tool. If the user is chatting, venting, expressing emotions, or making small talk — just BE there for them. Respond like a caring human friend would.`,
+      `2. Provide emotional support, encouragement, and empathy before offering solutions. Acknowledge how the user is feeling first.`,
+      `3. When appropriate, offer life-coach style insights, gentle motivation, or reframing perspectives — but always naturally, never preachy.`,
+      `PROACTIVE BEHAVIOR GUIDELINES:`,
+      `1. When reading emails or WhatsApp messages, actively look for events, meetings, or tasks and ask if they'd like you to add them to the calendar.`,
+      `2. When reviewing calendar events, proactively offer related help (e.g., route planning, traffic checks, preparation tips).`,
+      `3. Anticipate the user's needs. Don't just execute the immediate command; offer the logical next step.`,
       `Use the user's profile, memories, and recent conversation history to answer with full context.`,
+      `CRITICAL RULE: All responses should provide detailed breakdowns of data (emails, messages, search results) and NEVER be heavily summarized unless explicitly requested by the user.`,
       `Resolve pronouns and follow-up references such as 'it', 'that', 'the previous one', 'the last message', and 'this email' using the conversation context.`,
-      `Answer the user directly and concisely.`,
       `If answering directly, output only valid JSON exactly like this: {"final_answer":"...","memory_entries":[]} .`,
       `Do not include any extra text, comments, code fences, or instructions outside the JSON object.`,
       `Do not repeat or mention any internal instructions, constraints, tool syntax, or metadata.`,
       `Do not truncate the response. Include the full answer in final_answer, even if it is long.`,
       `final_answer must be a single string.`,
       `memory_entries must be a JSON array of strings.`,
-      `If you learn a stable personal detail about the user, include it only inside memory_entries.`,
+      `If you learn a stable personal detail that updates or supersedes an existing memory, output the new fact in memory_entries explicitly stating that it supersedes the old one (e.g., 'User now lives in Chicago (supersedes New York)'). Do not delete old memories.`,
       "Recent conversation history:",
-      ...conversationHistory.map((item) => `${item}`),
+      ...conversationHistory.map((item) => item.length > 500 ? item.substring(0, 500) + '...[truncated]' : item),
       "",
       ...profileLines,
       "Relevant memories:",
@@ -1828,18 +2582,33 @@ export class ArisService {
     ].join("\n");
   }
 
-  private buildToolChainPrompt(userMessage: string, userProfile: UserProfileEntry[], memories: string[], conversationHistory: string[], includeSearch: boolean) {
+  private buildToolChainPrompt(userMessage: string, userProfile: UserProfileEntry[], memories: string[], conversationHistory: string[], activeCategories: Set<string>, locationContext: string) {
     const profileLines = userProfile.length
       ? ["User profile:", ...userProfile.map((item) => `- ${item.profileKey}: ${item.profileValue}`), ""]
       : [];
+    const currentDateTime = new Date().toLocaleString("en-US", { weekday: "long", year: "numeric", month: "long", day: "numeric", hour: "numeric", minute: "numeric", timeZoneName: "short" });
 
     const toolInstructions = [
-      `If the user asks to access or manage Google Calendar or Gmail, do not answer directly. Output exactly one valid tool call and nothing else.`,
-      `If the user asks to check WhatsApp, do not answer directly. Output exactly one valid tool call and nothing else.`,
+      `You are Aris, an extremely conversational digital friend, an expert advisor, an emotional helper, a comforter, and a life coach.`,
+      `You have a persistent digital brain with a memory database.`,
+      `If the user asks to access or manage services, do not answer directly. Output exactly one valid tool call and nothing else.`,
+      `Current Date and Time: ${currentDateTime}`,
+      locationContext,
+      `BEHAVIORAL AND EMOTIONAL GUIDELINES:`,
+      `1. Not every chat or query requires tools! If the user is just chatting, venting, expressing an emotion (like boredom, sadness, joy), or making small talk, respond conversationally as an empathetic emotional helper without calling unnecessary tools.`,
+      `2. Act as a trusted confidant. Your tone should be warm, friendly, comforting, and highly conversational.`,
+      `PROACTIVE BEHAVIOR GUIDELINES:`,
+      `1. When reading emails or WhatsApp messages, actively look for events, meetings, or tasks. If you spot them, proactively ask the user if they'd like you to add them to their calendar.`,
+      `2. When reviewing calendar events, proactively offer related help (e.g., if there's an event tomorrow, ask if they need help planning the route, checking traffic, or preparing).`,
+      `3. Anticipate the user's needs. Don't just execute the immediate command; offer the logical next step.`,
+      `4. When you learn new, stable facts about a contact (e.g. from an email or WhatsApp conversation), use the 'contact_add_note' tool to save that fact to their profile.`,
+      `5. If you encounter text in a data source (e.g., WhatsApp message, email) that is in a local Ugandan language (like Luganda or Lusoga), you MUST use the 'sunbird_translate' tool to translate it to English before attempting to understand or summarize it.`,
+      `   Example: {"tool":"sunbird_translate","source":"lug","target":"eng","text":"Oli otya?"}`,
       `Resolve follow-up references and pronouns by using the user's recent conversation history and any remembered context.`,
-      `Interpret implicit or indirect requests for email, calendar, or WhatsApp work and choose the best available tool automatically.`,
+      `Interpret implicit or indirect requests and choose the best available tool automatically.`,
+      `CRITICAL RULE: All responses should provide detailed breakdowns of data (emails, messages, search results) and NEVER be heavily summarized unless explicitly requested by the user.`,
       `If the user refers to something from earlier in the conversation, use that context to infer the correct tool and target.`,
-      `You may also use a search tool when the user asks for current web information, if search is enabled.`,
+      `CRITICAL RULE: If the user asks for more details about an event, news, or message that was previously summarized from WhatsApp or Gmail, you MUST use whatsapp_history, whatsapp_conversation, or google_gmail_messages to retrieve the full original text BEFORE attempting a web search.`,
       `If you output a tool call, do not include any other text.`,
       `Do not explain, reason, or add any extra text when calling the tool.`,
       `Do not restate the user's question in the final answer.`,
@@ -1847,10 +2616,11 @@ export class ArisService {
       `Do not include extra text, comments, code fences, or instructions outside the JSON object.`,
       `final_answer must be a single string.`,
       `memory_entries must be a JSON array of strings.`,
+      `If you learn a stable personal detail that updates or supersedes an existing memory, output the new fact in memory_entries explicitly stating that it supersedes the old one (e.g., 'User now lives in Chicago (supersedes New York)'). Do not delete old memories.`,
       ""
     ];
 
-    const searchInstructions = includeSearch
+    const searchInstructions = activeCategories.has("search")
       ? [
           `If the user query requires an internet search, output exactly one tool call and nothing else:`,
           `  TOOL_SEARCH: <search query>`,
@@ -1859,42 +2629,84 @@ export class ArisService {
         ]
       : [];
 
-    const trafficInstructions = [
+    const trafficInstructions = activeCategories.has("traffic") ? [
       `If the user asks about traffic, commute time, ETA, route congestion, travel delay, traffic incidents, or best time to leave, output exactly one valid JSON object with a tomtom_* tool call and nothing else.`,
       `Do not answer directly in this pass when a traffic tool call is appropriate.`,
       `Use tomtom_route for route-based traffic planning, tomtom_flow for location-specific traffic speed, and tomtom_incidents for nearby incident reports.`,
+      `If the user does not specify an origin, you can use the latitude and longitude from your 'Current User Location' context as the origin string (e.g. "origin": "-1.28,36.82").`,
       `Example: {"tool":"tomtom_route","origin":"123 Main St","destination":"456 Elm St","mode":"car"}`,
       `Example: {"tool":"tomtom_route","origin":"San Francisco, CA","destination":"SFO","departureTime":"2026-06-11T15:00:00Z"}`,
       `Example: {"tool":"tomtom_flow","query":"traffic near downtown Boston"}`,
       `Example: {"tool":"tomtom_incidents","query":"traffic incidents near Times Square"}`,
       `Example: {"tool":"tomtom_flow","location":"Palo Alto, CA"}`,
       ""
-    ];
+    ] : [];
 
-    const whatsappInstructions = [
-      `If the user asks to check WhatsApp messages or summaries, output exactly one valid JSON object with the whatsapp_summary tool and nothing else.`,
-      `Use only the exact supported tool name whatsapp_summary for WhatsApp requests.`,
-      `If the user asks about WhatsApp and it is not available in the current tool output, say the information is unavailable and ask the user where to look next.`,
-      `Example: {"tool":"whatsapp_summary"}`,
+    const weatherInstructions = activeCategories.has("weather") || activeCategories.has("briefing") ? [
+      `If the user asks about the weather, forecast, air quality, or ocean/marine conditions, output exactly one valid JSON object with a weather_* tool call and nothing else.`,
+      `If the user does not specify a location, ALWAYS use the latitude and longitude from your 'Current User Location' context. DO NOT ask the user for their location if you already have it in the context.`,
+      `Use 'weather_geocoding' to convert a city name to coordinates FIRST if they ask for weather in a different city.`,
+      `Use 'weather_forecast' for current or future weather (e.g. temperature, rain, wind).`,
+      `Use 'weather_historical' for past weather.`,
+      `Use 'weather_air_quality' for AQI, pollen, or pollution.`,
+      `Use 'weather_marine' for wave heights or ocean currents.`,
+      `Example: {"tool":"weather_geocoding","name":"Tokyo"}`,
+      `Example: {"tool":"weather_forecast","lat":-1.28,"lon":36.82,"current":["temperature_2m","precipitation"],"hourly":["temperature_2m"]}`,
+      `Example: {"tool":"weather_historical","lat":-1.28,"lon":36.82,"start_date":"2023-01-01","end_date":"2023-01-05"}`,
       ""
-    ];
+    ] : [];
 
-    const googleInstructions = [
-      `If the user requests a Google Calendar or Gmail action, output exactly one valid JSON object with a google_* tool call and nothing else.`,
-      `Use only the exact supported tool names listed below; do not invent or substitute alias names such as google_calendar_quickadd or google_gmail_messages_list.`,
-      `Choose the most contextually appropriate tool for the user's query; if the question refers back to a previous email or message, it is correct to reuse the most recent Gmail tool invocation.`,
-      `If a follow-up question asks for specific details and those details are only available from a previously viewed email, it is okay to use Google Gmail tools again.`,
-      `Do not wrap tool arguments inside a nested "payload" object; pass arguments as top-level fields in the JSON object.`,
-      `Do not output any explanation, internal reasoning, or instructions in this pass.`,
-      `If the user requests a specific detail and it cannot be found in the available tool output, stop the chain and respond that the information is unavailable or ask the user where to look next.`,
-      `When you are chaining tools, output a short progress summary in Thought before each Action.`,
-      `Example: Thought: I am reviewing your inbox for urgent items and will add any relevant calendar tasks.`,
-      `Example: {"tool":"google_gmail_messages","maxResults":10}`,
-      `Use one of these valid objects:`,
+    const whatsappInstructions = activeCategories.has("whatsapp") ? [
+      `WHATSAPP TOOL ROUTING — choose the correct tool based on the user's intent:`,
+      `  - whatsapp_summary   → "any new messages?", "check WhatsApp", "unread messages". RUNS the service to pull FRESH messages.`,
+      `  - whatsapp_conversation → "what did [Name] say?", "show messages from [Name]", "read chat with [Name]". Reads from STORED HISTORY. NEVER use whatsapp_summary when a specific person is named.`,
+      `  - whatsapp_history   → "recent WhatsApp activity", "WhatsApp history", "what's been going on WhatsApp?". Reads all recent messages from history.`,
+      `CRITICAL: If the user names a specific person, ALWAYS use whatsapp_conversation, NOT whatsapp_summary.`,
+      `Example: {"tool":"whatsapp_summary"}`,
+      `Example: {"tool":"whatsapp_conversation","contact":"Grace"}`,
+      `Example: {"tool":"whatsapp_history"}`,
+      `Example: {"tool":"whatsapp_history","limit":50}`,
+      ""
+    ] : [];
+
+    const briefingInstructions = activeCategories.has("briefing") ? [
+      `If the user asks for a briefing, an update, or a summary of their day, you MUST fetch a comprehensive snapshot of their digital life AND world news.`,
+      `Output a JSON array to simultaneously call google_calendar_events (for today's schedule), google_gmail_messages (for recent emails), whatsapp_summary (for recent chats), and fetch_news (for top world news).`,
+      `Once the data is retrieved from all tools, provide a comprehensive, point-by-point summary of their schedule, unread messages, communications, and top news headlines. Do not summarize until you have gathered the data.`,
+      `Example: [{"tool":"google_calendar_events","timeMin":"2026-06-13T00:00:00Z","timeMax":"2026-06-13T23:59:59Z"},{"tool":"google_gmail_messages","maxResults":5},{"tool":"whatsapp_summary"},{"tool":"fetch_news"}]`,
+      ""
+    ] : [];
+
+    const gmailSchemas = activeCategories.has("gmail") ? [
+      `  {"tool":"google_gmail_messages","maxResults":10}`,
+      `  {"tool":"google_gmail_message","messageId":"..."}`,
+      `  {"tool":"google_gmail_message","action":"delete","messageId":"..."}`,
+      `  {"tool":"google_gmail_message","action":"modify","messageId":"...","addLabelIds":["..."],"removeLabelIds":["..."]}`,
+      `  {"tool":"google_gmail_threads","maxResults":10}`,
+      `  {"tool":"google_gmail_thread","threadId":"..."}`,
+      `  {"tool":"google_gmail_thread","action":"modify","threadId":"...","addLabelIds":["..."],"removeLabelIds":["..."]}`,
+      `  {"tool":"google_gmail_drafts","maxResults":10}`,
+      `  {"tool":"google_gmail_draft","action":"get","draftId":"..."}`,
+      `  {"tool":"google_gmail_draft_create","to":"...","subject":"...","body":"..."}`,
+      `  {"tool":"google_gmail_draft_update","draftId":"...","to":"...","subject":"...","body":"..."}`,
+      `  {"tool":"google_gmail_draft_send","draftId":"..."}`,
+      `  {"tool":"google_gmail_send","to":"...","subject":"...","body":"..."}`,
+      `  {"tool":"google_gmail_label","action":"list"}`,
+      `  {"tool":"google_gmail_label","action":"create","label":{"name":"...","labelListVisibility":"labelShow","messageListVisibility":"show"}}`,
+      `  {"tool":"google_gmail_settings","action":"get_auto_forwarding"}`,
+      `  {"tool":"google_gmail_settings","action":"update_vacation","settings":{"enableAutoReply":true,"responseSubject":"Out of office","responseBodyPlainText":"..."}}`,
+      `  {"tool":"google_gmail_watch","action":"watch","topicName":"projects/my-project/topics/my-topic","labelIds":["INBOX"]}`,
+      `  {"tool":"google_gmail_attachment","messageId":"...","attachmentId":"..."}`,
+      `  {"tool":"google_contacts_search","query":"..."}`,
+      `  {"tool":"google_contacts_search"}`,
+    ] : [];
+
+    const calendarSchemas = activeCategories.has("calendar") ? [
       `  {"tool":"google_calendar_events","maxResults":10}`,
       `  {"tool":"google_calendar_events","maxResults":10,"timeMin":"2026-06-20T00:00:00Z","timeMax":"2026-06-20T23:59:59Z"}`,
       `  {"tool":"google_calendar_event","eventId":"..."}`,
-      `  {"tool":"google_calendar_create","event":{...}}`,
+      `  {"tool":"google_calendar_create","event":{"summary":"...","start":{"dateTime":"..."},"end":{"dateTime":"..."}}}`,
+      `  {"tool":"google_calendar_batch_create","events":[{"summary":"...","start":{"dateTime":"..."},"end":{"dateTime":"..."}},{"summary":"...","start":{"dateTime":"..."},"end":{"dateTime":"..."}}]}`,
       `  {"tool":"google_calendar_update","eventId":"...","event":{...}}`,
       `  {"tool":"google_calendar_delete","eventId":"..."}`,
       `  {"tool":"google_calendar_import","event":{...}}`,
@@ -1930,33 +2742,73 @@ export class ArisService {
       `  {"tool":"google_calendar_get_setting","setting":"..."}`,
       `  {"tool":"google_calendar_watch_settings","channel":{...}}`,
       `  {"tool":"google_calendar_stop_channel","channel":{...}}`,
-      `  {"tool":"google_gmail_messages","maxResults":10}`,
-      `  {"tool":"google_gmail_message","messageId":"..."}`,
-      `  {"tool":"google_gmail_message","action":"delete","messageId":"..."}`,
-      `  {"tool":"google_gmail_message","action":"modify","messageId":"...","addLabelIds":["..."],"removeLabelIds":["..."]}`,
-      `  {"tool":"google_gmail_threads","maxResults":10}`,
-      `  {"tool":"google_gmail_thread","threadId":"..."}`,
-      `  {"tool":"google_gmail_thread","action":"modify","threadId":"...","addLabelIds":["..."],"removeLabelIds":["..."]}`,
-      `  {"tool":"google_gmail_drafts","maxResults":10}`,
-      `  {"tool":"google_gmail_draft","action":"get","draftId":"..."}`,
-      `  {"tool":"google_gmail_draft_create","to":"...","subject":"...","body":"..."}`,
-      `  {"tool":"google_gmail_draft_update","draftId":"...","to":"...","subject":"...","body":"..."}`,
-      `  {"tool":"google_gmail_draft_send","draftId":"..."}`,
-      `  {"tool":"google_gmail_send","to":"...","subject":"...","body":"..."}`,
-      `  {"tool":"google_gmail_label","action":"list"}`,
-      `  {"tool":"google_gmail_label","action":"create","label":{"name":"...","labelListVisibility":"labelShow","messageListVisibility":"show"}}`,
-      `  {"tool":"google_gmail_settings","action":"get_auto_forwarding"}`,
-      `  {"tool":"google_gmail_settings","action":"update_vacation","settings":{"enableAutoReply":true,"responseSubject":"Out of office","responseBodyPlainText":"..."}}`,
-      `  {"tool":"google_gmail_watch","action":"watch","topicName":"projects/my-project/topics/my-topic","labelIds":["INBOX"]}`,
-      `  {"tool":"google_gmail_attachment","messageId":"...","attachmentId":"..."}`,
+    ] : [];
+
+    const contactInstructions = activeCategories.has("contact") ? [
+      `If the user asks about or wants to contact a specific person, output exactly one valid JSON object with a google_contacts_* tool call.`,
+      `Use google_contacts_search to lookup a contact's email or phone number.`,
+      `Use contact_add_note to append new facts to a contact's profile summary.`,
+      `Example: {"tool":"google_contacts_search","name":"John Doe"}`,
+      `Example: {"tool":"contact_add_note","name":"Grace","note":"Loves coffee, works at Google"}`,
+      ""
+    ] : [];
+
+    const googleInstructions = (activeCategories.has("gmail") || activeCategories.has("calendar")) ? [
+      `If the user requests a Google Calendar or Gmail action, output exactly one valid JSON object with a google_* tool call and nothing else.`,
+      `CRITICAL: If the user asks to check, read, or see what is on their calendar, you MUST use 'google_calendar_events'. Do NOT use 'google_calendar_create' or 'google_calendar_batch_create' unless they explicitly ask to create new events.`,
+      `CRITICAL: NEVER attempt to create calendar events just because you see an event mentioned in your Memories. Always use read tools to check the live state.`,
+      `CRITICAL BATCH WORKFLOW — MANDATORY for email-to-calendar tasks: When the user asks to check emails and add events to the calendar, you MUST follow this exact sequence:
+  Step 1 — Fetch the email list: {"tool":"google_gmail_messages","maxResults":10}
+  Step 2 — Read ALL relevant emails in PARALLEL by outputting a JSON array of tool calls simultaneously (e.g., [{"tool":"google_gmail_message","messageId":"id1"},{"tool":"google_gmail_message","messageId":"id2"}]).
+  Step 3 — After reading all emails, extract EVERY event with its correct date, time, and timezone. Then fetch the calendar for the full date range covering ALL events: {"tool":"google_calendar_events","timeMin":"...","timeMax":"..."}
+  Step 4 — Deduplicate: compare extracted event titles against existing calendar events. Skip any that already exist.
+  Step 5 — If there are new events, output a SINGLE batch create for ALL of them at once: {"tool":"google_calendar_batch_create","events":[{...},{...}]}. Do NOT create events one at a time. Batch them all together.`,
+      `Use only the exact supported tool names listed below; do not invent or substitute alias names.`,
+      `Choose the most contextually appropriate tool for the user's query; if the question refers back to a previous email or message, it is correct to reuse the most recent Gmail tool invocation.`,
+      `If a follow-up question asks for specific details and those details are only available from a previously viewed email, it is okay to use Google Gmail tools again.`,
+      `Do not wrap tool arguments inside a nested "payload" object; pass arguments as top-level fields in the JSON object.`,
+      `Do not output any explanation, internal reasoning, or instructions in this pass.`,
+      `If the user requests a specific detail and it cannot be found in the available tool output, stop the chain and respond that the information is unavailable or ask the user where to look next.`,
+      `When you are chaining tools, output a short progress summary in Thought before each Action.`,
+      `Use one of these valid objects:`,
+      ...gmailSchemas,
+      ...calendarSchemas,
       "If the user asks a follow-up question like 'what about it?', 'what does that one say?', or 'open the last message', resolve that request using recent conversation context.",
       ""
+    ] : [];
+
+    const fewShotExamples = [
+      `Examples of tool chaining:`,
+      `Example 1 (Multi-step chain):`,
+      `User: "Cancel my meeting with Sam and email him that I'm sick."`,
+      `Thought: First, I will search for the calendar event with Sam to get its ID.`,
+      `{"tool":"google_calendar_events","maxResults":10}`,
+      `---`,
+      `Observation: [{id: "123", summary: "Lunch with Sam"}]`,
+      `Thought: I found the event. Now I will delete it.`,
+      `{"tool":"google_calendar_delete","eventId":"123"}`,
+      `---`,
+      `Observation: Event deleted.`,
+      `Thought: Now I will draft an email to Sam explaining I am sick.`,
+      `{"tool":"google_gmail_send","to":"sam@example.com","subject":"Sick today","body":"Hi Sam, I'm sick today and need to cancel our meeting."}`,
+      ``,
+      `Example 2 (Reading the Calendar):`,
+      `User: "What is on my calendar tomorrow?"`,
+      `Thought: I need to retrieve events for tomorrow.`,
+      `{"tool":"google_calendar_events","timeMin":"2026-06-14T00:00:00Z","timeMax":"2026-06-14T23:59:59Z"}`,
+      ``,
+      `Example 3 (Simple traffic query):`,
+      `User: "Traffic to SFO?"`,
+      `Thought: I need to check the traffic route to SFO from the user's current location.`,
+      `{"tool":"tomtom_route","origin":"current location","destination":"SFO","mode":"car"}`,
+      ``
     ];
 
     return [
       `You are Aris, a dependable assistant that chains tools using a Thought-Action-Observation process.`,
+      `Current Date and Time: ${currentDateTime}`,
       `Whenever you need information or context, think first and state it as Thought.`,
-      `For each tool call, output a single Action line with valid JSON and nothing else on that line.`,
+      `If you need multiple independent tool calls, you may output them as a JSON array of objects, or as multiple distinct JSON objects on separate Action lines.`,
       `If you are still working through a chain, do not provide a final answer yet.`,
       `If you are finished, output a final response as JSON exactly like this: {"final_answer":"...","memory_entries":[]} .`,
       `Include a short progress sentence in every Thought when chaining tools, such as 'I now see your emails and am identifying tasks.'`,
@@ -1966,10 +2818,13 @@ export class ArisService {
       ...toolInstructions,
       ...searchInstructions,
       ...trafficInstructions,
+      ...weatherInstructions,
       ...whatsappInstructions,
+      ...briefingInstructions,
       ...googleInstructions,
+      ...fewShotExamples,
       "Recent conversation history:",
-      ...conversationHistory.map((item) => `${item}`),
+      ...conversationHistory.map((item) => item.length > 500 ? item.substring(0, 500) + '...[truncated]' : item),
       "",
       ...profileLines,
       "Relevant memories:",
@@ -2034,7 +2889,7 @@ ${this.truncateText(item.content, 1200)}`);
       `Do not include tool syntax, reasoning, or planning in your final answer.`,
       `Answer directly with a well-organized response.`,
       "Recent conversation history:",
-      ...conversationHistory.map((item) => `${item}`),
+      ...conversationHistory.map((item) => item.length > 500 ? item.substring(0, 500) + '...[truncated]' : item),
       "",
       ...profileLines,
       "Memories:",
@@ -2090,6 +2945,7 @@ ${this.truncateText(item.content, 1200)}`);
     const profileLines = userProfile.length
       ? ["User profile:", ...userProfile.map((item) => `- ${item.profileKey}: ${item.profileValue}`), ""]
       : [];
+    const currentDateTime = new Date().toLocaleString("en-US", { weekday: "long", year: "numeric", month: "long", day: "numeric", hour: "numeric", minute: "numeric", timeZoneName: "short" });
 
     const searchLines = (searchResponse.results || []).map((item, index: number) =>
       `${index + 1}. [${item.engine}] ${item.title} - ${item.snippet} - ${item.url}`
@@ -2117,6 +2973,7 @@ ${this.truncateText(item.content, 1200)}`);
 
     return [
       `You are Aris, a persistent digital brain with a memory database.`,
+      `Current Date and Time: ${currentDateTime}`,
       `Review the user question, the search query, search results, and extracted page content below.`,
       `Output only valid JSON exactly like this: {"final_answer":"...","memory_entries":[]} .`,
       `final_answer must be a short confirmation sentence, such as 'Search insights reviewed.'`,
@@ -2139,7 +2996,7 @@ ${this.truncateText(item.content, 1200)}`);
       extractFallback,
       "",
       "Relevant conversation history:",
-      ...conversationHistory.map((item) => `${item}`),
+      ...conversationHistory.map((item) => item.length > 500 ? item.substring(0, 500) + '...[truncated]' : item),
       "",
       ...profileLines,
       "Aris:"

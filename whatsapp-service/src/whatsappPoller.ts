@@ -1,80 +1,148 @@
-import crypto from "crypto";
 import cron from "node-cron";
-import makeWASocket, { Browsers, DisconnectReason, AnyMessageContent, WASocket, fetchLatestWaWebVersion, fetchLatestBaileysVersion, proto } from "@whiskeysockets/baileys";
+import makeWASocket, {
+  Browsers,
+  DisconnectReason,
+  AnyMessageContent,
+  WASocket,
+  fetchLatestWaWebVersion,
+  fetchLatestBaileysVersion,
+  proto,
+} from "@whiskeysockets/baileys";
 import { usePostgreSQLAuthState } from "postgres-baileys";
 import qrcode from "qrcode-terminal";
 import { Pool } from "pg";
+import { EventEmitter } from "events";
 import { normalizeConnectionString } from "./db";
-import { saveWhatsappMessage, getPendingWhatsappMessagesByRemoteJid } from "./dbAdapter";
+import {
+  saveWhatsappMessage,
+  getPendingWhatsappMessagesByRemoteJid,
+  saveWhatsappGroup,
+} from "./dbAdapter";
 import { info, error } from "./logger";
 
-const AUTH_TABLE_NAME = process.env.WHATSAPP_AUTH_TABLE || "aris_whatsapp_auth_state";
+// ---------------------------------------------------------------------------
+// Configuration
+// ---------------------------------------------------------------------------
+
+const AUTH_TABLE_NAME =
+  process.env.WHATSAPP_AUTH_TABLE || "aris_whatsapp_auth_state";
+
 const DAY_START_HOUR = 8;
 const DAY_END_HOUR = 20;
 const BASE_INTERVAL_MINUTES = 55;
 const JITTER_MINUTES = 32;
-const QUIET_WINDOW_MS = 20000;
-const MAX_SESSION_MS = 2 * 60 * 1000;
-const FIRST_RUN_STAY_ALIVE_MS = 10 * 60 * 1000;
-const DEBUG_WHATSAPP_RAW_PAYLOAD = process.env.WHATSAPP_DEBUG_RAW_PAYLOAD === "true";
 
-function getDatabaseUrl() {
-  const databaseUrl = process.env.DATABASE_URL;
-  if (!databaseUrl) {
-    throw new Error("DATABASE_URL is required for WhatsApp polling.");
+/**
+ * Absolute hard-cap on how long a session may live.
+ * These are *safety nets*, not the primary completion mechanism.
+ * The session ends as soon as all in-flight work drains; these caps
+ * exist only to guard against WhatsApp never sending a completion signal.
+ */
+const HARD_CAP_FRESH_MS = 35 * 60 * 1000;    // 35 min  – first-ever QR pair
+const HARD_CAP_RECONNECT_MS = 10 * 60 * 1000; // 10 min  – subsequent sessions
+
+const QUIET_WINDOW_MS = 180_000; // wait this long after last activity before closing a session
+const DEBUG_WHATSAPP_RAW_PAYLOAD =
+  process.env.WHATSAPP_DEBUG_RAW_PAYLOAD === "true";
+
+// ---------------------------------------------------------------------------
+// WorkTracker
+// ---------------------------------------------------------------------------
+
+/**
+ * Tracks the number of concurrent in-flight async operations.
+ * Emits "drain" when the counter reaches zero (and was previously > 0).
+ * This replaces all guessed setTimeout-based draining.
+ */
+class WorkTracker extends EventEmitter {
+  private count = 0;
+
+  begin(): void {
+    this.count += 1;
   }
-  return databaseUrl;
+
+  end(): void {
+    if (this.count <= 0) {
+      return;
+    }
+    this.count -= 1;
+    if (this.count === 0) {
+      this.emit("drain");
+    }
+  }
+
+  get size(): number {
+    return this.count;
+  }
+
+  /** Returns a Promise that resolves when the tracker drains (or immediately if already 0). */
+  waitDrain(): Promise<void> {
+    if (this.count === 0) {
+      return Promise.resolve();
+    }
+    return new Promise((resolve) => this.once("drain", resolve));
+  }
+
+  /**
+   * Wraps an async operation: increments before, decrements after (success or failure).
+   * Returns the original promise so callers can still await results.
+   */
+  track<T>(op: Promise<T>): Promise<T> {
+    this.begin();
+    op.finally(() => this.end());
+    return op;
+  }
 }
 
-function getRandomPollDelayMs() {
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+function getDatabaseUrl(): string {
+  const url = process.env.DATABASE_URL;
+  if (!url) {
+    throw new Error("DATABASE_URL is required for WhatsApp polling.");
+  }
+  return url;
+}
+
+function getRandomPollDelayMs(): number {
   const jitter = (Math.random() * 2 - 1) * JITTER_MINUTES;
   const minutes = Math.max(1, BASE_INTERVAL_MINUTES + jitter);
   return Math.round(minutes * 60 * 1000);
 }
 
-function isDaytime(date: Date) {
+function isDaytime(date: Date): boolean {
   const hour = date.getHours();
   return hour >= DAY_START_HOUR && hour < DAY_END_HOUR;
 }
 
-function extractTextMessage(message: AnyMessageContent | undefined): string | undefined {
+function extractTextMessage(
+  message: AnyMessageContent | undefined
+): string | undefined {
   if (!message) return undefined;
-
-  const anyMessage = message as any;
-  if ("conversation" in anyMessage && typeof anyMessage.conversation === "string") {
-    return anyMessage.conversation;
-  }
-
-  if ("extendedTextMessage" in anyMessage && typeof anyMessage.extendedTextMessage?.text === "string") {
-    return anyMessage.extendedTextMessage.text;
-  }
-
-  if ("imageMessage" in anyMessage && typeof anyMessage.imageMessage?.caption === "string") {
-    return anyMessage.imageMessage.caption;
-  }
-
-  if ("videoMessage" in anyMessage && typeof anyMessage.videoMessage?.caption === "string") {
-    return anyMessage.videoMessage.caption;
-  }
-
-  if ("documentMessage" in anyMessage && typeof anyMessage.documentMessage?.fileName === "string") {
-    return anyMessage.documentMessage.fileName;
-  }
-
+  const m = message as any;
+  if (typeof m.conversation === "string") return m.conversation;
+  if (typeof m.extendedTextMessage?.text === "string")
+    return m.extendedTextMessage.text;
+  if (typeof m.imageMessage?.caption === "string")
+    return m.imageMessage.caption;
+  if (typeof m.videoMessage?.caption === "string")
+    return m.videoMessage.caption;
+  if (typeof m.documentMessage?.fileName === "string")
+    return m.documentMessage.fileName;
   return undefined;
 }
 
-async function ensureWhatsappHistorySyncTable(pool: Pool) {
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS whatsapp_history_sync (
-      id SERIAL PRIMARY KEY,
-      auth_state_hash TEXT UNIQUE NOT NULL,
-      sync_completed BOOLEAN NOT NULL DEFAULT FALSE,
-      synced_at TIMESTAMP WITH TIME ZONE,
-      created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-      updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
-    );
-  `);
+function isPreKeyError(err: unknown): boolean {
+  const msg = (err as any)?.message;
+  const name = (err as any)?.name;
+  return (
+    (typeof msg === "string" &&
+      /prekey/i.test(msg) &&
+      /invalid|missing|not found/i.test(msg)) ||
+    (typeof name === "string" && name.toLowerCase() === "prekeyerror")
+  );
 }
 
 function getChatId(chat: any): string | undefined {
@@ -85,9 +153,69 @@ function shouldProcessUnreadChat(chat: any): boolean {
   return typeof chat?.unreadCount === "number" && chat.unreadCount > 0;
 }
 
+// ---------------------------------------------------------------------------
+// DB: whatsapp_history_sync table (keyed by stable account_id / JID)
+// ---------------------------------------------------------------------------
+
+async function ensureWhatsappHistorySyncTable(pool: Pool): Promise<void> {
+  // Create the table if it doesn't exist, using account_id as the stable key.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS whatsapp_history_sync (
+      id                SERIAL PRIMARY KEY,
+      account_id        TEXT UNIQUE NOT NULL,
+      sync_completed    BOOLEAN NOT NULL DEFAULT FALSE,
+      synced_at         TIMESTAMP WITH TIME ZONE,
+      created_at        TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+      updated_at        TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+    );
+  `);
+
+  // Migration: if the old auth_state_hash column still exists, rename it.
+  // This is idempotent — it silently fails if the column is already gone.
+  await pool
+    .query(
+      `ALTER TABLE whatsapp_history_sync RENAME COLUMN auth_state_hash TO account_id;`
+    )
+    .catch(() => {
+      /* column already renamed or never existed – safe to ignore */
+    });
+}
+
+async function hasCompletedHistorySync(
+  pool: Pool,
+  accountId: string
+): Promise<boolean> {
+  const result = await pool.query(
+    `SELECT sync_completed FROM whatsapp_history_sync WHERE account_id = $1`,
+    [accountId]
+  );
+  return (
+    (result.rowCount ?? 0) > 0 && result.rows[0].sync_completed === true
+  );
+}
+
+async function markHistorySyncComplete(
+  pool: Pool,
+  accountId: string
+): Promise<void> {
+  await pool.query(
+    `INSERT INTO whatsapp_history_sync (account_id, sync_completed, synced_at, updated_at)
+     VALUES ($1, TRUE, NOW(), NOW())
+     ON CONFLICT (account_id)
+     DO UPDATE SET sync_completed = TRUE, synced_at = NOW(), updated_at = NOW()`,
+    [accountId]
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Message saving helpers
+// ---------------------------------------------------------------------------
+
 async function saveUnreadHistoryMessages(history: any): Promise<number> {
   if (!history?.chats?.length || !history?.messages?.length) {
-    info("WhatsApp history payload contained no chats or messages; no unread messages found.");
+    info(
+      "WhatsApp history payload contained no chats or messages; skipping."
+    );
     return 0;
   }
 
@@ -97,539 +225,637 @@ async function saveUnreadHistoryMessages(history: any): Promise<number> {
     .filter((jid: string | undefined): jid is string => Boolean(jid));
 
   if (!unreadChatIds.length) {
-    info("WhatsApp history payload contained no chats with unread messages; no unread messages found.");
+    info("WhatsApp history payload contained no chats with unread messages.");
     return 0;
   }
 
-  const unreadChatSet = new Set(unreadChatIds);
-  const messagesToSave = history.messages.filter((msg: any) => {
-    const remoteJid = msg?.key?.remoteJid;
-    return remoteJid && !msg?.key?.fromMe && unreadChatSet.has(remoteJid);
-  });
+  const unreadSet = new Set<string>(unreadChatIds);
+  const toSave = history.messages.filter(
+    (msg: any) =>
+      msg?.key?.remoteJid &&
+      !msg?.key?.fromMe &&
+      unreadSet.has(msg.key.remoteJid)
+  );
 
-  if (!messagesToSave.length) {
-    info("WhatsApp history payload contained no unread messages to save.");
+  if (!toSave.length) {
+    info("No unread messages in this history payload.");
     return 0;
   }
 
-  let savedCount = 0;
-  for (const msg of messagesToSave) {
+  let saved = 0;
+  const validRecords = [];
+
+  for (const msg of toSave) {
     const messageText = extractTextMessage(msg.message);
-    if (!messageText) {
-      continue;
-    }
+    if (!messageText) continue;
 
-    const senderId = msg.key.participant || msg.key.remoteJid;
-    if (!senderId) {
-      continue;
-    }
+    const isGroup = msg.key.remoteJid?.endsWith("@g.us");
+    const participantJid =
+      msg.key.participant || (isGroup ? (msg as any).participant : null) || null;
+    const senderId = participantJid || msg.key.remoteJid;
+    if (!senderId) continue;
 
-    try {
-      await saveWhatsappMessage({
-        senderId,
-        messageId: msg.key.id || `${senderId}:${msg.messageTimestamp}`,
-        messageText,
-        whatsappTimestamp: Number(msg.messageTimestamp) || Date.now(),
-        metadata: {
-          remoteJid: msg.key.remoteJid,
-          participant: msg.key.participant,
-          messageStubType: msg.messageStubType,
-          unreadCount: history.chats.find((chat: any) => getChatId(chat) === msg.key.remoteJid)?.unreadCount,
-        },
-      });
-      savedCount += 1;
-    } catch (err) {
-      error("Failed to save historical unread WhatsApp message", err);
-    }
+    validRecords.push({ msg, senderId, messageText, isGroup });
   }
 
-  if (savedCount) {
-    info(`Saved ${savedCount} historical unread WhatsApp message(s) from initial sync.`);
+  // Process in batches to avoid tying up a single connection sequentially for
+  // minutes, which causes Neon to terminate idle proxy connections.
+  // We use 25 since the pool max is 50, leaving room for other concurrent ops.
+  const BATCH_SIZE = 25;
+  for (let i = 0; i < validRecords.length; i += BATCH_SIZE) {
+    const batch = validRecords.slice(i, i + BATCH_SIZE);
+    
+    await Promise.all(
+      batch.map(async (record) => {
+        try {
+          await saveWhatsappMessage({
+            senderId: record.senderId,
+            messageId: record.msg.key.id || `${record.senderId}:${record.msg.messageTimestamp}`,
+            messageText: record.messageText,
+            whatsappTimestamp: Number(record.msg.messageTimestamp) || Date.now(),
+            metadata: {
+              remoteJid: record.msg.key.remoteJid,
+              groupJid: record.isGroup ? record.msg.key.remoteJid : undefined,
+              participant: record.msg.key.participant,
+              pushName: (record.msg as any).pushName || undefined,
+              messageStubType: record.msg.messageStubType,
+              unreadCount: history.chats.find(
+                (chat: any) => getChatId(chat) === record.msg.key.remoteJid
+              )?.unreadCount,
+            },
+          });
+          saved += 1;
+        } catch (err) {
+          error("Failed to save historical WhatsApp message", err);
+        }
+      })
+    );
   }
 
-  return savedCount;
+  if (saved) {
+    info(`Saved ${saved} historical unread WhatsApp message(s) from initial sync.`);
+  }
+  return saved;
 }
 
-async function saveLocalUnreadMessagesByRemoteJid(remoteJid: string): Promise<number> {
-  const pendingMessages = await getPendingWhatsappMessagesByRemoteJid(remoteJid, 100);
-  if (!pendingMessages.length) {
-    info(`No pending local unread WhatsApp messages found for ${remoteJid}.`);
+async function saveLocalUnreadMessagesByRemoteJid(
+  remoteJid: string
+): Promise<number> {
+  const pending = await getPendingWhatsappMessagesByRemoteJid(remoteJid, 100);
+  if (!pending.length) {
+    info(`No pending local unread messages for ${remoteJid}.`);
     return 0;
   }
-
-  info(`Loaded ${pendingMessages.length} pending local unread WhatsApp message(s) for ${remoteJid} from local history.`);
-  return pendingMessages.length;
-}
-
-function isPreKeyError(err: unknown): boolean {
-  if (!err || typeof err !== "object") {
-    return false;
-  }
-
-  const message = (err as any)?.message;
-  const name = (err as any)?.name;
-  return (
-    typeof message === "string" && /prekey/i.test(message) && /invalid|missing|not found/i.test(message)
-  ) || typeof name === "string" && name.toLowerCase() === "prekeyerror";
+  info(`Loaded ${pending.length} pending local unread message(s) for ${remoteJid}.`);
+  return pending.length;
 }
 
 async function handleUnreadChatMetadata(chat: any): Promise<number> {
-  if (!shouldProcessUnreadChat(chat)) {
-    info("WhatsApp chat metadata update contained no unread messages.");
-    return 0;
-  }
-
+  if (!shouldProcessUnreadChat(chat)) return 0;
   const remoteJid = getChatId(chat);
-  if (!remoteJid) {
-    info("WhatsApp chat metadata update had no remote JID; ignoring.");
-    return 0;
-  }
-
-  info(`Detected unread WhatsApp chat metadata for ${remoteJid} with unreadCount=${chat.unreadCount}.`);
-  return await saveLocalUnreadMessagesByRemoteJid(remoteJid);
-}
-
-function normalizeAuthState(value: unknown): unknown {
-  if (Buffer.isBuffer(value)) {
-    return value.toString("base64");
-  }
-  if (Array.isArray(value)) {
-    return value.map(normalizeAuthState);
-  }
-  if (value && typeof value === "object") {
-    const objectValue = value as Record<string, unknown>;
-    return Object.keys(objectValue).sort().reduce((acc, key) => {
-      acc[key] = normalizeAuthState(objectValue[key]);
-      return acc;
-    }, {} as Record<string, unknown>);
-  }
-  return value;
-}
-
-function computeAuthStateHash(state: any) {
-  const normalized = normalizeAuthState(state.creds || state);
-  const payload = JSON.stringify(normalized);
-  return crypto.createHash("sha256").update(payload).digest("hex");
-}
-
-async function hasCompletedWhatsappHistorySync(pool: Pool, authStateHash: string) {
-  const result = await pool.query(
-    `SELECT sync_completed FROM whatsapp_history_sync WHERE auth_state_hash = $1`,
-    [authStateHash]
+  if (!remoteJid) return 0;
+  info(
+    `Unread chat metadata for ${remoteJid} (unreadCount=${chat.unreadCount}).`
   );
-  return (result.rowCount ?? 0) > 0 && result.rows[0].sync_completed === true;
+  return saveLocalUnreadMessagesByRemoteJid(remoteJid);
 }
 
-async function markWhatsappHistorySyncComplete(pool: Pool, authStateHash: string) {
-  await pool.query(
-    `INSERT INTO whatsapp_history_sync (auth_state_hash, sync_completed, synced_at, updated_at)
-     VALUES ($1, TRUE, NOW(), NOW())
-     ON CONFLICT (auth_state_hash) DO UPDATE SET sync_completed = TRUE, synced_at = NOW(), updated_at = NOW()`,
-    [authStateHash]
-  );
+// ---------------------------------------------------------------------------
+// Socket close helper
+// ---------------------------------------------------------------------------
+
+function waitForSocketClose(sock: WASocket): Promise<void> {
+  return new Promise<void>((resolve) => {
+    let settled = false;
+
+    const done = () => {
+      if (settled) return;
+      settled = true;
+      sock.ws?.off("close", done);
+      sock.ev.off("connection.update", onUpdate);
+      resolve();
+    };
+
+    const onUpdate = (upd: any) => {
+      if (upd?.connection === "close") done();
+    };
+
+    // Already closed?
+    const ws = sock.ws as any;
+    if (!ws || ws.readyState === 3 /* CLOSED */) {
+      resolve();
+      return;
+    }
+
+    sock.ws?.once("close", done);
+    sock.ev.on("connection.update", onUpdate);
+  });
 }
 
-async function disconnectSocket(sock: WASocket) {
+function closeSocket(sock: WASocket): void {
   try {
-    info("Closing WhatsApp socket after quiet period.");
     if (typeof sock.end === "function") {
       sock.end(new Error("Intentional polling cutoff"));
     } else {
       sock.ws?.close();
     }
   } catch {
-    // ignore
+    /* ignore */
   }
 }
 
-export async function pollWhatsappInboxOnce() {
+// ---------------------------------------------------------------------------
+// Main polling function
+// ---------------------------------------------------------------------------
+
+export async function pollWhatsappInboxOnce(): Promise<void> {
   const databaseUrl = getDatabaseUrl();
   const url = new URL(databaseUrl);
   info(`WhatsApp service using database host: ${url.hostname}`);
 
-  const normalizedDatabaseUrl = normalizeConnectionString(databaseUrl);
   const pool = new Pool({
-    connectionString: normalizedDatabaseUrl,
-    max: Number(process.env.WHATSAPP_PG_POOL_MAX) || 20,
-    idleTimeoutMillis: 60000,
-    connectionTimeoutMillis: Number(process.env.WHATSAPP_PG_CONNECTION_TIMEOUT_MS) || 15000,
+    connectionString: normalizeConnectionString(databaseUrl),
+    max: Number(process.env.WHATSAPP_PG_POOL_MAX) || 50,
+    idleTimeoutMillis: 60_000,
+    connectionTimeoutMillis:
+      Number(process.env.WHATSAPP_PG_CONNECTION_TIMEOUT_MS) || 300_000,
   });
+
   await ensureWhatsappHistorySyncTable(pool);
 
-  const { state, saveCreds } = await usePostgreSQLAuthState(pool, AUTH_TABLE_NAME);
-  const getAuthStateHash = () => computeAuthStateHash(state);
-  let authStateHash = getAuthStateHash();
-  let historySyncPending = !(await hasCompletedWhatsappHistorySync(pool, authStateHash));
-  let historySyncCompleted = !historySyncPending;
+  const { state, saveCreds } = await usePostgreSQLAuthState(
+    pool,
+    AUTH_TABLE_NAME
+  );
 
-  const refreshHistorySyncState = async () => {
-    authStateHash = getAuthStateHash();
-    historySyncPending = !(await hasCompletedWhatsappHistorySync(pool, authStateHash));
-    historySyncCompleted = !historySyncPending;
-  };
+  // -------------------------------------------------------------------------
+  // Stable account identity — never changes after first QR scan.
+  // Falls back to a placeholder while the account is being registered so that
+  // we don't mark sync complete for the wrong session.
+  // -------------------------------------------------------------------------
+  const getAccountId = (): string | null =>
+    state.creds?.me?.id ?? null;
 
-  const isFreshSession = !state.creds?.me || process.env.FIRST_RUN === "true";
-  const shouldExitAfterPoolEnd = process.argv.includes("once") || process.env.WHATSAPP_ABORT_ON_CLOSE === "true";
-  const sessionTimeoutMs = isFreshSession ? Math.max(MAX_SESSION_MS, FIRST_RUN_STAY_ALIVE_MS + 60 * 1000) : MAX_SESSION_MS;
+  const initialAccountId = getAccountId();
+  const alreadySynced = initialAccountId
+    ? await hasCompletedHistorySync(pool, initialAccountId)
+    : false;
 
-  const hasAuth = Boolean(state.creds?.me);
-  info(`WhatsApp saved auth state exists: ${hasAuth}`);
-  if (!hasAuth) {
-    info("No saved WhatsApp auth was found. A QR code will be shown for pairing.");
-  }
+  // historySyncPending is TRUE if we still need to receive history from WA.
+  let historySyncPending = !alreadySynced;
+  let historySyncCompleted = alreadySynced;
 
+  // A "fresh session" is one where history sync is required — this drives
+  // the hard-cap timeout choice and whether we wait for the sync before closing.
+  const isFreshSession =
+    historySyncPending ||
+    !state.creds?.me ||
+    process.env.FIRST_RUN === "true";
+
+  const shouldExitAfterDone =
+    process.argv.includes("once") ||
+    process.env.WHATSAPP_ABORT_ON_CLOSE === "true";
+
+  const hardCapMs = isFreshSession ? HARD_CAP_FRESH_MS : HARD_CAP_RECONNECT_MS;
+
+  info(
+    `WhatsApp auth loaded. accountId=${initialAccountId ?? "none"} ` +
+      `historySyncPending=${historySyncPending} ` +
+      `isFreshSession=${isFreshSession} ` +
+      `hardCapMs=${hardCapMs}`
+  );
+
+  // -------------------------------------------------------------------------
+  // Fetch WA Web version
+  // -------------------------------------------------------------------------
   const waVersionResponse = await fetchLatestWaWebVersion();
   let version = waVersionResponse.version;
-  let versionLabel = `WhatsApp Web version ${version.join('.')}`;
+  let versionLabel = `WhatsApp Web version ${version.join(".")}`;
 
   if (!waVersionResponse.isLatest) {
     error("Failed to fetch latest WhatsApp Web version", waVersionResponse.error);
-    const baileysFallback = await fetchLatestBaileysVersion();
-    version = baileysFallback.version;
-    versionLabel = `fallback Baileys version ${version.join('.')}`;
+    const fallback = await fetchLatestBaileysVersion();
+    version = fallback.version;
+    versionLabel = `fallback Baileys version ${version.join(".")}`;
   }
-
   info(`Using ${versionLabel}`);
 
+  // -------------------------------------------------------------------------
+  // Session lifecycle state
+  // -------------------------------------------------------------------------
   let currentSock: WASocket | undefined;
-  let reconnecting = false;
-  let resolved = false;
   let shutdownRequested = false;
-  let poolShutdownScheduled = false;
-  let quietTimer: NodeJS.Timeout | undefined;
-  let activeHistorySets = 0;
-  let sessionTimer: NodeJS.Timeout | undefined;
-  let unreadMessagesProcessed = 0;
-  let sessionResolve: (() => void) | undefined;
-  const sessionPromise = new Promise<void>((resolve) => {
-    sessionResolve = resolve;
+  let poolClosed = false;
+  let reconnecting = false;
+  let unreadProcessed = 0;
+  // How many messaging-history.set batches we have received so far.
+  // Used to guard receivedPendingNotifications: that event only means
+  // "WA server flushed offline notifications" — it fires BEFORE the
+  // phone-driven history sync starts, so we must not treat it as
+  // "history complete" unless actual history data has already arrived.
+  let seenHistorySetCount = 0;
+
+  // Tracks every async DB/creds write so we can wait for them before exiting.
+  const dbWork = new WorkTracker();
+  // Tracks active messaging-history.set processing (separate for clarity).
+  const historyWork = new WorkTracker();
+
+  // The single promise the outer caller awaits.
+  let sessionResolve!: () => void;
+  const sessionDone = new Promise<void>((res) => {
+    sessionResolve = res;
   });
-  const pendingOperations = new Set<Promise<unknown>>();
 
-  const trackPendingOperation = <T>(promise: Promise<T>) => {
-    pendingOperations.add(promise as Promise<unknown>);
-    promise.finally(() => pendingOperations.delete(promise as Promise<unknown>));
-    return promise;
+  // Quiet-window timer for reconnect sessions (closed when any work arrives,
+  // restarted after each operation completes).
+  let quietTimer: ReturnType<typeof setTimeout> | undefined;
+
+  // Absolute hard-cap timer — safety net only.
+  let hardCapTimer: ReturnType<typeof setTimeout> | undefined;
+
+  // -------------------------------------------------------------------------
+  // Helpers
+  // -------------------------------------------------------------------------
+
+  const resetQuietTimer = () => {
+    // Fresh sessions get a massive 15-minute idle window to allow the phone
+    // all the time it needs to generate, encrypt, and upload massive INITIAL,
+    // RECENT, and FULL history chunks. Reconnects use the standard 3-minute window.
+    const ms = isFreshSession ? 15 * 60_000 : QUIET_WINDOW_MS;
+
+    if (quietTimer) clearTimeout(quietTimer);
+    quietTimer = setTimeout(() => {
+      info(
+        `Quiet window (${ms}ms) expired with no activity — closing session.`
+      );
+      void endSession("quiet-window");
+    }, ms);
   };
 
-  const waitForPendingOperations = async () => {
-    if (pendingOperations.size === 0) {
-      info("No pending auth writes to drain before pool shutdown.");
-      return;
+  const cancelQuietTimer = () => {
+    if (quietTimer) {
+      clearTimeout(quietTimer);
+      quietTimer = undefined;
     }
-    info(`Waiting for ${pendingOperations.size} pending auth write(s) to settle before pool shutdown.`);
-    await Promise.allSettled(Array.from(pendingOperations));
-    info("Pending auth writes have settled.");
   };
 
-  const canShutdown = () => {
-    return historySyncCompleted && activeHistorySets === 0 && pendingOperations.size === 0 && !reconnecting;
-  };
+  /**
+   * Primary shutdown path. Waits for all in-flight work to drain (no timers),
+   * then closes the socket and pool in order.
+   *
+   * `reason` is just for logging.
+   */
+  const endSession = async (reason: string): Promise<void> => {
+    if (shutdownRequested) return;
+    shutdownRequested = true;
 
-  const attemptShutdown = async () => {
-    if (!isFreshSession) {
-      return;
-    }
-    if (!canShutdown()) {
-      return;
-    }
-    info("First-run sync is complete and all pending work is settled. Triggering shutdown.");
-    await endSession();
-  };
+    info(`WhatsApp session ending (reason=${reason}).`);
+    cancelQuietTimer();
 
-  const drainPostgresPool = async () => {
-    if (poolShutdownScheduled) {
-      return;
+    if (hardCapTimer) {
+      clearTimeout(hardCapTimer);
+      hardCapTimer = undefined;
     }
-    poolShutdownScheduled = true;
 
-    info("[whatsapp-service] Socket completely closed. Now draining DB pool...");
-    await new Promise((resolve) => setTimeout(resolve, 2000));
-    await waitForPendingOperations();
-    try {
-      await pool.end();
-      info("[whatsapp-service] Postgres pool ended cleanly.");
-    } catch (err) {
-      error("Failed to end Postgres pool cleanly", err);
+    // 1. Wait for any in-flight history processing to complete.
+    if (historyWork.size > 0) {
+      info(`Waiting for ${historyWork.size} in-flight history batch(es) to drain…`);
+      await historyWork.waitDrain();
+      info("History work drained.");
     }
-    if (shouldExitAfterPoolEnd) {
-      info("[whatsapp-service] Exiting process after graceful shutdown.");
+
+    // 2. Wait for all DB writes to settle.
+    if (dbWork.size > 0) {
+      info(`Waiting for ${dbWork.size} in-flight DB write(s) to settle…`);
+      await dbWork.waitDrain();
+      info("DB work drained.");
+    }
+
+    // 3. Close the socket and wait for the close event — no setTimeout.
+    if (currentSock) {
+      const sockClosePromise = waitForSocketClose(currentSock);
+      closeSocket(currentSock);
+      info("Waiting for socket close event…");
+      await sockClosePromise;
+      info("Socket closed.");
+    }
+
+    // 4. Final drain check after socket close (creds.update may still fire).
+    if (dbWork.size > 0) {
+      await dbWork.waitDrain();
+    }
+
+    // 5. Drain and end the Postgres pool.
+    if (!poolClosed) {
+      poolClosed = true;
+      try {
+        await pool.end();
+        info("Postgres pool ended cleanly.");
+      } catch (err) {
+        error("Failed to end Postgres pool", err);
+      }
+    }
+
+    if (shouldExitAfterDone) {
+      info("Exiting process after graceful shutdown.");
       process.exit(0);
     }
+
+    sessionResolve();
   };
 
-  const waitForSocketClose = async (sock: WASocket) => {
-    return new Promise<void>((resolve) => {
-      let settled = false;
+  /**
+   * Called whenever we're confident history sync is now complete.
+   * Idempotent — safe to call multiple times.
+   *
+   * The DB write is tracked through dbWork so it cannot race with pool.end()
+   * even if endSession() is triggered concurrently (e.g. hard-cap fires at
+   * the same moment as messaging-history.status arrives).
+   */
+  const onHistorySyncComplete = (trigger: string): void => {
+    if (historySyncCompleted) return;
+    historySyncCompleted = true;
+    historySyncPending = false;
 
-      const cleanup = () => {
-        if (settled) {
-          return;
+    const accountId = getAccountId();
+    info(
+      `History sync marked complete (trigger=${trigger}, accountId=${accountId ?? "unknown"}).`
+    );
+
+    if (accountId && !poolClosed) {
+      const persistOp = (async () => {
+        try {
+          await markHistorySyncComplete(pool, accountId);
+        } catch (err) {
+          error("Failed to persist history sync completion", err);
         }
-        settled = true;
-        sock.ws?.off("close", onClose);
-        sock.ev.off("connection.update", onConnectionUpdate);
-        resolve();
-      };
+      })();
+      dbWork.track(persistOp);
+    }
 
-      const onClose = () => {
-        info("WhatsApp WebSocket close event received.");
-        cleanup();
-      };
-
-      const onConnectionUpdate = (update: any) => {
-        if (update?.connection === "close") {
-          info("WhatsApp connection update reported close.");
-          cleanup();
-        }
-      };
-
-      sock.ws?.once("close", onClose);
-      sock.ev.on("connection.update", onConnectionUpdate);
-    });
+    // ALWAYS start a quiet window when sync completes.
+    // We give it a LONG window (60s) because Baileys might be downloading
+    // huge history chunks in the background right now.
+    resetQuietTimer();
   };
 
-  const endSession = async () => {
-    if (shutdownRequested) {
-      return;
-    }
-    shutdownRequested = true;
-    if (quietTimer) {
-      clearTimeout(quietTimer);
-    }
-    if (sessionTimer) {
-      clearTimeout(sessionTimer);
-    }
-    if (currentSock) {
-      const closePromise = waitForSocketClose(currentSock);
-      await disconnectSocket(currentSock);
-      info("Waiting for socket close event before final completion.");
-      await closePromise;
-      info("Socket close event received. Waiting for pending auth writes to settle.");
-    }
+  // -------------------------------------------------------------------------
+  // Socket factory (called once, and again on restartRequired)
+  // -------------------------------------------------------------------------
 
-    await waitForPendingOperations();
-    resolved = true;
-    sessionResolve?.();
-  };
-
-  const scheduleClose = () => {
-    if (isFreshSession) {
-      info("First-run session active; skipping quiet-period timeout.");
-      return;
-    }
-
-    if (quietTimer) {
-      clearTimeout(quietTimer);
-    }
-    quietTimer = setTimeout(endSession, QUIET_WINDOW_MS);
-  };
-
-  const createSocket = async () => {
+  const createSocket = async (): Promise<WASocket> => {
     const sock = makeWASocket({
       auth: state,
       version,
       browser: Browsers.macOS("Chrome"),
-      shouldIgnoreJid: (jid) => typeof jid === "string" && jid.includes("broadcast"),
+      shouldIgnoreJid: (jid) =>
+        typeof jid === "string" && jid.includes("broadcast"),
       markOnlineOnConnect: false,
+      // Only request full history when we actually need it.
       syncFullHistory: historySyncPending,
-      shouldSyncHistoryMessage: ({ syncType }) => syncType !== 1,
+      // Allow all sync types through — filtering happens at the processing layer.
+      shouldSyncHistoryMessage: () => true,
       getMessage: async () => ({ conversation: "" }),
     });
 
     currentSock = sock;
-    info("WhatsApp polling socket created and auth state loaded.");
+    info("WhatsApp socket created.");
 
-    sock.ev.on("creds.update", async () => {
-      if (resolved) {
-        return;
-      }
-
+    // ------------------------------------------------------------------
+    // creds.update — save credentials to Postgres
+    // Intentionally has NO shutdownRequested guard: Baileys fires creds.update
+    // as part of the graceful close handshake (key rotation, etc). Dropping
+    // those writes would corrupt the auth state for the next session.
+    // endSession() calls dbWork.waitDrain() *after* closing the socket, so
+    // these late writes are always awaited before pool.end().
+    // ------------------------------------------------------------------
+    sock.ev.on("creds.update", () => {
+      if (poolClosed) return; // pool is already gone — nothing we can do
       const op = (async () => {
         try {
           await saveCreds();
-          await refreshHistorySyncState();
-          info("WhatsApp credentials updated and persisted to Postgres.");
+          info("WhatsApp credentials persisted.");
         } catch (err) {
           error("Failed to persist WhatsApp credentials", err);
         }
       })();
-
-      trackPendingOperation(op);
-      await op;
+      dbWork.track(op);
     });
 
-    sock.ev.on("messaging-history.status", async (status: any) => {
-      if (resolved) {
-        return;
-      }
-
-      const op = (async () => {
-        info("WhatsApp messaging-history.status:", JSON.stringify(status));
-        if (!historySyncPending || historySyncCompleted) {
-          return;
-        }
-
-        const relevantSyncTypes = [
-          proto.HistorySync.HistorySyncType.INITIAL_BOOTSTRAP,
-          proto.HistorySync.HistorySyncType.RECENT,
-          proto.HistorySync.HistorySyncType.FULL,
-        ];
-
-        if (!relevantSyncTypes.includes(status.syncType)) {
-          return;
-        }
-
-        if (status.status === "complete" || status.status === "paused") {
-          try {
-            await markWhatsappHistorySyncComplete(pool, getAuthStateHash());
-            historySyncPending = false;
-            historySyncCompleted = true;
-            info("Marked one-time WhatsApp full history sync as completed.");
-            if (isFreshSession) {
-              await attemptShutdown();
-            } else {
-              scheduleClose();
-            }
-          } catch (err) {
-            error("Failed to record WhatsApp history sync completion", err);
-          }
-        }
-      })();
-
-      trackPendingOperation(op);
-    });
-
-    sock.ev.on("messaging-history.set", async (history: any) => {
-      if (resolved) return;
-
-      activeHistorySets += 1;
-      const op = (async () => {
-        const syncStage = historySyncPending && !historySyncCompleted ? "initial sync" : "periodic sync";
-        info(`WhatsApp messaging-history.set received during ${syncStage}.`);
-        if (DEBUG_WHATSAPP_RAW_PAYLOAD) {
-          info("WhatsApp raw messaging-history.set payload:", JSON.stringify(history, null, 2));
-        }
-        try {
-          const savedCount = await saveUnreadHistoryMessages(history);
-          unreadMessagesProcessed += savedCount;
-        } catch (err) {
-          error("Failed to save unread chat history from WhatsApp history payload", err);
-        } finally {
-          activeHistorySets -= 1;
-          if (isFreshSession) {
-            await attemptShutdown();
-          }
-        }
-      })();
-
-      trackPendingOperation(op);
-    });
-
+    // ------------------------------------------------------------------
+    // connection.update — the authoritative connection lifecycle event
+    // ------------------------------------------------------------------
     sock.ev.on("connection.update", async (update: any) => {
       const code = update.lastDisconnect?.error?.output?.statusCode;
-      info("WhatsApp connection.update:", JSON.stringify(update));
+      info("connection.update:", JSON.stringify(update));
 
+      // QR code for fresh pairing
       if (update.qr) {
-        info("WhatsApp QR code generated. Scan the code below with your WhatsApp mobile app:");
-        info(`QR payload length: ${update.qr.length} startsWith https://wa.me/settings/linked_devices#: ${update.qr.startsWith("https://wa.me/settings/linked_devices#")}`);
+        info(
+          "WhatsApp QR code generated. Scan with your WhatsApp mobile app:"
+        );
         qrcode.generate(update.qr, { small: true });
-        info("If the QR does not appear, copy the base64 QR string and use an external QR scanner.");
       }
 
+      // ----------------------------------------------------------------
+      // Socket closed by WhatsApp
+      // ----------------------------------------------------------------
       if (update.connection === "close") {
-        info(`WhatsApp connection closed: ${update.lastDisconnect?.error?.message ?? "unknown"} (code=${code})`);
+        info(
+          `Connection closed: ${update.lastDisconnect?.error?.message ?? "unknown"} (code=${code})`
+        );
 
         if (code === DisconnectReason.restartRequired) {
-          info("WhatsApp restartRequired close received; reconnecting to finalize pairing/login.");
-          if (quietTimer) {
-            clearTimeout(quietTimer);
-            quietTimer = undefined;
-          }
-          if (!resolved && !reconnecting) {
+          // WhatsApp asks us to reconnect to complete pairing/login.
+          info("restartRequired — reconnecting to finalise login.");
+          cancelQuietTimer();
+          if (!shutdownRequested && !reconnecting) {
             reconnecting = true;
-            setTimeout(async () => {
-              reconnecting = false;
-              try {
-                await createSocket();
-              } catch (err) {
-                error("Failed to reconnect WhatsApp socket after restartRequired", err);
-              }
-            }, 1500);
+            // Use a promise-based delay rather than a fire-and-forget timeout.
+            await new Promise<void>((res) => setTimeout(res, 1500));
+            reconnecting = false;
+            try {
+              await createSocket();
+            } catch (err) {
+              error("Failed to reconnect after restartRequired", err);
+              void endSession("reconnect-failed");
+            }
           }
           return;
         }
 
         if (code === DisconnectReason.loggedOut) {
-          info("WhatsApp auth state was logged out. Ending polling session.");
+          info("Logged out — clearing pending sync flag.");
         }
 
         if (!shutdownRequested) {
-          await endSession();
+          void endSession(`connection-close-code-${code ?? "unknown"}`);
         }
-
-        await drainPostgresPool();
-      }
-
-      if (update.connection === "open" || update.isNewLogin || update.registered) {
-        info("WhatsApp connection is ready or paired.");
-
-        if (!historySyncPending || historySyncCompleted) {
-          if (isFreshSession) {
-            await attemptShutdown();
-          } else {
-            scheduleClose();
-          }
-          return;
-        }
-
-        if (state.creds?.accountSyncCounter > 0) {
-          info("Existing WhatsApp sync state detected; treating history sync as complete on open.");
-          try {
-            await markWhatsappHistorySyncComplete(pool, getAuthStateHash());
-            historySyncPending = false;
-            historySyncCompleted = true;
-            info("Marked one-time WhatsApp full history sync as completed on reconnection.");
-          } catch (err) {
-            error("Failed to record WhatsApp history sync completion", err);
-          }
-          if (isFreshSession) {
-            await attemptShutdown();
-          } else {
-            scheduleClose();
-          }
-          return;
-        }
-
-        info("Waiting for WhatsApp history sync completion before closing session.");
-      }
-    });
-
-    sock.ev.on("messages.upsert", async (upsert: any) => {
-      if (resolved || !Array.isArray(upsert.messages)) {
         return;
       }
 
-      const op = (async () => {
-        if (DEBUG_WHATSAPP_RAW_PAYLOAD) {
-          info("WhatsApp raw messages.upsert payload:", JSON.stringify(upsert, null, 2));
+      // ----------------------------------------------------------------
+      // Connection open / paired
+      // ----------------------------------------------------------------
+      if (update.connection === "open" || update.isNewLogin || update.registered) {
+        info("WhatsApp connection is open.");
+
+        // If we already know sync is done (e.g. second reconnect in same session),
+        // let the quiet window handle shutdown.
+        if (!historySyncPending || historySyncCompleted) {
+          resetQuietTimer();
+          return;
         }
 
+        // We need history — do NOT short-circuit on accountSyncCounter.
+        // Just log and wait for messaging-history.* events.
+        info("Waiting for WhatsApp history sync events…");
+      }
+
+      // ----------------------------------------------------------------
+      // receivedPendingNotifications — WA server flushed offline messages
+      // ----------------------------------------------------------------
+      // IMPORTANT: this event means the WA *server* has delivered all
+      // queued offline *server-side* notifications. It fires BEFORE the
+      // phone-driven history sync (AwaitingInitialSync) begins. It is
+      // therefore NOT a reliable signal that history sync is complete
+      // unless we have already received actual messaging-history.set data.
+      //
+      // We use it as a completion trigger only when:
+      //   seenHistorySetCount > 0  — history batches have arrived and
+      //                              been processed, so there is real
+      //                              data behind this event.
+      // If no history batches have arrived yet, we log and keep waiting
+      // for messaging-history.set / messaging-history.status or the hard cap.
+      if (update.receivedPendingNotifications === true && historySyncPending) {
+        info(
+          `receivedPendingNotifications=true — WA server notifications flushed. ` +
+          `seenHistorySetCount=${seenHistorySetCount}.`
+        );
+
+        if (seenHistorySetCount === 0) {
+          info(
+            "No messaging-history.set batches received yet — phone-driven history " +
+            "sync has not started. Waiting for messaging-history.set / " +
+            "messaging-history.status or hard-cap timeout."
+          );
+          // Do NOT mark complete here. The hard-cap timer is the safety net.
+          return;
+        }
+
+        // We have seen real history data. Wait for any in-flight batches
+        // to finish before marking complete.
+        if (historyWork.size > 0) {
+          info(`Still processing ${historyWork.size} history batch(es); waiting…`);
+          await historyWork.waitDrain();
+        }
+        if (!historySyncCompleted) {
+          info("All history batches processed before receivedPendingNotifications; marking sync complete.");
+          onHistorySyncComplete("receivedPendingNotifications");
+        }
+      }
+    });
+
+    // ------------------------------------------------------------------
+    // messaging-history.status — explicit sync completion signal from WA
+    // ------------------------------------------------------------------
+    sock.ev.on("messaging-history.status", async (status: any) => {
+      if (shutdownRequested) return;
+      info("messaging-history.status:", JSON.stringify(status));
+
+      if (!historySyncPending || historySyncCompleted) return;
+
+      const relevantTypes = [
+        proto.HistorySync.HistorySyncType.INITIAL_BOOTSTRAP,
+        proto.HistorySync.HistorySyncType.RECENT,
+        proto.HistorySync.HistorySyncType.FULL,
+      ];
+      if (!relevantTypes.includes(status.syncType)) return;
+
+      if (status.status === "complete" || status.status === "paused") {
+        // Wait for any in-flight batches that arrived before this status event.
+        if (historyWork.size > 0) {
+          info(
+            `messaging-history.status=${status.status}: waiting for ${historyWork.size} batch(es) to drain first…`
+          );
+          await historyWork.waitDrain();
+        }
+        onHistorySyncComplete(`messaging-history.status:${status.status}`);
+      }
+    });
+
+    // ------------------------------------------------------------------
+    // messaging-history.set — actual history data batches from the phone
+    // ------------------------------------------------------------------
+    sock.ev.on("messaging-history.set", (history: any) => {
+      if (shutdownRequested) return;
+
+      seenHistorySetCount += 1;
+
+      // Cancel quiet timer while processing — we have active work.
+      cancelQuietTimer();
+
+      const op = (async () => {
+        const stage =
+          historySyncPending && !historySyncCompleted
+            ? "initial sync"
+            : "periodic sync";
+        info(`messaging-history.set #${seenHistorySetCount} received during ${stage}.`);
+        if (DEBUG_WHATSAPP_RAW_PAYLOAD) {
+          info(
+            "Raw messaging-history.set payload:",
+            JSON.stringify(history, null, 2)
+          );
+        }
+        try {
+          const saved = await saveUnreadHistoryMessages(history);
+          unreadProcessed += saved;
+        } catch (err) {
+          error("Failed to process history batch", err);
+        }
+      })();
+
+      // Track both work trackers: DB writes inside the op use dbWork directly,
+      // the outer batch processing uses historyWork.
+      historyWork.track(op);
+      dbWork.track(op);
+
+      // When the chunk is done processing, restart the quiet timer so we wait for the next chunk
+      op.finally(() => {
+        if (!shutdownRequested) {
+          resetQuietTimer();
+        }
+      });
+    });
+
+    // ------------------------------------------------------------------
+    // messages.upsert — real-time incoming messages
+    // ------------------------------------------------------------------
+    sock.ev.on("messages.upsert", (upsert: any) => {
+      if (shutdownRequested || !Array.isArray(upsert.messages)) return;
+
+      cancelQuietTimer();
+
+      const op = (async () => {
+        if (DEBUG_WHATSAPP_RAW_PAYLOAD) {
+          info("Raw messages.upsert:", JSON.stringify(upsert, null, 2));
+        }
         if (upsert.type !== "notify") {
-          info(`WhatsApp messages.upsert received with type=${upsert.type}; processing history-style or pending messages.`);
+          info(`messages.upsert type=${upsert.type} — processing history-style messages.`);
         }
 
         try {
           for (const msg of upsert.messages) {
-            if (msg.key.fromMe || !msg.key.remoteJid) {
-              continue;
-            }
+            if (msg.key.fromMe || !msg.key.remoteJid) continue;
 
-            const senderId = msg.key.participant || msg.key.remoteJid;
+            const isGroup = msg.key.remoteJid?.endsWith("@g.us");
+            const participantJid =
+              msg.key.participant ||
+              (isGroup ? (msg as any).participant : null) ||
+              null;
+            const senderId = participantJid || msg.key.remoteJid;
             const messageText = extractTextMessage(msg.message);
-            if (!messageText) {
-              continue;
-            }
+            if (!messageText) continue;
 
             try {
               await saveWhatsappMessage({
@@ -639,101 +865,138 @@ export async function pollWhatsappInboxOnce() {
                 whatsappTimestamp: Number(msg.messageTimestamp) || Date.now(),
                 metadata: {
                   remoteJid: msg.key.remoteJid,
-                  participant: msg.key.participant,
+                  groupJid: isGroup ? msg.key.remoteJid : undefined,
+                  participant: participantJid,
+                  pushName: (msg as any).pushName || undefined,
                   messageStubType: msg.messageStubType,
                   upsertType: upsert.type,
                 },
               });
-              info(`Saved WhatsApp message from ${senderId} (${upsert.type}).`);
+              info(`Saved message from ${senderId} (${upsert.type}).`);
             } catch (err) {
-              error("Failed to save WhatsApp message to Postgres", err);
+              error("Failed to save WhatsApp message", err);
             }
           }
         } catch (err) {
           if (isPreKeyError(err)) {
-            info("Skipped undecryptable group message due to missing PreKey.");
+            info("Skipped undecryptable group message (missing PreKey).");
             return;
           }
           throw err;
         }
 
+        // After processing live messages, nudge the quiet timer.
         if (!historySyncPending || historySyncCompleted) {
-          if (isFreshSession) {
-            await attemptShutdown();
-          } else {
-            scheduleClose();
+          resetQuietTimer();
+        }
+      })();
+
+      dbWork.track(op);
+    });
+
+    // ------------------------------------------------------------------
+    // chats.upsert / chats.update
+    // ------------------------------------------------------------------
+    const handleChats = (chats: any[]) => {
+      if (!Array.isArray(chats) || shutdownRequested) return;
+      cancelQuietTimer();
+      const op = (async () => {
+        for (const chat of chats) {
+          const saved = await handleUnreadChatMetadata(chat);
+          unreadProcessed += saved;
+        }
+        resetQuietTimer();
+      })();
+      dbWork.track(op);
+    };
+
+    sock.ev.on("chats.upsert", handleChats);
+    sock.ev.on("chats.update", handleChats);
+
+    // ------------------------------------------------------------------
+    // groups.upsert / groups.update
+    // ------------------------------------------------------------------
+    const handleGroups = (groups: any[]) => {
+      if (!Array.isArray(groups) || shutdownRequested) return;
+      const op = (async () => {
+        for (const group of groups) {
+          const jid: string = group?.id || group?.jid;
+          const subject: string = group?.subject;
+          if (jid && subject) {
+            try {
+              await saveWhatsappGroup(jid, subject);
+              info(`Saved group "${subject}" for ${jid}.`);
+            } catch (err) {
+              error("Failed to save WhatsApp group", err);
+            }
           }
-        } else {
-          info("Received WhatsApp messages while waiting for history sync completion.");
         }
       })();
+      dbWork.track(op);
+    };
 
-      trackPendingOperation(op);
-    });
-
-    sock.ev.on("chats.upsert", async (chats: any[]) => {
-      if (!Array.isArray(chats)) {
-        return;
-      }
-
-      const op = (async () => {
-        for (const chat of chats) {
-          const savedCount = await handleUnreadChatMetadata(chat);
-          unreadMessagesProcessed += savedCount;
-        }
-      })();
-
-      trackPendingOperation(op);
-    });
-
-    sock.ev.on("chats.update", async (chats: any[]) => {
-      if (!Array.isArray(chats)) {
-        return;
-      }
-
-      const op = (async () => {
-        for (const chat of chats) {
-          const savedCount = await handleUnreadChatMetadata(chat);
-          unreadMessagesProcessed += savedCount;
-        }
-      })();
-
-      trackPendingOperation(op);
-    });
+    sock.ev.on("groups.upsert", handleGroups);
+    sock.ev.on("groups.update", handleGroups);
 
     return sock;
   };
 
+  // -------------------------------------------------------------------------
+  // Install absolute hard-cap timer — pure safety net, not primary mechanism.
+  // -------------------------------------------------------------------------
+  hardCapTimer = setTimeout(() => {
+    info(
+      `Hard-cap timeout (${hardCapMs}ms) reached — forcing session end. ` +
+        "This means WA never sent a completion signal; check connectivity."
+    );
+    void endSession("hard-cap-timeout");
+  }, hardCapMs);
+
+  // -------------------------------------------------------------------------
+  // Start the socket, then await the session-done promise.
+  // Everything from here on is event-driven.
+  // -------------------------------------------------------------------------
   await createSocket();
-  sessionTimer = setTimeout(endSession, sessionTimeoutMs);
 
-  await sessionPromise;
+  // NOTE: For reconnect sessions the quiet timer is started inside the
+  // connection.update handler once the socket is confirmed open (line ~687).
+  // Do NOT start it here — the socket hasn't opened yet and the timer would
+  // race against the connection attempt, potentially killing the session
+  // before WA has even finished the TLS handshake.
 
-  if (unreadMessagesProcessed === 0) {
-    info("WhatsApp polling session completed with zero unread messages processed.");
+  await sessionDone;
+
+  if (unreadProcessed === 0) {
+    info("Session completed — no unread messages found.");
   } else {
-    info(`WhatsApp polling session completed with ${unreadMessagesProcessed} unread message(s) processed.`);
+    info(`Session completed — ${unreadProcessed} unread message(s) processed.`);
   }
-  info("All pending writes drained. Postgres pool termination will occur after socket close.");
 }
 
-export async function clearWhatsappAuthState() {
+// ---------------------------------------------------------------------------
+// Clear auth state
+// ---------------------------------------------------------------------------
+
+export async function clearWhatsappAuthState(): Promise<void> {
   const databaseUrl = getDatabaseUrl();
-  const normalizedDatabaseUrl = normalizeConnectionString(databaseUrl);
   const pool = new Pool({
-    connectionString: normalizedDatabaseUrl,
-    max: Number(process.env.WHATSAPP_PG_POOL_MAX) || 20,
-    idleTimeoutMillis: 60000,
-    connectionTimeoutMillis: Number(process.env.WHATSAPP_PG_CONNECTION_TIMEOUT_MS) || 15000,
+    connectionString: normalizeConnectionString(databaseUrl),
+    max: 5,
+    idleTimeoutMillis: 60_000,
+    connectionTimeoutMillis:
+      Number(process.env.WHATSAPP_PG_CONNECTION_TIMEOUT_MS) || 15_000,
   });
   const { deleteSession } = await usePostgreSQLAuthState(pool, AUTH_TABLE_NAME);
   await deleteSession();
   await pool.end();
-
   info("Cleared WhatsApp auth state from database.");
 }
 
-export function startWhatsappScheduler() {
+// ---------------------------------------------------------------------------
+// Scheduler
+// ---------------------------------------------------------------------------
+
+export function startWhatsappScheduler(): void {
   info("Starting WhatsApp polling scheduler.");
 
   cron.schedule("0 8 * * *", () => {
@@ -744,23 +1007,24 @@ export function startWhatsappScheduler() {
     info("WhatsApp polling window has closed for the day.");
   });
 
-  const scheduleNext = async () => {
+  const scheduleNext = async (): Promise<void> => {
     const delayMs = getRandomPollDelayMs();
     const nextRun = new Date(Date.now() + delayMs);
     info(`Next WhatsApp polling check scheduled at ${nextRun.toISOString()}`);
 
-    setTimeout(async () => {
-      if (isDaytime(new Date())) {
-        try {
-          await pollWhatsappInboxOnce();
-        } catch (err) {
-          error("WhatsApp polling run failed", err);
-        }
-      } else {
-        info("Skipping WhatsApp polling because now is outside the daytime window.");
+    await new Promise<void>((resolve) => setTimeout(resolve, delayMs));
+
+    if (isDaytime(new Date())) {
+      try {
+        await pollWhatsappInboxOnce();
+      } catch (err) {
+        error("WhatsApp polling run failed", err);
       }
-      scheduleNext();
-    }, delayMs);
+    } else {
+      info("Skipping poll — outside daytime window.");
+    }
+
+    scheduleNext();
   };
 
   scheduleNext();

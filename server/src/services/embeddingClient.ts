@@ -8,13 +8,25 @@ const EMBEDDING_SERVICE_URL = process.env.EMBEDDING_SERVICE_URL?.trim();
 const EMBEDDING_API_KEY = process.env.EMBEDDING_API_KEY?.trim();
 
 if (!EMBEDDING_SERVICE_URL) {
-  throw new Error("EMBEDDING_SERVICE_URL is required in environment configuration.");
+  // Warn at startup but do not crash — semantic memory will fall back to
+  // recency-based retrieval when embeddings are unavailable.
+  console.warn(
+    "[embeddingClient] EMBEDDING_SERVICE_URL is not set. " +
+      "Semantic vector search will be unavailable; recent-memory fallback will be used."
+  );
 }
 
 export class EmbeddingClient {
   public async embedTexts(texts: string[]): Promise<number[][]> {
     if (!texts.length) {
       return [];
+    }
+
+    if (!EMBEDDING_SERVICE_URL) {
+      throw new Error(
+        "EMBEDDING_SERVICE_URL is not configured. " +
+          "Set it in your .env to enable semantic memory search."
+      );
     }
 
     const headers: Record<string, string> = {

@@ -32,7 +32,12 @@ let pool: Pool | null = null;
 
 export function getDatabasePool() {
   if (!pool) {
-    pool = new Pool({ connectionString: normalizedConnectionString });
+    const isLocalhost = connectionString ? (connectionString.includes('localhost') || connectionString.includes('127.0.0.1')) : false;
+    pool = new Pool({ 
+      connectionString: normalizedConnectionString,
+      // Cloud databases like Neon require SSL. We enforce it unless running a local dev DB.
+      ssl: isLocalhost ? false : { rejectUnauthorized: false }
+    });
   }
   return pool;
 }

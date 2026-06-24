@@ -973,7 +973,60 @@ async function main() {
         }
 
         try {
-          const result = await sendChatMessage(baseUrl, userInput, authResult.token, sessionId);
+          let lastProgressLength = 0;
+          const onProgress = (msg: string) => {
+            const clearStr = '\r\x1b[K';
+            process.stdout.write(`${clearStr}Aris > \x1b[90m[${msg}]\x1b[0m`);
+            lastProgressLength = msg.length;
+          };
+
+          let result = await sendChatMessage(baseUrl, userInput, authResult.token, sessionId, onProgress);
+          
+          if (lastProgressLength > 0) {
+            process.stdout.write('\r\x1b[K');
+          }
+
+          if (result.status === "awaiting_approval" && result.pendingAction) {
+            const action = result.pendingAction;
+
+            if (action.tool === "google_calendar_batch_create") {
+              const events: any[] = Array.isArray(action.payload?.events) ? action.payload.events : [];
+              console.log(`\nAris > I found ${events.length} new event(s) to add to your calendar:\n`);
+              events.forEach((ev: any, i: number) => {
+                const start = ev.start?.dateTime || ev.start?.date || "?";
+                const end = ev.end?.dateTime || ev.end?.date || "?";
+                console.log(`  ${i + 1}. ${ev.summary}`);
+                console.log(`     From: ${start}`);
+                console.log(`     To:   ${end}${ev.description ? `\n     Note: ${ev.description}` : ""}`);
+                console.log("");
+              });
+            } else {
+              console.log(`\nAris > I need your permission to execute the following action:`);
+              console.log(`Tool: ${action.tool}`);
+              console.log(`Payload: ${JSON.stringify(action.payload, null, 2)}\n`);
+            }
+            const { approval } = await inquirer.prompt([
+              {
+                type: "confirm",
+                name: "approval",
+                message: action.tool === "google_calendar_batch_create"
+                  ? "Do you approve adding these events?"
+                  : "Do you approve this action?",
+                default: false,
+              },
+            ]);
+
+            if (approval) {
+              result = await sendChatMessage(baseUrl, "approved", authResult.token, sessionId, onProgress, result.pendingAction);
+              if (lastProgressLength > 0) {
+                process.stdout.write('\r\x1b[K');
+              }
+            } else {
+              console.log(`\nAris > Action cancelled.\n`);
+              continue;
+            }
+          }
+
           console.log(`\nAris > ${result.arisReply}\n`);
           if (result.memoryUpdates.length > 0) {
             console.log("Memory updated:");
@@ -981,7 +1034,7 @@ async function main() {
             console.log("");
           }
         } catch (error) {
-          console.error("Error sending message to Aris:", error instanceof Error ? error.message : error);
+          console.error("\nError sending message to Aris:", error instanceof Error ? error.message : error);
         }
       }
     } else if (mode === "mic" || mode === "voice") {

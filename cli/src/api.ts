@@ -1,4 +1,5 @@
 import axios from "axios";
+import readline from "readline";
 
 function formatAxiosError(err: any) {
   if (err?.response?.data) {
@@ -13,6 +14,11 @@ function formatAxiosError(err: any) {
 export interface ArisChatResponse {
   arisReply: string;
   memoryUpdates: string[];
+  status?: "finished" | "awaiting_approval" | "max_iterations_reached" | "error";
+  pendingAction?: {
+    tool: string;
+    payload: any;
+  };
 }
 
 export interface ArisVoiceResponse {
@@ -35,13 +41,43 @@ export interface AuthResponse {
   onboardingRequired: boolean;
 }
 
-export async function sendChatMessage(baseUrl: string, message: string, authToken: string, sessionId?: string) {
-  const response = await axios.post<ArisChatResponse>(
-    `${baseUrl}/api/aris/chat`,
-    { message, sessionId },
-    { headers: { Authorization: `Bearer ${authToken}` } }
+export async function sendChatMessage(baseUrl: string, message: string, authToken: string, sessionId?: string, onProgress?: (msg: string) => void, approvedAction?: any): Promise<ArisChatResponse> {
+  const response = await axios.post(
+    `${baseUrl}/api/aris/chat/stream`,
+    { message, sessionId, approvedAction },
+    { 
+      headers: { Authorization: `Bearer ${authToken}` },
+      responseType: 'stream'
+    }
   );
-  return response.data;
+
+  return new Promise((resolve, reject) => {
+    const rl = readline.createInterface({ input: response.data });
+    let finalResponse: ArisChatResponse | undefined;
+
+    rl.on('line', (line) => {
+      if (!line.trim()) return;
+      try {
+        const data = JSON.parse(line);
+        if (data.type === 'progress' && onProgress) {
+          onProgress(data.message);
+        } else if (data.type === 'complete') {
+          finalResponse = data.data;
+        } else if (data.type === 'heartbeat') {
+          // keepalive — ignore
+        } else if (data.error) {
+          reject(new Error(data.error));
+        }
+      } catch (e) {
+        // ignore parse errors for partial lines
+      }
+    });
+
+    rl.on('close', () => {
+      if (finalResponse) resolve(finalResponse);
+      else reject(new Error("Stream closed without complete response"));
+    });
+  });
 }
 
 export async function sendVoiceMessage(

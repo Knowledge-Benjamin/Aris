@@ -7,31 +7,96 @@ import { VoiceService } from "../services/voiceService";
 import { info, error } from "../utils/logger";
 import { AuthenticatedRequest } from "../middleware/authMiddleware";
 
+import { ContextStore } from "../db/contextStore";
+
 const pool = getDatabasePool();
 const memoryStore = new MemoryStore(pool);
+const contextStore = new ContextStore(pool);
 const gemmaService = new GemmaService();
-const arisService = new ArisService(memoryStore, gemmaService);
+const arisService = new ArisService(memoryStore, contextStore, gemmaService);
 const voiceService = new VoiceService();
 
 export async function arisChat(req: Request, res: Response) {
   try {
-    const { message, sessionId } = req.body;
+    const { message, sessionId, approvedAction } = req.body;
     const authReq = req as AuthenticatedRequest;
     const userId = authReq.authUserId;
 
     if (!message || typeof message !== "string") {
       return res.status(400).json({ error: "message is required" });
     }
+    
+    if (message.length > 8000) {
+      return res.status(400).json({ error: "message is too long (max 8000 chars)" });
+    }
 
     if (!userId) {
       return res.status(401).json({ error: "Unauthorized user." });
     }
 
-    const response = await arisService.handleChat({ message, sessionId, userId });
+    const response = await arisService.handleChat({ message, sessionId, userId, approvedAction });
     res.json(response);
   } catch (error) {
     console.error("arisChat error", error);
     res.status(500).json({ error: "Aris internal error" });
+  }
+}
+
+export async function arisChatStream(req: Request, res: Response) {
+  try {
+    const { message, sessionId, approvedAction } = req.body;
+    const authReq = req as AuthenticatedRequest;
+    const userId = authReq.authUserId;
+
+    if (!message || typeof message !== "string") {
+      return res.status(400).json({ error: "message is required" });
+    }
+    
+    if (message.length > 8000) {
+      return res.status(400).json({ error: "message is too long (max 8000 chars)" });
+    }
+
+    if (!userId) {
+      return res.status(401).json({ error: "Unauthorized user." });
+    }
+
+    res.setHeader('Content-Type', 'application/x-ndjson');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Connection', 'keep-alive');
+
+    // Disable socket timeout for long-running tool chains
+    req.socket.setTimeout(0);
+    req.socket.setKeepAlive(true);
+
+    // Send a keepalive heartbeat every 15s to prevent the connection being dropped
+    const heartbeat = setInterval(() => {
+      if (!res.writableEnded) {
+        res.write(`${JSON.stringify({ type: 'heartbeat' })}\n`);
+      }
+    }, 15000);
+
+    const onProgress = (msg: string) => {
+      res.write(`${JSON.stringify({ type: 'progress', message: msg })}\n`);
+    };
+
+    try {
+      const response = await arisService.handleChat({ message, sessionId, userId, approvedAction }, onProgress);
+      clearInterval(heartbeat);
+      res.write(`${JSON.stringify({ type: 'complete', data: response })}\n`);
+      res.end();
+    } catch (innerError) {
+      clearInterval(heartbeat);
+      throw innerError;
+    }
+
+  } catch (error) {
+    console.error("arisChatStream error", error);
+    if (!res.headersSent) {
+      res.status(500).json({ error: "Aris internal error" });
+    } else {
+      res.write(`${JSON.stringify({ error: "Aris internal error" })}\n`);
+      res.end();
+    }
   }
 }
 
