@@ -145,6 +145,8 @@ export class ArisService {
     "goal_view_tasks",
     // WhatsApp outbox (send to self)
     "whatsapp_send",
+    // Internet reading
+    "url_read",
   ]);
 
   constructor(
@@ -896,6 +898,27 @@ export class ArisService {
         return { success: true, tool: toolName, data: { summary: "Message queued to your WhatsApp. It will be delivered on the next polling cycle." } };
       } catch (err: any) {
         return { success: false, tool: toolName, error: err?.message || "Failed to queue WhatsApp message." };
+      }
+    }
+
+    if (toolName === "url_read") {
+      try {
+        const raw = invocation.payload?.url || invocation.payload?.urls;
+        if (!raw) return { success: false, tool: toolName, error: "url_read requires a 'url' string or 'urls' array." };
+        const urls: string[] = Array.isArray(raw) ? raw : [String(raw)];
+        const limitPerArticle: number = invocation.payload?.limit || 3000;
+
+        const extracted = await this.extractClient.extract({ urls, limit: limitPerArticle });
+        const readable = extracted.results.filter(r => !r.error && r.content && r.content.length > 100);
+        if (readable.length === 0) {
+          return { success: false, tool: toolName, error: "Could not extract readable content from the provided URL(s). The page may require JavaScript or block scraping." };
+        }
+
+        const resultSummary = readable.map(r => `**${r.title || r.url}**\n${r.content.slice(0, limitPerArticle)}`).join("\n\n---\n\n");
+        this.recordLastToolInvocation(userId, sessionId, invocation);
+        return { success: true, tool: toolName, data: { summary: resultSummary, results: readable.map(r => ({ url: r.url, title: r.title, content: r.content.slice(0, limitPerArticle) })) } };
+      } catch (err: any) {
+        return { success: false, tool: toolName, error: err?.message || "Failed to read URL." };
       }
     }
 
@@ -2673,6 +2696,11 @@ export class ArisService {
       `Use 'goal_set' to create a new goal. Example: {"tool":"goal_set", "title": "Become a billionaire", "description": "in 10 years"}`,
       `Use 'goal_update_state' to update the user's Initial Know profile based on conversation. You can also add topics for Aris to monitor on the internet by setting "monitored_topics" (array of strings). Example: {"tool":"goal_update_state", "stateUpdates": {"net_worth": "100k", "monitored_topics": ["AI news", "TSLA stock"]}}`,
       `Use 'goal_view_tasks' to check the status of today's tasks.`,
+      `INTERNET READING TOOL:`,
+      `Use 'url_read' whenever the user shares a link or asks you to read/summarize a webpage, article, or any URL. Also use it to deeply verify information from search results. Example: {"tool":"url_read","url":"https://example.com/article"}`,
+      `You can pass multiple URLs at once: {"tool":"url_read","urls":["https://example.com/a","https://example.com/b"]}`,
+      `Use 'url_read' after a 'search' to go deeper — don't just rely on snippets, read the actual pages.`,
+      `Use 'whatsapp_send' to push an alert or message to the user's WhatsApp. Example: {"tool":"whatsapp_send","message":"Don't forget your 3pm meeting!"}`,
       `You have a persistent digital brain with a memory database.`,
       `If the user asks to access or manage services, do not answer directly. Output exactly one valid tool call and nothing else.`,
       `Current Date and Time: ${currentDateTime}`,

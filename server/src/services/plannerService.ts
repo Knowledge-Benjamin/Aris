@@ -10,14 +10,17 @@ import { GemmaService } from "./gemmaService";
 import { WeatherService } from "./weatherService";
 import { NewsService } from "./newsService";
 import { SearchClient } from "./searchClient";
+import { ExtractClient } from "./extractClient";
 import { info, error } from "../utils/logger";
 
 const voiceService = new VoiceService();
 const weatherService = new WeatherService();
 const newsService = new NewsService();
 let searchClient: SearchClient | undefined;
+let extractClient: ExtractClient | undefined;
 try {
   searchClient = new SearchClient();
+  extractClient = new ExtractClient();
 } catch (e) {
   // gracefully handle missing SEARCH_SERVICE_URL during init
 }
@@ -76,24 +79,55 @@ export class PlannerService {
         }
       } catch { /* ignore */ }
 
-      // 1d. Proactive News & Internet Monitoring
+      // 1d. Proactive News & Internet Monitoring (with full article scraping)
       const topics = state.state?.monitored_topics;
       if (Array.isArray(topics) && topics.length > 0) {
-        info(`[PlannerService] Monitoring topics: ${topics.join(", ")}`);
-        for (const topic of topics.slice(0, 3)) { // Limit to 3 topics per run to avoid context bloat
+        info(`[PlannerService] Monitoring ${topics.length} topics with full article scraping`);
+        for (const topic of topics.slice(0, 3)) { // limit to 3 topics per cycle
           try {
-            const news = await newsService.getTopNews(topic, 2);
+            const urlsToScrape: string[] = [];
+
+            // Step 1: Get top 3 news headlines + their URLs
+            const news = await newsService.getTopNews(topic, 3);
             if (news.length > 0) {
               contextText += `\nLatest News for "${topic}":\n`;
-              news.forEach(n => contextText += `- ${n.title} (${n.source})\n`);
+              news.forEach(n => {
+                contextText += `- ${n.title} (${n.source}) [${n.link}]\n`;
+                if (n.link) urlsToScrape.push(n.link);
+              });
             }
+
+            // Step 2: Get top 3 web search results + their URLs
             if (searchClient) {
-              const searchRes = await searchClient.search({ query: topic, limit: 2 });
-              if (searchRes.results && searchRes.results.length > 0) {
-                contextText += `\nRecent Web Search for "${topic}":\n`;
-                searchRes.results.slice(0, 2).forEach((r: any) => contextText += `- ${r.title}: ${r.snippet}\n`);
+              const searchRes = await searchClient.search({ query: topic, limit: 3 });
+              if (searchRes.results?.length > 0) {
+                contextText += `\nWeb Search for "${topic}":\n`;
+                searchRes.results.slice(0, 3).forEach((r: any) => {
+                  contextText += `- ${r.title}: ${r.snippet} [${r.url}]\n`;
+                  if (r.url) urlsToScrape.push(r.url);
+                });
               }
             }
+
+            // Step 3: Scrape the full article content from all collected URLs
+            if (extractClient && urlsToScrape.length > 0) {
+              info(`[PlannerService] Scraping ${urlsToScrape.length} URLs for topic "${topic}"`);
+              try {
+                const extracted = await extractClient.extract({ urls: urlsToScrape, limit: 1500 });
+                const readable = extracted.results.filter(r => !r.error && r.content && r.content.length > 200);
+                if (readable.length > 0) {
+                  contextText += `\nFull Article Content for "${topic}":\n`;
+                  readable.forEach(r => {
+                    // Truncate per article to keep context manageable
+                    const preview = r.content.slice(0, 800);
+                    contextText += `\n[${r.title}]\n${preview}${r.content.length > 800 ? "...(truncated)" : ""}\n`;
+                  });
+                }
+              } catch (scrapeErr) {
+                error(`[PlannerService] Article scraping failed for topic ${topic}`, scrapeErr);
+              }
+            }
+
           } catch (e) {
             error(`[PlannerService] Failed to monitor topic ${topic}`, e);
           }
