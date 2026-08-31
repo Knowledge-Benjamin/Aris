@@ -886,8 +886,9 @@ export class ArisService {
     if (toolName === "whatsapp_send") {
       try {
         if (!userId) return { success: false, tool: toolName, error: "User not authenticated." };
-        const selfJid = process.env.WHATSAPP_SELF_JID;
-        if (!selfJid) return { success: false, tool: toolName, error: "WHATSAPP_SELF_JID is not configured." };
+        const { getSelfJid } = await import("../db/whatsappAuthStore");
+        const selfJid = await getSelfJid();
+        if (!selfJid) return { success: false, tool: toolName, error: "WhatsApp account is not connected yet." };
         const body = invocation.payload?.message || invocation.payload?.body || invocation.payload?.text;
         if (!body) return { success: false, tool: toolName, error: "whatsapp_send requires a 'message' string." };
         const { whatsappOutboxStore } = await import("../db/whatsappOutboxStore");

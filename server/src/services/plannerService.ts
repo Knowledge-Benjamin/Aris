@@ -3,6 +3,7 @@ import { googleService } from "./googleService";
 import { GoogleAccountRecord } from "../db/googleAccountStore";
 import { goalsStore } from "../db/goalsStore";
 import { whatsappOutboxStore } from "../db/whatsappOutboxStore";
+import { getSelfJid } from "../db/whatsappAuthStore";
 import { gcsService } from "./gcsService";
 import { VoiceService } from "./voiceService";
 import { GemmaService } from "./gemmaService";
@@ -86,7 +87,7 @@ Respond ONLY in valid JSON. Example:
 
       // Queue urgent actions as WhatsApp self-messages (text notification to user)
       if (Array.isArray(reasoning.urgent_actions) && reasoning.urgent_actions.length > 0) {
-        const selfJid = process.env.WHATSAPP_SELF_JID;
+        const selfJid = await getSelfJid();
         if (selfJid) {
           const body = `⚡ *Aris Alert* ⚡\n\nBased on your latest messages, here's what needs your attention now:\n\n` +
             reasoning.urgent_actions.map((a: string, i: number) => `${i + 1}. ${a}`).join("\n");
@@ -177,7 +178,7 @@ Respond ONLY in valid JSON.`;
       }
 
       // 2c. Synthesize TTS voice note and deliver via WhatsApp outbox
-      const selfJid = process.env.WHATSAPP_SELF_JID;
+      const selfJid = await getSelfJid();
       if (selfJid && briefScript) {
         try {
           const taskList = tasks.map((t: any, i: number) => `${i + 1}. ${t.title}`).join("\n");
