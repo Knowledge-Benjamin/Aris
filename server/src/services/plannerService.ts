@@ -47,25 +47,43 @@ export class PlannerService {
         }
       }
 
+      const state = await goalsStore.getUserState(userId);
+      const goals = await goalsStore.getActiveGoals(userId);
+      const pendingTasks = await goalsStore.getPendingTasks(userId);
+
+      // 1c. Short-term weather context (next 4 hours)
+      const lat = state.state?.lat || 40.7128;
+      const lon = state.state?.lon || -74.0060;
+      let weatherAlertContext = "";
+      try {
+        const forecast = await weatherService.getForecast(lat, lon, undefined, ["temperature_2m", "precipitation_probability"]);
+        if (forecast.hourly?.precipitation_probability) {
+          const next4Hours = forecast.hourly.precipitation_probability.slice(0, 4);
+          const maxPrecip = Math.max(...next4Hours);
+          if (maxPrecip > 30) {
+            weatherAlertContext = `\nWARNING: High chance of precipitation (${maxPrecip}%) in the next 4 hours.`;
+            contextText += weatherAlertContext;
+          }
+        }
+      } catch { /* ignore */ }
+
       if (!contextText) {
         info(`[PlannerService] No new context for user ${userId}`);
         return;
       }
 
-      const state = await goalsStore.getUserState(userId);
-      const goals = await goalsStore.getActiveGoals(userId);
-
-      // 1c. Deep strategic reasoning pass
+      // 1d. Deep strategic reasoning pass
       const prompt = `You are Aris's autonomous background reasoning engine.
-Analyze the following recent messages/emails for a user whose active goals are: ${JSON.stringify(goals.map((g: any) => g.title))}.
+Analyze the following recent events for a user whose active goals are: ${JSON.stringify(goals.map((g: any) => g.title))}.
 Current state profile: ${JSON.stringify(state.state)}
+Today's Pending Tasks: ${JSON.stringify(pendingTasks.map((t: any) => t.title))}
 
-MESSAGES / EMAILS:
+RECENT EVENTS (Messages / Emails / Weather Alerts):
 ${contextText}
 
 Perform the following reasoning steps and return a SINGLE JSON object:
 1. "state_updates": any new facts to merge into the profile (e.g. {"mood": "stressed", "client_x_status": "unhappy"})
-2. "urgent_actions": array of strings describing any immediate actions Aris should take (e.g. "Reschedule pitch deck block to today 10am", "Reply to client X urgently")
+2. "urgent_actions": array of strings describing any immediate actions Aris should take (e.g. "Alert user that it will rain soon so they should do their outdoor task now", "Reschedule pitch deck block to today 10am")
 3. "persona_shift": optional new coach persona if user is clearly slipping or under pressure (e.g. "tough-love", "crisis-mode", "military-drill-sergeant"). Leave null if no change needed.
 
 Respond ONLY in valid JSON. Example:
