@@ -585,7 +585,7 @@ export interface ArisAdviceResponse {
 }
 
 export class GemmaService {
-  async requestArisAdvice(prompt: string): Promise<ArisAdviceResponse> {
+  async requestArisAdvice(prompt: string, mediaParts?: Array<{ inlineData: { mimeType: string; data: string } }>): Promise<ArisAdviceResponse> {
     if (!apiKey || !apiUrl) {
       return {
         reply: "[Aris advisor unavailable: missing Gemma API config.]",
@@ -595,15 +595,16 @@ export class GemmaService {
     }
 
     const url = buildGemmaUrl();
+    const parts: any[] = [{ text: prompt }];
+    if (mediaParts && mediaParts.length > 0) {
+      parts.push(...mediaParts);
+    }
+
     const requestPayload = {
       contents: [
         {
           role: "user",
-          parts: [
-            {
-              text: prompt,
-            },
-          ],
+          parts,
         },
       ],
       generationConfig: {

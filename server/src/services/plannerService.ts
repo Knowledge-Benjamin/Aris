@@ -41,10 +41,17 @@ export class PlannerService {
     try {
       // 1a. WhatsApp messages
       const pendingWa = await getPendingWhatsappMessages(50);
+      const mediaParts: Array<{ inlineData: { mimeType: string; data: string } }> = [];
       if (pendingWa.length > 0) {
         contextText += "Recent WhatsApp Messages:\n";
         pendingWa.forEach(m => {
           contextText += `- [${m.receivedAt}] From ${m.senderId}: ${m.messageText}\n`;
+          if (m.metadata?.mediaData) {
+            const media = m.metadata.mediaData as any;
+            if (media.mimeType && media.dataBase64) {
+              mediaParts.push({ inlineData: { mimeType: media.mimeType, data: media.dataBase64 } });
+            }
+          }
         });
       }
 
@@ -156,7 +163,7 @@ Perform the following reasoning steps and return a SINGLE JSON object:
 Respond ONLY in valid JSON. Example:
 {"state_updates": {"mood": "stressed"}, "urgent_actions": ["Move pitch prep to 9am"], "persona_shift": "tough-love"}`;
 
-      const response = await this.gemmaService.requestArisAdvice(prompt);
+      const response = await this.gemmaService.requestArisAdvice(prompt, mediaParts);
       const cleaned = response.reply.replace(/```json/g, "").replace(/```/g, "").trim();
       let reasoning: any = {};
       try { reasoning = JSON.parse(cleaned); } catch { /* ignore */ }

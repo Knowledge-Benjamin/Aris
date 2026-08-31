@@ -7,6 +7,7 @@ import makeWASocket, {
   fetchLatestWaWebVersion,
   fetchLatestBaileysVersion,
   proto,
+  downloadMediaMessage,
 } from "@whiskeysockets/baileys";
 import { usePostgreSQLAuthState } from "postgres-baileys";
 import qrcode from "qrcode-terminal";
@@ -918,14 +919,34 @@ export async function pollWhatsappInboxOnce(): Promise<void> {
               (isGroup ? (msg as any).participant : null) ||
               null;
             const senderId = participantJid || msg.key.remoteJid;
-            const messageText = extractTextMessage(msg.message);
-            if (!messageText) continue;
+            const messageText = extractTextMessage(msg.message) || "[Media Message]";
+            
+            let mediaData: { mimeType: string; dataBase64: string } | undefined;
+            const msgType = Object.keys(msg.message || {})[0];
+            if (msgType === "imageMessage" || msgType === "audioMessage" || msgType === "videoMessage" || msgType === "documentMessage") {
+              try {
+                const buffer = await downloadMediaMessage(msg, "buffer", {}, { logger: Object.assign(info, { child: () => info }) as any });
+                if (buffer) {
+                  const m = msg.message as any;
+                  const mType = m[msgType];
+                  mediaData = {
+                    mimeType: mType?.mimetype || "application/octet-stream",
+                    dataBase64: buffer.toString("base64")
+                  };
+                  info(`[whatsappPoller] Downloaded media from ${senderId} - type: ${mediaData.mimeType}, size: ${buffer.length}`);
+                }
+              } catch (e) {
+                error(`[whatsappPoller] Failed to download media message from ${senderId}`, e);
+              }
+            }
+
+            if (!messageText && !mediaData) continue;
 
             try {
               await saveWhatsappMessage({
                 senderId,
                 messageId: msg.key.id || `${senderId}:${msg.messageTimestamp}`,
-                messageText,
+                messageText: messageText === "[Media Message]" ? (mediaData ? "[Attached Media]" : "") : messageText,
                 whatsappTimestamp: Number(msg.messageTimestamp) || Date.now(),
                 metadata: {
                   remoteJid: msg.key.remoteJid,
@@ -934,6 +955,7 @@ export async function pollWhatsappInboxOnce(): Promise<void> {
                   pushName: (msg as any).pushName || undefined,
                   messageStubType: msg.messageStubType,
                   upsertType: upsert.type,
+                  mediaData,
                 },
               });
               info(`Saved message from ${senderId} (${upsert.type}).`);

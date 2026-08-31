@@ -25,6 +25,7 @@ interface ChatInput {
   sessionId?: string;
   userId?: number;
   approvedAction?: ToolInvocation;
+  mediaData?: { mimeType: string; dataBase64: string };
 }
 
 interface ToolInvocation {
@@ -354,7 +355,8 @@ export class ArisService {
       activeGoals,
       pendingTasks,
       onProgress,
-      input.approvedAction
+      input.approvedAction,
+      input.mediaData
     );
 
     let arisReply = toolChainResult.reply;
@@ -2290,7 +2292,8 @@ export class ArisService {
     activeGoals: any[],
     pendingTasks: any[],
     onProgress?: (msg: string) => void,
-    approvedAction?: ToolInvocation
+    approvedAction?: ToolInvocation,
+    mediaData?: { mimeType: string; dataBase64: string }
   ): Promise<ToolChainResult> {
     const toolResults: Array<{ invocation: ToolInvocation; result: ToolExecutionResult }> = [];
     
@@ -2303,6 +2306,8 @@ export class ArisService {
     }
     const activeCategories = this.determineToolCategories(userMessage, conversationHistory);
     if (includeSearch) activeCategories.add("search");
+    
+    const mediaParts = mediaData ? [{ inlineData: { mimeType: mediaData.mimeType, data: mediaData.dataBase64 } }] : undefined;
     
     // Inject Live Location Awareness
     const locationData = await this.locationService.getCurrentLocation();
@@ -2344,7 +2349,7 @@ export class ArisService {
     for (let iteration = 0; iteration < MAX_ITERATIONS; iteration += 1) {
 
       onProgress?.("Thinking...");
-      const modelResponse = await this.gemmaService.requestArisAdvice(prompt);
+      const modelResponse = await this.gemmaService.requestArisAdvice(prompt, mediaParts);
       lastModelReply = modelResponse.reply.trim();
 
       const invocations = this.parseToolInvocations(lastModelReply);
