@@ -121,5 +121,18 @@ export const goalsStore = {
   
   async markTaskStatus(taskId: number, status: string): Promise<void> {
     await pool.query(`UPDATE daily_tasks SET status = $1, updated_at = NOW() WHERE id = $2`, [status, taskId]);
+  },
+
+  async getYesterdayTasks(userId: number): Promise<DailyTask[]> {
+    const res = await pool.query(`
+      SELECT * FROM daily_tasks 
+      WHERE user_id = $1 
+      AND start_time >= CURRENT_DATE - INTERVAL '1 day'
+      AND start_time < CURRENT_DATE
+    `, [userId]);
+    return res.rows.map((row: any) => ({
+      id: row.id, userId: row.user_id, goalId: row.goal_id, title: row.title, description: row.description,
+      calendarEventId: row.calendar_event_id, startTime: row.start_time, endTime: row.end_time, status: row.status
+    }));
   }
 };

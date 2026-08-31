@@ -7,9 +7,12 @@ import { getSelfJid } from "../db/whatsappAuthStore";
 import { gcsService } from "./gcsService";
 import { VoiceService } from "./voiceService";
 import { GemmaService } from "./gemmaService";
+import { WeatherService } from "./weatherService";
 import { info, error } from "../utils/logger";
 
 const voiceService = new VoiceService();
+const weatherService = new WeatherService();
+
 
 export class PlannerService {
   constructor(private gemmaService: GemmaService) {}
@@ -113,26 +116,69 @@ Respond ONLY in valid JSON. Example:
       const state = await goalsStore.getUserState(userId);
       const activeGoals = await goalsStore.getActiveGoals(userId);
       const pendingTasks = await goalsStore.getPendingTasks(userId);
+      const yesterdayTasks = await goalsStore.getYesterdayTasks(userId);
+
+      // Calculate Goal Metrics
+      const goalMetrics = activeGoals.map(g => {
+        const start = new Date(g.createdAt).getTime();
+        const target = g.targetDate ? new Date(g.targetDate).getTime() : start + (365 * 24 * 60 * 60 * 1000); // default 1 yr
+        const now = Date.now();
+        const totalDays = Math.max(1, Math.round((target - start) / (1000 * 60 * 60 * 24)));
+        const elapsedDays = Math.max(0, Math.round((now - start) / (1000 * 60 * 60 * 24)));
+        const percentTime = Math.min(100, Math.round((elapsedDays / totalDays) * 100));
+        
+        // Calculate task progress for this goal
+        const goalTasks = yesterdayTasks.filter(t => t.goalId === g.id);
+        const completed = goalTasks.filter(t => t.status === 'completed').length;
+        const total = goalTasks.length;
+        const dailyProgress = total > 0 ? Math.round((completed / total) * 100) : 0;
+
+        return {
+          title: g.title,
+          totalDays,
+          elapsedDays,
+          percentTimeElapsed: percentTime,
+          yesterdayCompletionRate: `${completed}/${total} (${dailyProgress}%)`
+        };
+      });
+
+      // Get Weather (Defaulting to New York if no location in state)
+      const lat = state.state?.lat || 40.7128;
+      const lon = state.state?.lon || -74.0060;
+      let weatherInfo = "Weather data unavailable.";
+      try {
+        const forecast = await weatherService.getForecast(lat, lon, ["temperature_2m", "precipitation"]);
+        weatherInfo = `Today: ${forecast.current?.temperature_2m || 20}°C, Precip: ${forecast.current?.precipitation || 0}mm`;
+      } catch { /* ignore */ }
 
       const today = new Date().toLocaleDateString("en-US", { weekday: "long", month: "long", day: "numeric" });
 
       // 2a. LLM generates both: (i) structured task list, (ii) spoken morning brief script
       const prompt = `You are Aris, an aggressive and strategic life coach. Today is ${today}.
 User's Current State: ${JSON.stringify(state.state)}
-Active Goals: ${JSON.stringify(activeGoals.map((g: any) => g.title))}
 Coach Persona: ${state.coachPersona}
-Unfinished Tasks from yesterday: ${JSON.stringify(pendingTasks.map((t: any) => t.title))}
+
+--- GOAL METRICS ---
+${JSON.stringify(goalMetrics, null, 2)}
+
+--- YESTERDAY'S PERFORMANCE ---
+Tasks: ${JSON.stringify(yesterdayTasks.map(t => ({ title: t.title, status: t.status })))}
+
+--- TODAY'S CONTEXT ---
+Weather: ${weatherInfo}
+Pending Carryover Tasks: ${JSON.stringify(pendingTasks.map((t: any) => t.title))}
 
 Generate a JSON object with two keys:
 1. "tasks": array of 2-3 objects with "title", "description", "durationHours" — concrete actions for TODAY.
 2. "morning_brief": a spoken script (under 90 seconds when read aloud, around 200 words) for a WhatsApp voice note. 
-   Be direct, strategic, and match the coach persona. Reference the user's goals. 
-   Mention any unfinished items. Give today's battle plan. End with a rallying call.
+   Be direct, strategic, and match the coach persona.
+   CRITICAL: Verbally call out their goal timeline (e.g. "You are ${goalMetrics[0]?.elapsedDays || 0} days into your ${goalMetrics[0]?.totalDays || 0} day plan. That's ${goalMetrics[0]?.percentTimeElapsed || 0}% of your time gone.")
+   Call out yesterday's performance (what they did/didn't do). Mention the weather if relevant to tasks. Give today's battle plan. End with a rallying call.
 
 Example:
 {
   "tasks": [{"title": "Finalize pitch deck", "description": "Complete slides 8-12", "durationHours": 2}],
-  "morning_brief": "Good morning. Yesterday you left the pitch deck half-done. That's not acceptable. Today we fix it..."
+  "morning_brief": "Good morning. You are 45 days into your 365 day billionaire goal. 12% of your time is gone. Yesterday you only completed 1 of 3 tasks. That's unacceptable. It's raining today, so no excuses to leave the desk. Let's fix this..."
 }
 
 Respond ONLY in valid JSON.`;
