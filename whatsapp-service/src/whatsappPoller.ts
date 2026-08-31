@@ -17,8 +17,13 @@ import {
   saveWhatsappMessage,
   getPendingWhatsappMessagesByRemoteJid,
   saveWhatsappGroup,
+  getPendingOutboxMessages,
+  markOutboxSent,
+  markOutboxFailed,
 } from "./dbAdapter";
 import { info, error } from "./logger";
+import axios from "axios";
+import { google } from "googleapis";
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -104,6 +109,62 @@ function getDatabaseUrl(): string {
     throw new Error("DATABASE_URL is required for WhatsApp polling.");
   }
   return url;
+}
+
+/**
+ * Downloads a GCS object using the service-account credentials in env and
+ * returns the raw buffer. Used to retrieve audio before sending as a voice note.
+ */
+async function downloadFromGcs(gcsUri: string): Promise<Buffer> {
+  const bucket = process.env.GCS_BUCKET_NAME;
+  if (!bucket) throw new Error("GCS_BUCKET_NAME env var not set.");
+  const objectPath = gcsUri.replace(`gs://${bucket}/`, "");
+
+  const keyJson = process.env.GCS_KEY_JSON
+    ? JSON.parse(Buffer.from(process.env.GCS_KEY_JSON, "base64").toString("utf8"))
+    : undefined;
+  const auth = new google.auth.GoogleAuth({
+    credentials: keyJson,
+    scopes: ["https://www.googleapis.com/auth/devstorage.read_only"],
+  });
+  const token = await auth.getAccessToken();
+  const url = `https://storage.googleapis.com/storage/v1/b/${bucket}/o/${encodeURIComponent(objectPath)}?alt=media`;
+  const resp = await axios.get<Buffer>(url, {
+    headers: { Authorization: `Bearer ${token}` },
+    responseType: "arraybuffer",
+  });
+  return Buffer.from(resp.data);
+}
+
+/**
+ * Flushes pending WhatsApp outbox messages via the live socket.
+ * Text messages are sent as plain text; audio messages are sent as voice notes.
+ */
+async function flushOutbox(sock: WASocket): Promise<void> {
+  const pending = await getPendingOutboxMessages(10);
+  if (pending.length === 0) return;
+  info(`[outbox] Flushing ${pending.length} pending message(s).`);
+
+  for (const msg of pending) {
+    try {
+      if (msg.messageType === "text" && msg.body) {
+        await sock.sendMessage(msg.toJid, { text: msg.body });
+        info(`[outbox] Sent text message id=${msg.id} to=${msg.toJid}`);
+      } else if (msg.messageType === "audio" && msg.mediaGcsUri) {
+        const audioBuffer = await downloadFromGcs(msg.mediaGcsUri);
+        await sock.sendMessage(msg.toJid, {
+          audio: audioBuffer,
+          mimetype: (msg.mediaMimeType || "audio/ogg") as any,
+          ptt: true, // send as voice note (push-to-talk)
+        });
+        info(`[outbox] Sent voice note id=${msg.id} to=${msg.toJid} (${audioBuffer.length} bytes)`);
+      }
+      await markOutboxSent(msg.id);
+    } catch (err) {
+      error(`[outbox] Failed to send message id=${msg.id}`, err);
+      await markOutboxFailed(msg.id).catch(() => undefined);
+    }
+  }
 }
 
 function getRandomPollDelayMs(): number {
@@ -699,6 +760,9 @@ export async function pollWhatsappInboxOnce(): Promise<void> {
       // ----------------------------------------------------------------
       if (update.connection === "open" || update.isNewLogin || update.registered) {
         info("WhatsApp connection is open.");
+
+        // Flush any pending outbox messages (morning brief voice notes, alerts, etc.)
+        flushOutbox(sock).catch(err => error("[outbox] flush failed", err));
 
         // If we already know sync is done (e.g. second reconnect in same session),
         // let the quiet window handle shutdown.

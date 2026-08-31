@@ -139,6 +139,12 @@ export class ArisService {
     "google_contacts_sync",
     "contact_add_note",
     "sunbird_translate",
+    // Goal tracking tools
+    "goal_set",
+    "goal_update_state",
+    "goal_view_tasks",
+    // WhatsApp outbox (send to self)
+    "whatsapp_send",
   ]);
 
   constructor(
@@ -315,6 +321,24 @@ export class ArisService {
       console.error("[arisService] Background save failed for user message:", err);
     });
 
+    let coachPersona = "encouraging";
+    let goalState = {};
+    let activeGoals: any[] = [];
+    let pendingTasks: any[] = [];
+    
+    if (input.userId) {
+      try {
+        const { goalsStore } = await import("../db/goalsStore");
+        const stateData = await goalsStore.getUserState(input.userId);
+        coachPersona = stateData.coachPersona;
+        goalState = stateData.state;
+        activeGoals = await goalsStore.getActiveGoals(input.userId);
+        pendingTasks = await goalsStore.getPendingTasks(input.userId);
+      } catch (err) {
+        console.error("[arisService] Failed to load goal state:", err);
+      }
+    }
+
     const toolChainResult = await this.executeToolChain(
       input.userId,
       effectiveMessage,
@@ -323,6 +347,10 @@ export class ArisService {
       conversationHistory,
       sessionId,
       searchToolEnabled,
+      coachPersona,
+      goalState,
+      activeGoals,
+      pendingTasks,
       onProgress,
       input.approvedAction
     );
@@ -817,6 +845,58 @@ export class ArisService {
       }
     }
 
+    if (toolName === "goal_set") {
+      try {
+        if (!userId) return { success: false, tool: toolName, error: "User not authenticated." };
+        const { goalsStore } = await import("../db/goalsStore");
+        const title = invocation.payload?.title;
+        const desc = invocation.payload?.description;
+        if (!title) return { success: false, tool: toolName, error: "goal_set requires a 'title' string." };
+        const goal = await goalsStore.createGoal(userId, title, desc);
+        return { success: true, tool: toolName, data: { summary: `Goal created successfully. ID: ${goal.id}`, goal } };
+      } catch (err: any) {
+        return { success: false, tool: toolName, error: err?.message || "Failed to create goal." };
+      }
+    }
+
+    if (toolName === "goal_update_state") {
+      try {
+        if (!userId) return { success: false, tool: toolName, error: "User not authenticated." };
+        const { goalsStore } = await import("../db/goalsStore");
+        const updates = invocation.payload?.stateUpdates;
+        if (!updates) return { success: false, tool: toolName, error: "goal_update_state requires a 'stateUpdates' JSON object." };
+        const state = await goalsStore.updateUserState(userId, updates);
+        return { success: true, tool: toolName, data: { summary: `State updated successfully.`, state: state.state } };
+      } catch (err: any) {
+        return { success: false, tool: toolName, error: err?.message || "Failed to update state." };
+      }
+    }
+
+    if (toolName === "goal_view_tasks") {
+      try {
+        if (!userId) return { success: false, tool: toolName, error: "User not authenticated." };
+        const { goalsStore } = await import("../db/goalsStore");
+        const tasks = await goalsStore.getPendingTasks(userId);
+        return { success: true, tool: toolName, data: { summary: `Found ${tasks.length} pending tasks.`, tasks } };
+      } catch (err: any) {
+        return { success: false, tool: toolName, error: err?.message || "Failed to fetch tasks." };
+      }
+    }
+
+    if (toolName === "whatsapp_send") {
+      try {
+        if (!userId) return { success: false, tool: toolName, error: "User not authenticated." };
+        const selfJid = process.env.WHATSAPP_SELF_JID;
+        if (!selfJid) return { success: false, tool: toolName, error: "WHATSAPP_SELF_JID is not configured." };
+        const body = invocation.payload?.message || invocation.payload?.body || invocation.payload?.text;
+        if (!body) return { success: false, tool: toolName, error: "whatsapp_send requires a 'message' string." };
+        const { whatsappOutboxStore } = await import("../db/whatsappOutboxStore");
+        await whatsappOutboxStore.enqueue(selfJid, "text", String(body), undefined, undefined, userId);
+        return { success: true, tool: toolName, data: { summary: "Message queued to your WhatsApp. It will be delivered on the next polling cycle." } };
+      } catch (err: any) {
+        return { success: false, tool: toolName, error: err?.message || "Failed to queue WhatsApp message." };
+      }
+    }
 
     if (toolName === "tomtom_route") {
       try {
@@ -2181,6 +2261,10 @@ export class ArisService {
     conversationHistory: string[],
     sessionId: string,
     includeSearch: boolean,
+    coachPersona: string,
+    goalState: any,
+    activeGoals: any[],
+    pendingTasks: any[],
     onProgress?: (msg: string) => void,
     approvedAction?: ToolInvocation
   ): Promise<ToolChainResult> {
@@ -2227,7 +2311,7 @@ export class ArisService {
         `Thought:`
       ].join('\n');
     } else {
-      prompt = this.buildToolChainPrompt(userMessage, userProfile, memories, conversationHistory, activeCategories, locationContext);
+      prompt = this.buildToolChainPrompt(userMessage, userProfile, memories, conversationHistory, activeCategories, locationContext, coachPersona, goalState, activeGoals, pendingTasks);
     }
     let lastModelReply = "";
 
@@ -2571,14 +2655,23 @@ export class ArisService {
     ].join("\n");
   }
 
-  private buildToolChainPrompt(userMessage: string, userProfile: UserProfileEntry[], memories: string[], conversationHistory: string[], activeCategories: Set<string>, locationContext: string) {
+  private buildToolChainPrompt(userMessage: string, userProfile: UserProfileEntry[], memories: string[], conversationHistory: string[], activeCategories: Set<string>, locationContext: string, coachPersona: string, goalState: any, activeGoals: any[], pendingTasks: any[]) {
     const profileLines = userProfile.length
       ? ["User profile:", ...userProfile.map((item) => `- ${item.profileKey}: ${item.profileValue}`), ""]
       : [];
+      
     const currentDateTime = new Date().toLocaleString("en-US", { weekday: "long", year: "numeric", month: "long", day: "numeric", hour: "numeric", minute: "numeric", timeZoneName: "short" });
 
     const toolInstructions = [
-      `You are Aris, an extremely conversational digital friend, an expert advisor, an emotional helper, a comforter, and a life coach.`,
+      `You are Aris, an extremely conversational digital friend, an expert advisor, an emotional helper, and an aggressive, tactical life coach.`,
+      `Your current Life Coach Persona is: ${coachPersona}. Adjust your tone and advice to match this persona exactly.`,
+      `User's Current State (Initial Know): ${JSON.stringify(goalState)}`,
+      `User's Active Goals: ${JSON.stringify(activeGoals.map(g => g.title))}`,
+      `User's Pending Tasks Today: ${JSON.stringify(pendingTasks.map(t => t.title))}`,
+      `GOAL TRACKING TOOLS:`,
+      `Use 'goal_set' to create a new goal. Example: {"tool":"goal_set", "title": "Become a billionaire", "description": "in 10 years"}`,
+      `Use 'goal_update_state' to update the user's Initial Know profile based on conversation. Example: {"tool":"goal_update_state", "stateUpdates": {"net_worth": "100k"}}`,
+      `Use 'goal_view_tasks' to check the status of today's tasks.`,
       `You have a persistent digital brain with a memory database.`,
       `If the user asks to access or manage services, do not answer directly. Output exactly one valid tool call and nothing else.`,
       `Current Date and Time: ${currentDateTime}`,

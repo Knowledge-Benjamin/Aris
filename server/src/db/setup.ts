@@ -222,6 +222,75 @@ async function setup() {
     CREATE INDEX IF NOT EXISTS contacts_phone_numbers_idx ON contacts USING GIN(phone_numbers);
   `).catch(() => undefined);
 
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS user_state (
+      user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+      state JSONB NOT NULL DEFAULT '{}',
+      coach_persona TEXT NOT NULL DEFAULT 'encouraging',
+      updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+    );
+  `).catch(() => undefined);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS goals (
+      id SERIAL PRIMARY KEY,
+      user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      title TEXT NOT NULL,
+      description TEXT,
+      status TEXT NOT NULL DEFAULT 'active',
+      target_date TIMESTAMP WITH TIME ZONE,
+      created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+      updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+    );
+  `).catch(() => undefined);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS goal_milestones (
+      id SERIAL PRIMARY KEY,
+      goal_id INTEGER NOT NULL REFERENCES goals(id) ON DELETE CASCADE,
+      title TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'pending',
+      due_date TIMESTAMP WITH TIME ZONE,
+      created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+      updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+    );
+  `).catch(() => undefined);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS daily_tasks (
+      id SERIAL PRIMARY KEY,
+      user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      goal_id INTEGER REFERENCES goals(id) ON DELETE SET NULL,
+      title TEXT NOT NULL,
+      description TEXT,
+      calendar_event_id TEXT,
+      start_time TIMESTAMP WITH TIME ZONE,
+      end_time TIMESTAMP WITH TIME ZONE,
+      status TEXT NOT NULL DEFAULT 'pending',
+      created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+      updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+    );
+  `).catch(() => undefined);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS whatsapp_outbox (
+      id SERIAL PRIMARY KEY,
+      user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+      to_jid TEXT NOT NULL,
+      message_type TEXT NOT NULL DEFAULT 'text',
+      body TEXT,
+      media_gcs_uri TEXT,
+      media_mime_type TEXT,
+      status TEXT NOT NULL DEFAULT 'pending',
+      created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+      sent_at TIMESTAMP WITH TIME ZONE
+    );
+  `).catch(() => undefined);
+
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS whatsapp_outbox_status_idx ON whatsapp_outbox(status);
+  `).catch(() => undefined);
+
   console.log("Database setup complete.");
   await pool.end();
 }
