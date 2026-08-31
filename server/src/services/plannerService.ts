@@ -8,10 +8,19 @@ import { gcsService } from "./gcsService";
 import { VoiceService } from "./voiceService";
 import { GemmaService } from "./gemmaService";
 import { WeatherService } from "./weatherService";
+import { NewsService } from "./newsService";
+import { SearchClient } from "./searchClient";
 import { info, error } from "../utils/logger";
 
 const voiceService = new VoiceService();
 const weatherService = new WeatherService();
+const newsService = new NewsService();
+let searchClient: SearchClient | undefined;
+try {
+  searchClient = new SearchClient();
+} catch (e) {
+  // gracefully handle missing SEARCH_SERVICE_URL during init
+}
 
 
 export class PlannerService {
@@ -67,6 +76,30 @@ export class PlannerService {
         }
       } catch { /* ignore */ }
 
+      // 1d. Proactive News & Internet Monitoring
+      const topics = state.state?.monitored_topics;
+      if (Array.isArray(topics) && topics.length > 0) {
+        info(`[PlannerService] Monitoring topics: ${topics.join(", ")}`);
+        for (const topic of topics.slice(0, 3)) { // Limit to 3 topics per run to avoid context bloat
+          try {
+            const news = await newsService.getTopNews(topic, 2);
+            if (news.length > 0) {
+              contextText += `\nLatest News for "${topic}":\n`;
+              news.forEach(n => contextText += `- ${n.title} (${n.source})\n`);
+            }
+            if (searchClient) {
+              const searchRes = await searchClient.search({ query: topic, limit: 2 });
+              if (searchRes.results && searchRes.results.length > 0) {
+                contextText += `\nRecent Web Search for "${topic}":\n`;
+                searchRes.results.slice(0, 2).forEach((r: any) => contextText += `- ${r.title}: ${r.snippet}\n`);
+              }
+            }
+          } catch (e) {
+            error(`[PlannerService] Failed to monitor topic ${topic}`, e);
+          }
+        }
+      }
+
       if (!contextText) {
         info(`[PlannerService] No new context for user ${userId}`);
         return;
@@ -78,12 +111,12 @@ Analyze the following recent events for a user whose active goals are: ${JSON.st
 Current state profile: ${JSON.stringify(state.state)}
 Today's Pending Tasks: ${JSON.stringify(pendingTasks.map((t: any) => t.title))}
 
-RECENT EVENTS (Messages / Emails / Weather Alerts):
+RECENT EVENTS (Messages / Emails / Weather / News / Web Searches):
 ${contextText}
 
 Perform the following reasoning steps and return a SINGLE JSON object:
-1. "state_updates": any new facts to merge into the profile (e.g. {"mood": "stressed", "client_x_status": "unhappy"})
-2. "urgent_actions": array of strings describing any immediate actions Aris should take (e.g. "Alert user that it will rain soon so they should do their outdoor task now", "Reschedule pitch deck block to today 10am")
+1. "state_updates": any new facts to merge into the profile (e.g. {"mood": "stressed", "monitored_topics": ["stock market"]})
+2. "urgent_actions": array of strings describing immediate actions Aris should take. Use this to alert the user of breaking news, severe weather, or unread urgent emails. (e.g. "Alert user that their competitor just launched a new product according to the news.", "Warn user it will rain soon.")
 3. "persona_shift": optional new coach persona if user is clearly slipping or under pressure (e.g. "tough-love", "crisis-mode", "military-drill-sergeant"). Leave null if no change needed.
 
 Respond ONLY in valid JSON. Example:

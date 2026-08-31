@@ -2671,7 +2671,7 @@ export class ArisService {
       `User's Pending Tasks Today: ${JSON.stringify(pendingTasks.map(t => t.title))}`,
       `GOAL TRACKING TOOLS:`,
       `Use 'goal_set' to create a new goal. Example: {"tool":"goal_set", "title": "Become a billionaire", "description": "in 10 years"}`,
-      `Use 'goal_update_state' to update the user's Initial Know profile based on conversation. Example: {"tool":"goal_update_state", "stateUpdates": {"net_worth": "100k"}}`,
+      `Use 'goal_update_state' to update the user's Initial Know profile based on conversation. You can also add topics for Aris to monitor on the internet by setting "monitored_topics" (array of strings). Example: {"tool":"goal_update_state", "stateUpdates": {"net_worth": "100k", "monitored_topics": ["AI news", "TSLA stock"]}}`,
       `Use 'goal_view_tasks' to check the status of today's tasks.`,
       `You have a persistent digital brain with a memory database.`,
       `If the user asks to access or manage services, do not answer directly. Output exactly one valid tool call and nothing else.`,
