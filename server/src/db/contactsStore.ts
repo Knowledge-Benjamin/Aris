@@ -96,7 +96,10 @@ export async function resolvePhoneNumbers(
     const groupRes = await pool.query(
       `SELECT jid, subject FROM whatsapp_groups WHERE jid = ANY($1)`,
       [groupJids]
-    ).catch(() => ({ rows: [] as any[] }));
+    ).catch((err) => {
+      console.error("[contactsStore] Failed to resolve group JIDs", err);
+      return { rows: [] as any[] };
+    });
     for (const row of groupRes.rows) {
       result[row.jid] = row.subject;
     }

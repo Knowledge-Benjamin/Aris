@@ -651,9 +651,6 @@ export class ArisService {
     };
   }
 
-  private isTerminalTool(toolName: string): boolean {
-    return false;
-  }
 
   private validateToolName(toolName: string): string | undefined {
     const normalized = this.normalizeToolName(toolName);
@@ -2361,15 +2358,7 @@ export class ArisService {
 
       const hasFailure = results.some((r) => !r.success);
 
-      const terminalIndex = normalizedInvocations.findIndex((inv) => this.isTerminalTool(inv.tool));
-      if (terminalIndex !== -1) {
-        const summary = String(results[terminalIndex].data?.summary || "").trim();
-        return {
-          status: "finished",
-          reply: summary || "Task completed.",
-          memoryEntries: [],
-        };
-      }
+
 
       // Build continuation prompt with actual tool data embedded
       const successResults = toolResults.filter(tr => tr.result.success && tr.invocation.tool !== '_system');
