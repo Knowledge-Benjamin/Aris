@@ -1,0 +1,3 @@
+[submodule "search-server"]
+	path = search-server
+	url = https://github.com/Knowledge-Benjamin/Search-Service.git

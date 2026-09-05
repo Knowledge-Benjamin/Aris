@@ -291,6 +291,19 @@ async function setup() {
     CREATE INDEX IF NOT EXISTS whatsapp_outbox_status_idx ON whatsapp_outbox(status);
   `).catch(() => undefined);
 
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS whatsapp_chat_inbox (
+      id SERIAL PRIMARY KEY,
+      user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+      sender_jid TEXT NOT NULL,
+      message_text TEXT,
+      media_data JSONB,
+      status TEXT NOT NULL DEFAULT 'pending',
+      created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+      processed_at TIMESTAMP WITH TIME ZONE
+    );
+  `).catch(() => undefined);
+
   console.log("Database setup complete.");
   await pool.end();
 }

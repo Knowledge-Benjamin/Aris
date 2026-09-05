@@ -167,3 +167,16 @@ export async function markOutboxFailed(id: number): Promise<void> {
     [id]
   );
 }
+
+export async function enqueueWhatsappChat(
+  userId: number,
+  senderJid: string,
+  messageText: string | undefined,
+  mediaData: any | undefined
+): Promise<void> {
+  await pool.query(
+    `INSERT INTO whatsapp_chat_inbox (user_id, sender_jid, message_text, media_data)
+     VALUES ($1, $2, $3, $4)`,
+    [userId, senderJid, messageText || null, mediaData || null]
+  );
+}

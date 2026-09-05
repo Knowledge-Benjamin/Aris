@@ -9,7 +9,7 @@ import { GoogleService } from "./googleService";
 import { WhatsappService } from "./whatsappService";
 import { TomTomService } from "./tomtomService";
 import { upsertContacts, getContactCount, searchContacts as searchContactsDb, getAllContacts, resolveNameToPhones, updateContactProfileSummary } from "../db/contactsStore";
-import { info } from "../utils/logger";
+import { info, error } from "../utils/logger";
 import { LocationService } from "./locationService";
 import { WeatherService } from "./weatherService";
 import { SunbirdService } from "./sunbirdService";
@@ -148,6 +148,11 @@ export class ArisService {
     "whatsapp_send",
     // Internet reading
     "url_read",
+    // Meeting bot
+    "join_meeting",
+    // Secure vault
+    "vault_store",
+    "vault_retrieve",
   ]);
 
   constructor(
@@ -758,6 +763,75 @@ export class ArisService {
         tool: toolName,
         error: payloadError,
       };
+    }
+
+    if (toolName === "vault_store") {
+      try {
+        const { key, value } = invocation.payload || {};
+        if (!key || !value) throw new Error("vault_store requires 'key' and 'value'");
+        if (!userId) throw new Error("vault_store requires an authenticated userId");
+        const { VaultStore } = await import("../db/vaultStore");
+        const pool = (await import("../db/db")).getDatabasePool();
+        const vault = new VaultStore(pool);
+        await vault.storeSecret(userId, key, String(value));
+        return {
+          success: true,
+          tool: toolName,
+          data: `Securely stored "${key}" in your encrypted vault.`,
+        };
+      } catch (e: any) {
+        return { success: false, tool: toolName, error: e.message };
+      }
+    }
+
+    if (toolName === "vault_retrieve") {
+      try {
+        const { key } = invocation.payload || {};
+        if (!key) throw new Error("vault_retrieve requires 'key'");
+        if (!userId) throw new Error("vault_retrieve requires an authenticated userId");
+        const { VaultStore } = await import("../db/vaultStore");
+        const pool = (await import("../db/db")).getDatabasePool();
+        const vault = new VaultStore(pool);
+        const value = await vault.retrieveSecret(userId, key);
+        if (value === null) {
+          return { success: false, tool: toolName, error: `No vault entry found for key: "${key}". Has it been stored yet?` };
+        }
+        return {
+          success: true,
+          tool: toolName,
+          data: `Vault entry for "${key}": ${value}`,
+        };
+      } catch (e: any) {
+        return { success: false, tool: toolName, error: e.message };
+      }
+    }
+
+    if (toolName === "join_meeting") {
+      try {
+        const url = invocation.payload?.url;
+        if (!url) throw new Error("Missing 'url' in payload");
+        
+        // Dynamic import to avoid circular dependencies or massive imports
+        const { MeetingBotService } = require('./meetingBotService');
+        const meetingBot = new MeetingBotService();
+        
+        // We pass the bot instance to the plannerService to track the state
+        const plannerService = require('../backgroundJobs').plannerService || require('../server').plannerService;
+        if (plannerService) {
+          plannerService.startMeeting(url, meetingBot);
+        }
+
+        // Fire and forget, we don't await the entire meeting
+        meetingBot.joinMeeting(url, "Aris (Notetaker)").catch((e: any) => error("[MeetingBot] Error:", e));
+        
+        return {
+          success: true,
+          tool: toolName,
+          data: `Successfully dispatched Aris to join ${url}. It will take notes and email them when finished.`,
+        };
+      } catch (e: any) {
+        return { success: false, tool: toolName, error: e.message };
+      }
     }
 
     if (toolName === "fetch_news") {
@@ -1596,7 +1670,7 @@ export class ArisService {
           return {
             success: true,
             tool: toolName,
-            data: await this.googleService.sendEmail(account, invocation.payload?.to, invocation.payload?.subject, invocation.payload?.body, persistTokens),
+            data: await this.googleService.sendEmail(account, invocation.payload?.to, invocation.payload?.subject, invocation.payload?.body, undefined, persistTokens),
           };
         case "google_gmail_label": {
           const action = invocation.payload?.action?.toString()?.trim().toLowerCase();
@@ -2269,6 +2343,10 @@ export class ArisService {
     if (this.hasFuzzyMatch(allWords, ["whatsapp", "wa", "chat"])) categories.add("whatsapp");
     if (this.hasFuzzyMatch(allWords, ["traffic", "route", "commute", "drive", "directions", "eta"])) categories.add("traffic");
     if (this.hasFuzzyMatch(allWords, ["weather", "forecast", "air", "quality", "marine", "ocean", "rain", "temperature", "temp", "cold", "hot"])) categories.add("weather");
+    if (
+      this.hasFuzzyMatch(allWords, ["join", "meet", "zoom", "meeting", "notetaker", "notes"]) &&
+      (textToAnalyze.includes("meet.google.com") || textToAnalyze.includes("zoom.us") || textToAnalyze.includes("join") )
+    ) categories.add("meeting");
 
     // Only fall back to search+generic tools if no specific category was detected
     // and this is clearly NOT a casual conversational message.
@@ -2705,7 +2783,22 @@ export class ArisService {
       `Use 'url_read' whenever the user shares a link or asks you to read/summarize a webpage, article, or any URL. Also use it to deeply verify information from search results. Example: {"tool":"url_read","url":"https://example.com/article"}`,
       `You can pass multiple URLs at once: {"tool":"url_read","urls":["https://example.com/a","https://example.com/b"]}`,
       `Use 'url_read' after a 'search' to go deeper — don't just rely on snippets, read the actual pages.`,
+      `MEETING BOT TOOL:`,
+      `Use 'join_meeting' if the user asks you to join a Google Meet or Zoom meeting to take notes. Example: {"tool":"join_meeting","url":"https://meet.google.com/xyz"}`,
       `Use 'whatsapp_send' to push an alert or message to the user's WhatsApp. Example: {"tool":"whatsapp_send","message":"Don't forget your 3pm meeting!"}`,
+      `SECURE VAULT TOOLS:`,
+      `The vault is an AES-256-GCM encrypted store for any sensitive information. Use it proactively whenever the user shares or asks about sensitive data.`,
+      `Use 'vault_store' to encrypt and save any sensitive value. Examples of when to use it:`,
+      `  - User says "My WiFi password is Abc12345" → {"tool":"vault_store","key":"wifi_password","value":"Abc12345"}`,
+      `  - User says "My phone PIN is 2580" → {"tool":"vault_store","key":"phone_pin","value":"2580"}`,
+      `  - User says "My MTN MoMo PIN is 1234" → {"tool":"vault_store","key":"momo_pin","value":"1234"}`,
+      `  - User says "Store my Netflix password: pass123" → {"tool":"vault_store","key":"netflix_password","value":"pass123"}`,
+      `  - User says "My bank account number is 012345678" → {"tool":"vault_store","key":"bank_account","value":"012345678"}`,
+      `Use 'vault_retrieve' to decrypt and fetch a previously stored secret. Examples:`,
+      `  - User says "What's my WiFi password?" → {"tool":"vault_retrieve","key":"wifi_password"}`,
+      `  - User says "What PIN did I store for my phone?" → {"tool":"vault_retrieve","key":"phone_pin"}`,
+      `CRITICAL VAULT RULE: If you detect a password, PIN, account number, secret key, or any credential in the user's message, you MUST call vault_store immediately — even if the user didn't explicitly ask you to save it.`,
+      `CRITICAL VAULT RULE: Never echo a raw password or PIN in your final_answer. If you retrieve a secret, present it naturally: "Your WiFi password is stored. Here it is: [value]". Do not repeat it in memory_entries.`,
       `You have a persistent digital brain with a memory database.`,
       `If the user asks to access or manage services, do not answer directly. Output exactly one valid tool call and nothing else.`,
       `Current Date and Time: ${currentDateTime}`,

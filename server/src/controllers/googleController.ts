@@ -1410,6 +1410,7 @@ export async function sendGmailMessage(req: Request, res: Response) {
       to,
       subject,
       body,
+      undefined, // no attachment
       async (tokens) => {
         await googleAccountStore.updateGoogleTokens(
           userId,

@@ -48,6 +48,32 @@ export async function getPendingWhatsappMessages(limit = 50): Promise<WhatsappMe
   return result.rows.map(mapRow);
 }
 
+export async function getPendingWhatsappChat(limit = 5) {
+  const result = await pool.query(
+    `SELECT id, user_id, sender_jid, message_text, media_data, created_at
+     FROM whatsapp_chat_inbox
+     WHERE status = 'pending'
+     ORDER BY created_at ASC
+     LIMIT $1`,
+    [limit]
+  );
+  return result.rows.map(row => ({
+    id: row.id,
+    userId: row.user_id,
+    senderJid: row.sender_jid,
+    messageText: row.message_text,
+    mediaData: row.media_data,
+    createdAt: row.created_at
+  }));
+}
+
+export async function markWhatsappChatProcessed(id: number, status = 'processed') {
+  await pool.query(
+    `UPDATE whatsapp_chat_inbox SET status = $1, processed_at = NOW() WHERE id = $2`,
+    [status, id]
+  );
+}
+
 /**
  * Fetch recent messages from ALL senders (both analyzed and pending), newest first.
  * Used for general WhatsApp history reads.

@@ -706,4 +706,99 @@ export class GemmaService {
       isFinalAnswer,
     };
   }
+
+  public async inferAmbientAction(prompt: string): Promise<string> {
+    try {
+      const response = await axios.post(
+        buildGemmaUrl(),
+        {
+          contents: [{ role: "user", parts: [{ text: prompt }] }],
+          generationConfig: { temperature: 0.1, maxOutputTokens: 150 }
+        },
+        {
+          headers: {
+            "x-goog-api-key": apiKey,
+            "Content-Type": "application/json",
+          },
+        }
+      );
+      return extractGeneratedText(response.data) || "No action";
+    } catch (e: any) {
+      error("[GemmaService] inferAmbientAction failed", e.response?.data || e.message);
+      return "No action";
+    }
+  }
+
+  public async inferNextUiAction(goal: string, uiTreeStr: string, base64Image?: string, phonePin?: string): Promise<string> {
+    const vaultContext = phonePin 
+      ? `\n      VAULT CONTEXT: The user's phone PIN is "${phonePin}". Use it if the lock screen is visible.`
+      : `\n      VAULT CONTEXT: Phone PIN not stored. If locked, instruct the user to unlock manually.`;
+
+    const prompt = `
+      You are an Android Autonomy Agent.
+      Goal: "${goal}"
+      ${vaultContext}
+      
+      Here is the current UI tree (Accessibility Nodes) of the screen:
+      ${uiTreeStr}
+      
+      Analyze the screen and determine the NEXT action required to achieve the goal.
+      Return ONLY a raw JSON object with the following schema, with no markdown formatting or backticks:
+      {
+        "action": "click" | "type" | "scroll" | "home" | "back" | "complete",
+        "targetNodeId": "The ID of the node to interact with (if applicable)",
+        "text": "The text to type (if action is type)",
+        "feedback": "A short, 1-2 sentence status message explaining what Aris is doing right now (e.g. 'Finding the search bar...' or 'Opening WhatsApp.')"
+      }
+    `;
+
+    const parts: any[] = [{ text: prompt }];
+    if (base64Image) {
+      parts.push({
+        inlineData: { mimeType: "image/jpeg", data: base64Image }
+      });
+    }
+
+    try {
+      const response = await axios.post(
+        buildGemmaUrl(),
+        {
+          contents: [{ role: "user", parts }],
+          generationConfig: { temperature: 0.1, maxOutputTokens: 200 }
+        },
+        {
+          headers: {
+            "x-goog-api-key": apiKey,
+            "Content-Type": "application/json",
+          },
+        }
+      );
+      return extractGeneratedText(response.data) || '{"action":"complete"}';
+    } catch (e: any) {
+      error("[GemmaService] inferNextUiAction failed", e.response?.data || e.message);
+      return '{"action":"complete"}';
+    }
+  }
+
+  public async compareVoicePrints(prompt: string, refBase64: string, candidateBase64: string): Promise<string> {
+    const parts = [
+      { text: prompt },
+      { inlineData: { mimeType: "audio/ogg", data: refBase64 } },
+      { inlineData: { mimeType: "audio/ogg", data: candidateBase64 } }
+    ];
+    try {
+      const response = await axios.post(
+        buildGemmaUrl(),
+        {
+          contents: [{ role: "user", parts }],
+          generationConfig: { temperature: 0.0, maxOutputTokens: 80 }
+        },
+        { headers: { "x-goog-api-key": apiKey, "Content-Type": "application/json" } }
+      );
+      return extractGeneratedText(response.data) || '{"same_speaker":false,"confidence":0}';
+    } catch (e: any) {
+      error("[GemmaService] compareVoicePrints failed", e.response?.data || e.message);
+      return '{"same_speaker":false,"confidence":0}';
+    }
+  }
 }

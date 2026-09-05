@@ -4,10 +4,10 @@ import makeWASocket, {
   DisconnectReason,
   AnyMessageContent,
   WASocket,
-  fetchLatestWaWebVersion,
   fetchLatestBaileysVersion,
   proto,
   downloadMediaMessage,
+  jidNormalizedUser,
 } from "@whiskeysockets/baileys";
 import { usePostgreSQLAuthState } from "postgres-baileys";
 import qrcode from "qrcode-terminal";
@@ -21,6 +21,7 @@ import {
   getPendingOutboxMessages,
   markOutboxSent,
   markOutboxFailed,
+  enqueueWhatsappChat,
 } from "./dbAdapter";
 import { info, error } from "./logger";
 import axios from "axios";
@@ -141,6 +142,8 @@ async function downloadFromGcs(gcsUri: string): Promise<Buffer> {
  * Flushes pending WhatsApp outbox messages via the live socket.
  * Text messages are sent as plain text; audio messages are sent as voice notes.
  */
+const arisSentMessageIds = new Set<string>();
+
 async function flushOutbox(sock: WASocket): Promise<void> {
   const pending = await getPendingOutboxMessages(10);
   if (pending.length === 0) return;
@@ -148,18 +151,37 @@ async function flushOutbox(sock: WASocket): Promise<void> {
 
   for (const msg of pending) {
     try {
+      let sentMsg;
       if (msg.messageType === "text" && msg.body) {
-        await sock.sendMessage(msg.toJid, { text: msg.body });
+        sentMsg = await sock.sendMessage(msg.toJid, { text: msg.body });
         info(`[outbox] Sent text message id=${msg.id} to=${msg.toJid}`);
       } else if (msg.messageType === "audio" && msg.mediaGcsUri) {
         const audioBuffer = await downloadFromGcs(msg.mediaGcsUri);
-        await sock.sendMessage(msg.toJid, {
+        sentMsg = await sock.sendMessage(msg.toJid, {
           audio: audioBuffer,
           mimetype: (msg.mediaMimeType || "audio/ogg") as any,
           ptt: true, // send as voice note (push-to-talk)
         });
         info(`[outbox] Sent voice note id=${msg.id} to=${msg.toJid} (${audioBuffer.length} bytes)`);
+      } else if (msg.messageType === "document" && msg.mediaGcsUri) {
+        const docBuffer = await downloadFromGcs(msg.mediaGcsUri);
+        sentMsg = await sock.sendMessage(msg.toJid, {
+          document: docBuffer,
+          mimetype: msg.mediaMimeType || "application/pdf",
+          fileName: msg.body || "document.pdf"
+        });
+        info(`[outbox] Sent document id=${msg.id} to=${msg.toJid} (${docBuffer.length} bytes)`);
       }
+      
+      if (sentMsg?.key?.id) {
+        arisSentMessageIds.add(sentMsg.key.id);
+        // keep set bounded
+        if (arisSentMessageIds.size > 1000) {
+          const iter = arisSentMessageIds.keys();
+          arisSentMessageIds.delete(iter.next().value!);
+        }
+      }
+
       await markOutboxSent(msg.id);
     } catch (err) {
       error(`[outbox] Failed to send message id=${msg.id}`, err);
@@ -911,14 +933,27 @@ export async function pollWhatsappInboxOnce(): Promise<void> {
 
         try {
           for (const msg of upsert.messages) {
-            if (msg.key.fromMe || !msg.key.remoteJid) continue;
+            if (!msg.key.remoteJid) continue;
+
+            if (msg.key.id && arisSentMessageIds.has(msg.key.id)) {
+              // This is a message Aris sent via flushOutbox. We don't want to process it as user input!
+              continue;
+            }
+
+            const selfJid = sock.user?.id ? jidNormalizedUser(sock.user.id) : null;
+            const isMessageYourself = selfJid && msg.key.remoteJid === selfJid;
+            
+            // If the user sent an outgoing message to someone else, we just want to save it as context.
+            // But if it's sent to "Message Yourself", it's a direct chat to Aris!
 
             const isGroup = msg.key.remoteJid?.endsWith("@g.us");
             const participantJid =
               msg.key.participant ||
               (isGroup ? (msg as any).participant : null) ||
               null;
-            const senderId = participantJid || msg.key.remoteJid;
+            
+            // If it's fromMe, the sender is "Me".
+            const senderId = msg.key.fromMe ? "Me" : (participantJid || msg.key.remoteJid);
             const messageText = extractTextMessage(msg.message) || "[Media Message]";
             
             let mediaData: { mimeType: string; dataBase64: string } | undefined;
@@ -942,25 +977,43 @@ export async function pollWhatsappInboxOnce(): Promise<void> {
 
             if (!messageText && !mediaData) continue;
 
-            try {
-              await saveWhatsappMessage({
-                senderId,
-                messageId: msg.key.id || `${senderId}:${msg.messageTimestamp}`,
-                messageText: messageText === "[Media Message]" ? (mediaData ? "[Attached Media]" : "") : messageText,
-                whatsappTimestamp: Number(msg.messageTimestamp) || Date.now(),
-                metadata: {
-                  remoteJid: msg.key.remoteJid,
-                  groupJid: isGroup ? msg.key.remoteJid : undefined,
-                  participant: participantJid,
-                  pushName: (msg as any).pushName || undefined,
-                  messageStubType: msg.messageStubType,
-                  upsertType: upsert.type,
-                  mediaData,
-                },
-              });
-              info(`Saved message from ${senderId} (${upsert.type}).`);
-            } catch (err) {
-              error("Failed to save WhatsApp message", err);
+            if (msg.key.fromMe && isMessageYourself) {
+              // User is talking to Aris!
+              info(`[whatsappPoller] User is talking directly to Aris in Message Yourself chat.`);
+              try {
+                // We assume there's exactly 1 active userId for the poller in single-tenant for now, 
+                // but let's grab it from the DB args if we can. Actually we can just pass userId = 1
+                await enqueueWhatsappChat(
+                  userId,
+                  msg.key.remoteJid,
+                  messageText === "[Media Message]" ? undefined : messageText,
+                  mediaData
+                );
+              } catch (err) {
+                error("Failed to enqueue WhatsApp chat to Aris", err);
+              }
+            } else {
+              // Regular incoming message, or an outgoing message to someone else (for context)
+              try {
+                await saveWhatsappMessage({
+                  senderId,
+                  messageId: msg.key.id || `${senderId}:${msg.messageTimestamp}`,
+                  messageText: messageText === "[Media Message]" ? (mediaData ? "[Attached Media]" : "") : messageText,
+                  whatsappTimestamp: Number(msg.messageTimestamp) || Date.now(),
+                  metadata: {
+                    remoteJid: msg.key.remoteJid,
+                    groupJid: isGroup ? msg.key.remoteJid : undefined,
+                    participant: participantJid,
+                    pushName: (msg as any).pushName || undefined,
+                    messageStubType: msg.messageStubType,
+                    upsertType: upsert.type,
+                    mediaData,
+                  },
+                });
+                info(`Saved message from ${senderId} (${upsert.type}).`);
+              } catch (err) {
+                error("Failed to save WhatsApp message", err);
+              }
             }
           }
         } catch (err) {

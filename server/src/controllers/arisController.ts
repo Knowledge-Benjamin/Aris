@@ -8,6 +8,7 @@ import { info, error } from "../utils/logger";
 import { AuthenticatedRequest } from "../middleware/authMiddleware";
 
 import { ContextStore } from "../db/contextStore";
+import { CompanionService } from "../services/companionService";
 
 const pool = getDatabasePool();
 const memoryStore = new MemoryStore(pool);
@@ -15,6 +16,7 @@ const contextStore = new ContextStore(pool);
 const gemmaService = new GemmaService();
 const arisService = new ArisService(memoryStore, contextStore, gemmaService);
 const voiceService = new VoiceService();
+const companionService = new CompanionService(gemmaService);
 
 export async function arisChat(req: Request, res: Response) {
   try {
@@ -167,5 +169,23 @@ export async function arisWelcome(req: Request, res: Response) {
   } catch (error) {
     console.error("arisWelcome error", error);
     res.status(500).json({ error: "Aris welcome speech failed." });
+  }
+}
+
+export async function companionAudio(req: Request, res: Response) {
+  try {
+    const { userId, audioBase64 } = req.body;
+    if (!userId || !audioBase64) {
+      return res.status(400).json({ error: "Missing userId or audioBase64" });
+    }
+
+    info(`[companionAudio] Passing audio to CompanionService for user ${userId}, length: ${audioBase64.length}`);
+
+    const result = await companionService.processAmbientAudio(userId, audioBase64);
+
+    res.json(result);
+  } catch (err) {
+    error("companionAudio error", err);
+    res.status(500).json({ error: "Failed to process ambient audio" });
   }
 }

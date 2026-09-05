@@ -1727,6 +1727,7 @@ export class GoogleService {
     recipient: string,
     subject: string,
     bodyText: string,
+    attachment?: { filename: string; mimeType: string; contentBase64: string },
     tokenUpdateHandler?: (tokens: {
       access_token?: string | null;
       refresh_token?: string | null;
@@ -1738,15 +1739,41 @@ export class GoogleService {
       throw new Error("Google account email is required to send email.");
     }
 
-    const rawMessage = [
-      `From: ${account.googleEmail}`,
-      `To: ${recipient}`,
-      `Subject: ${subject}`,
-      "MIME-Version: 1.0",
-      "Content-Type: text/plain; charset=UTF-8",
-      "",
-      bodyText,
-    ].join("\r\n");
+    let rawMessage: string;
+    
+    if (attachment) {
+      const boundary = 'aris-boundary-' + Date.now().toString(16);
+      rawMessage = [
+        `From: ${account.googleEmail}`,
+        `To: ${recipient}`,
+        `Subject: ${subject}`,
+        `MIME-Version: 1.0`,
+        `Content-Type: multipart/mixed; boundary=${boundary}`,
+        ``,
+        `--${boundary}`,
+        `Content-Type: text/plain; charset=UTF-8`,
+        ``,
+        bodyText,
+        ``,
+        `--${boundary}`,
+        `Content-Type: ${attachment.mimeType}; name="${attachment.filename}"`,
+        `Content-Disposition: attachment; filename="${attachment.filename}"`,
+        `Content-Transfer-Encoding: base64`,
+        ``,
+        attachment.contentBase64,
+        `--${boundary}--`
+      ].join('\r\n');
+    } else {
+      rawMessage = [
+        `From: ${account.googleEmail}`,
+        `To: ${recipient}`,
+        `Subject: ${subject}`,
+        "MIME-Version: 1.0",
+        "Content-Type: text/plain; charset=UTF-8",
+        "",
+        bodyText,
+      ].join("\r\n");
+    }
 
     const encoded = Buffer.from(rawMessage)
       .toString("base64")
