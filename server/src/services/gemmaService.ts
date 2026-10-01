@@ -614,6 +614,7 @@ export class GemmaService {
     };
 
     info(`[gemma] sending request to ${url}`);
+    info(`[gemma] multimodal parts=${mediaParts?.length || 0}${mediaParts?.[0]?.inlineData?.mimeType ? ` mimeType=${mediaParts[0].inlineData.mimeType}` : ""}`);
     info(`[gemma] request payload prompt length=${prompt.length} chars`);
     info(`[gemma] request payload preview=${JSON.stringify(prompt.slice(0, 300)).replace(/\\n/g, "\\n")}...`);
 
@@ -639,6 +640,7 @@ export class GemmaService {
         status: requestError.response?.status,
         statusText: requestError.response?.statusText,
         message: requestError.message,
+        responseBody: requestError.response?.data,
       });
 
       try {
@@ -662,6 +664,7 @@ export class GemmaService {
         error("[gemma] fallback request also failed", {
           status: fallbackError.response?.status,
           message: fallbackError.message,
+          responseBody: fallbackError.response?.data,
         });
         return {
           reply: "I'm experiencing a bit of a technical hiccup connecting to my brain right now! It seems the upstream servers are taking a little nap. Could we try that again in a few minutes?",
