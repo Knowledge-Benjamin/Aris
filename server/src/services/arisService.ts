@@ -5105,6 +5105,13 @@ export class ArisService {
       ""
     ] : [];
 
+    const locationInstructions = activeCategories.has("location") ? [
+      `For nearby places or services, use tomtom_nearby with a concise POI query such as "pharmacy", "restaurant", or "fuel station".`,
+      `Search relative to the coordinates in Current User Location; do not substitute a web search for a nearby-place lookup.`,
+      `Example: {"tool":"tomtom_nearby","query":"pharmacy","radiusMeters":5000,"limit":10}`,
+      ""
+    ] : [];
+
     const whatsappInstructions = activeCategories.has("whatsapp") ? [
       `WHATSAPP TOOL ROUTING — choose the correct tool based on the user's intent:`,
       `  - whatsapp_summary   → "any new messages?", "check WhatsApp", "unread messages". RUNS the service to pull FRESH messages.`,
@@ -5271,6 +5278,7 @@ export class ArisService {
       ...searchInstructions,
       ...trafficInstructions,
       ...weatherInstructions,
+      ...locationInstructions,
       ...whatsappInstructions,
       ...briefingInstructions,
       ...googleInstructions,
