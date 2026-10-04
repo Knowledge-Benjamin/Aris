@@ -18,7 +18,7 @@ import org.json.JSONObject
 import java.io.IOException
 import java.net.HttpURLConnection
 import java.net.URL
-import java.time.ZoneId
+import java.util.TimeZone
 import kotlin.coroutines.resume
 
 data class PhoneLocation(
@@ -79,7 +79,7 @@ object PhoneLocationProvider {
                     .put("lon", location.longitude)
                     .put("accuracyMeters", location.accuracyMeters)
                     .put("capturedAtEpochMs", location.capturedAtEpochMs)
-                    .put("timezone", ZoneId.systemDefault().id)
+                    .put("timezone", TimeZone.getDefault().id)
                 connection.outputStream.use { it.write(body.toString().toByteArray(Charsets.UTF_8)) }
                 val status = connection.responseCode
                 if (status !in 200..299) {
@@ -113,11 +113,11 @@ object PhoneLocationProvider {
             suspendCancellableCoroutine { continuation ->
                 val listener = object : LocationListener {
                     override fun onLocationChanged(location: Location) {
-                        completeLocationRequest(manager, listener = this, continuation, location)
+                        completeLocationRequest(manager, this, continuation, location)
                     }
 
                     override fun onProviderDisabled(provider: String) {
-                        completeLocationRequest(manager, listener = this, continuation, null)
+                        completeLocationRequest(manager, this, continuation, null)
                     }
 
                     override fun onProviderEnabled(provider: String) = Unit
@@ -125,7 +125,13 @@ object PhoneLocationProvider {
                     @Deprecated("Deprecated by Android")
                     override fun onStatusChanged(provider: String?, status: Int, extras: android.os.Bundle?) = Unit
                 }
-                continuation.invokeOnCancellation { manager.removeUpdates(listener) }
+                continuation.invokeOnCancellation {
+                    try {
+                        manager.removeUpdates(listener)
+                    } catch (securityException: SecurityException) {
+                        Log.w(TAG, "Location permission changed while cancelling the location request", securityException)
+                    }
+                }
                 try {
                     manager.requestLocationUpdates(provider, 0L, 0f, listener, Looper.getMainLooper())
                 } catch (securityException: SecurityException) {
