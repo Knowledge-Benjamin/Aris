@@ -113,11 +113,11 @@ object PhoneLocationProvider {
             suspendCancellableCoroutine { continuation ->
                 val listener = object : LocationListener {
                     override fun onLocationChanged(location: Location) {
-                        if (continuation.isActive) continuation.resume(location)
+                        completeLocationRequest(manager, listener = this, continuation, location)
                     }
 
                     override fun onProviderDisabled(provider: String) {
-                        if (continuation.isActive) continuation.resume(null)
+                        completeLocationRequest(manager, listener = this, continuation, null)
                     }
 
                     override fun onProviderEnabled(provider: String) = Unit
@@ -130,12 +130,26 @@ object PhoneLocationProvider {
                     manager.requestLocationUpdates(provider, 0L, 0f, listener, Looper.getMainLooper())
                 } catch (securityException: SecurityException) {
                     Log.w(TAG, "Location permission changed while requesting a location fix", securityException)
-                    if (continuation.isActive) continuation.resume(null)
+                    completeLocationRequest(manager, listener, continuation, null)
                 } catch (illegalArgumentException: IllegalArgumentException) {
-                    if (continuation.isActive) continuation.resume(null)
+                    completeLocationRequest(manager, listener, continuation, null)
                 }
             }
         }
+
+    private fun completeLocationRequest(
+        manager: LocationManager,
+        listener: LocationListener,
+        continuation: kotlinx.coroutines.CancellableContinuation<Location?>,
+        location: Location?,
+    ) {
+        try {
+            manager.removeUpdates(listener)
+        } catch (securityException: SecurityException) {
+            Log.w(TAG, "Location permission changed while closing the location request", securityException)
+        }
+        if (continuation.isActive) continuation.resume(location)
+    }
 
     private fun isProviderEnabled(manager: LocationManager, provider: String): Boolean =
         try {
