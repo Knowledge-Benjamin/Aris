@@ -52,9 +52,12 @@ object PhoneLocationProvider {
             return cached.toPhoneLocation()
         }
 
+        val deadline = System.currentTimeMillis() + LOCATION_TIMEOUT_MS
         for (provider in preferredProviders) {
             if (!isProviderEnabled(manager, provider)) continue
-            val fix = requestLocation(manager, provider)
+            val remaining = deadline - System.currentTimeMillis()
+            if (remaining <= 0) break
+            val fix = requestLocation(manager, provider, remaining)
             if (fix != null) return fix.toPhoneLocation()
         }
         return cached?.takeIf { System.currentTimeMillis() - it.time in 0..5 * 60 * 1000L }?.toPhoneLocation()
@@ -108,8 +111,8 @@ object PhoneLocationProvider {
             .maxByOrNull { it.time }
 
     @SuppressLint("MissingPermission")
-    private suspend fun requestLocation(manager: LocationManager, provider: String): Location? =
-        withTimeoutOrNull(LOCATION_TIMEOUT_MS) {
+    private suspend fun requestLocation(manager: LocationManager, provider: String, timeoutMs: Long): Location? =
+        withTimeoutOrNull(timeoutMs) {
             suspendCancellableCoroutine { continuation ->
                 val listener = object : LocationListener {
                     override fun onLocationChanged(location: Location) {
