@@ -21,6 +21,8 @@ import { ResearchBrowserService } from "./researchBrowserService";
 import { SkillStore } from "../db/skillStore";
 import { SkillService } from "./skillService";
 import { NewsResearchStore, NewsResearchArticle } from "../db/newsResearchStore";
+import { MediaLibraryStore, MediaLibraryRecord } from "../db/mediaLibraryStore";
+import { MediaLibraryService } from "./mediaLibraryService";
 
 const searchToolEnabled = process.env.SEARCH_TOOL_ENABLED?.trim().toLowerCase() !== "false" &&
   process.env.SEARCH_TOOL_ENABLED?.trim() !== "0";
@@ -32,7 +34,7 @@ interface ChatInput {
   sessionId?: string;
   userId?: number;
   approvedAction?: ToolInvocation;
-  mediaData?: { mimeType: string; dataBase64: string };
+  mediaData?: { mimeType: string; dataBase64: string; fileName?: string };
   replyContext?: string;
   replyToWhatsappMessage?: unknown;
 }
@@ -71,6 +73,7 @@ type RequestRouteIntent =
   | "contact"
   | "meeting"
   | "briefing"
+  | "media_library"
   | "other";
 
 interface RequestRoutingDecision {
@@ -84,7 +87,13 @@ interface ArisResponse {
   memoryUpdates: string[];
   status?: "finished" | "awaiting_approval" | "max_iterations_reached" | "error";
   pendingAction?: ToolInvocation;
-  mediaAttachments?: Array<{ mimeType: string; base64: string }>;
+  mediaAttachments?: Array<{
+    mimeType: string;
+    base64?: string;
+    libraryId?: number;
+    fileName?: string;
+    driveUrl?: string;
+  }>;
 }
 
 export class ArisService {
@@ -98,6 +107,7 @@ export class ArisService {
   private researchBrowserService = new ResearchBrowserService();
   private newsCache = new Map<string, { day: string; data: unknown }>();
   private newsResearchStore = new NewsResearchStore(getDatabasePool());
+  private mediaLibraryService: MediaLibraryService;
 
   private summarizeToolData(data: any): string {
     if (data?.audioBase64) {
@@ -272,6 +282,12 @@ export class ArisService {
     private contextStore: ContextStore,
     private gemmaService: GemmaService
   ) {
+    this.mediaLibraryService = new MediaLibraryService(
+      this.googleService,
+      this.googleAccountStore,
+      new MediaLibraryStore(getDatabasePool()),
+      this.gemmaService,
+    );
     this.skillService = new SkillService(
       new SkillStore(getDatabasePool()),
       this.googleService,
@@ -301,7 +317,7 @@ export class ArisService {
   ): Promise<RequestRoutingDecision> {
     const allowedCategories = [
       "briefing", "calendar", "gmail", "contact", "whatsapp", "traffic",
-      "weather", "news", "search", "location", "time", "meeting",
+      "weather", "news", "search", "location", "time", "meeting", "media_library",
     ];
     const observations = this.getRecentToolObservations(userId, sessionId)
       .slice(-5)
@@ -339,7 +355,7 @@ export class ArisService {
       const validIntents: RequestRouteIntent[] = [
         "current_time", "current_date", "current_location", "weather", "traffic",
         "news", "web_research", "calendar", "gmail", "whatsapp", "contact",
-        "meeting", "briefing", "other",
+        "meeting", "briefing", "media_library", "other",
       ];
       if (parsed && validIntents.includes(parsed.intent as RequestRouteIntent) && Array.isArray(parsed.categories)) {
         const categories = Array.from(new Set(
@@ -366,6 +382,7 @@ export class ArisService {
           contact: "contact",
           meeting: "meeting",
           briefing: "briefing",
+          media_library: "media_library",
         };
         const intentCategory = categoryForIntent[intent];
         if (intentCategory && (intentCategory !== "search" || searchToolEnabled)) {
@@ -395,7 +412,8 @@ export class ArisService {
               : categories.includes("calendar") ? "calendar"
                 : categories.includes("gmail") ? "gmail"
                   : categories.includes("whatsapp") ? "whatsapp"
-                    : categories.includes("search") ? "web_research"
+                    : categories.includes("media_library") ? "media_library"
+                      : categories.includes("search") ? "web_research"
                       : "other";
     return { intent, categories, reusePriorAnswer: false };
   }
@@ -643,9 +661,98 @@ export class ArisService {
     return generated.reply.trim() || fallback;
   }
 
+  private async storeChatAttachment(
+    userId: number | undefined,
+    sessionId: string,
+    caption: string,
+    mediaData: { mimeType: string; dataBase64: string; fileName?: string },
+  ): Promise<MediaLibraryRecord> {
+    if (!userId) throw new Error("Sign in before uploading attachments to the Aris Media Library.");
+    if (!mediaData.mimeType?.trim() || !mediaData.dataBase64?.trim()) {
+      throw new Error("The uploaded attachment is missing its MIME type or file data.");
+    }
+    if (!/^[A-Za-z0-9+/]*={0,2}$/.test(mediaData.dataBase64) || mediaData.dataBase64.length % 4 !== 0) {
+      throw new Error("The uploaded attachment is not valid base64 data.");
+    }
+    const content = Buffer.from(mediaData.dataBase64, "base64");
+    if (!content.length) throw new Error("The uploaded attachment is empty.");
+    if (content.length > 20 * 1024 * 1024) {
+      throw new Error("Attachments are limited to 20 MiB per file.");
+    }
+    const mimeType = mediaData.mimeType.split(";")[0].trim().toLowerCase();
+    const fileName = mediaData.fileName?.trim() || `aris-upload-${Date.now()}${this.getExtensionForMimeType(mimeType)}`;
+    return this.mediaLibraryService.store({
+      userId,
+      sessionId,
+      fileName,
+      mimeType,
+      content,
+      sourceType: "user_upload",
+      description: caption,
+    });
+  }
+
+  async archiveGeneratedMedia(
+    userId: number,
+    sessionId: string | undefined,
+    fileName: string,
+    mimeType: string,
+    content: Buffer,
+    sourceType: string,
+    sourceText: string,
+  ): Promise<MediaLibraryRecord> {
+    return this.mediaLibraryService.store({
+      userId,
+      sessionId,
+      fileName,
+      mimeType,
+      content,
+      sourceType,
+      summary: sourceText.slice(0, 12000),
+      sourceText,
+    });
+  }
+
+  async downloadLibraryMedia(userId: number, mediaId: number): Promise<{ record: MediaLibraryRecord; content: Buffer } | undefined> {
+    const record = await this.mediaLibraryService.findById(userId, mediaId);
+    return record ? { record, content: await this.mediaLibraryService.download(userId, record) } : undefined;
+  }
+
+  async downloadLibraryMediaByDriveId(userId: number, driveFileId: string): Promise<{ record: MediaLibraryRecord; content: Buffer } | undefined> {
+    const record = await this.mediaLibraryService.findByDriveFileId(userId, driveFileId);
+    return record ? { record, content: await this.mediaLibraryService.download(userId, record) } : undefined;
+  }
+
+  private formatMessageWithAttachment(message: string, attachment?: MediaLibraryRecord): string {
+    if (!attachment) return message;
+    return [
+      message,
+      `[Attachment archived in the Aris Media Library as item #${attachment.id}: ${attachment.fileName}; ${attachment.mimeType}. Indexed description: ${attachment.summary}]`,
+    ].filter(Boolean).join("\n\n");
+  }
+
+  private getExtensionForMimeType(mimeType: string): string {
+    const extensions: Record<string, string> = {
+      "application/pdf": ".pdf",
+      "text/plain": ".txt",
+      "image/jpeg": ".jpg",
+      "image/png": ".png",
+      "image/webp": ".webp",
+      "audio/mpeg": ".mp3",
+      "audio/ogg": ".ogg",
+      "audio/wav": ".wav",
+      "video/mp4": ".mp4",
+      "video/webm": ".webm",
+    };
+    return extensions[mimeType] || "";
+  }
+
   async handleChat(input: ChatInput, onProgress?: (msg: string) => void): Promise<ArisResponse> {
     const sessionId = input.sessionId || "default";
     await this.contextStore.warmCache(this.getContextKey(input.userId, sessionId));
+    const storedAttachment = input.mediaData
+      ? await this.storeChatAttachment(input.userId, sessionId, input.message, input.mediaData)
+      : undefined;
     const approvalMessage = /^(approve|approved|yes|yes please|send it|do it|go ahead)$/i.test(input.message.trim());
     const storedApproval = !input.approvedAction && approvalMessage
       ? this.getLastToolInvocation(input.userId, sessionId)
@@ -671,7 +778,7 @@ export class ArisService {
       userId: input.userId,
       sessionId,
       role: "user",
-      content: input.message,
+      content: this.formatMessageWithAttachment(input.message, storedAttachment),
     });
     if (input.userId && input.message.trim().length >= 40) {
       void this.extractAndStoreEvidence(
@@ -711,9 +818,11 @@ export class ArisService {
 
     const [userProfile, conversationHistory] = await Promise.all([userProfilePromise, conversationHistoryPromise]);
     const effectiveMessage = input.message.trim();
-    const messageWithReplyContext = input.replyContext?.trim()
-      ? `${effectiveMessage}\n\nMessage being replied to:\n${input.replyContext.trim()}`
-      : effectiveMessage;
+    const messageWithAttachment = this.formatMessageWithAttachment(effectiveMessage, storedAttachment);
+    const messageWithReplyContext = [
+      messageWithAttachment,
+      input.replyContext?.trim() ? `Message being replied to:\n${input.replyContext.trim()}` : "",
+    ].filter(Boolean).join("\n\n");
     const requestRoute = isShortConversational
       ? { intent: "other", categories: [], reusePriorAnswer: false } satisfies RequestRoutingDecision
       : await this.classifyRequestRoute(
@@ -871,12 +980,13 @@ export class ArisService {
   }
 
   private hasNativeCapabilityIntent(message: string, categories?: Set<string>): boolean {
-    if (categories && ["weather", "traffic", "location", "time"].some((category) => categories.has(category))) {
+    if (categories && ["weather", "traffic", "location", "time", "media_library"].some((category) => categories.has(category))) {
       return true;
     }
     return this.isCurrentLocationRequest(message)
       || this.isLocalDateTimeRequest(message)
       || /\b(?:weather|forecast|temperature|rainfall|rain|air quality|pollution|pollen|marine conditions|wave height|traffic|commute|congestion|route|directions|eta|estimated arrival)\b/i.test(message)
+      || /\b(?:media library|uploaded file|uploaded image|attached file|my attachment)\b/i.test(message)
       || this.determineToolCategories(message).size > 0;
   }
 
@@ -1829,6 +1939,20 @@ export class ArisService {
           return "fetch_news_podcast requires an optional 'feedUrl' string.";
         }
         break;
+      case "media_library_search":
+        if (typeof payload.query !== "string" || !payload.query.trim()) {
+          return "media_library_search requires a non-empty descriptive query.";
+        }
+        break;
+      case "media_library_download":
+        if (!(Number.isInteger(Number(payload.mediaId)) && Number(payload.mediaId) > 0) &&
+            !(typeof payload.query === "string" && payload.query.trim())) {
+          return "media_library_download requires a mediaId or a descriptive query.";
+        }
+        if (payload.analyze !== undefined && typeof payload.analyze !== "boolean") {
+          return "media_library_download analyze must be a boolean.";
+        }
+        break;
       case "search":
         if (!payload.query || typeof payload.query !== "string" || !payload.query.trim()) {
           return "search requires a non-empty 'query' string.";
@@ -1899,6 +2023,103 @@ export class ArisService {
     return undefined;
   }
 
+  private async executeMediaLibraryTool(
+    userId: number | undefined,
+    toolName: string,
+    payload: any,
+  ): Promise<ToolExecutionResult> {
+    if (!userId) return { success: false, tool: toolName, error: "Sign in to use your Aris Media Library." };
+
+    try {
+      if (toolName === "media_library_list") {
+        const records = await this.mediaLibraryService.listRecent(userId, Number(payload?.limit) || 20);
+        return {
+          success: true,
+          tool: toolName,
+          data: {
+            summary: `Found ${records.length} recent media library item(s).`,
+            items: records.map((record) => this.toMediaLibrarySummary(record)),
+          },
+        };
+      }
+
+      if (toolName === "media_library_search") {
+        const query = String(payload?.query || "").trim();
+        if (!query) return { success: false, tool: toolName, error: "media_library_search requires a descriptive query." };
+        const records = await this.mediaLibraryService.search(userId, query, Number(payload?.limit) || 8);
+        return {
+          success: true,
+          tool: toolName,
+          data: {
+            query,
+            summary: records.length ? `Found ${records.length} matching media library item(s).` : "No relevant media files were found.",
+            items: records.map((record) => this.toMediaLibrarySummary(record)),
+          },
+        };
+      }
+
+      if (toolName === "media_library_download") {
+        let record: MediaLibraryRecord | undefined;
+        const mediaId = Number(payload?.mediaId);
+        if (Number.isInteger(mediaId) && mediaId > 0) {
+          record = await this.mediaLibraryService.findById(userId, mediaId);
+        } else if (typeof payload?.query === "string" && payload.query.trim()) {
+          record = (await this.mediaLibraryService.search(userId, payload.query.trim(), 1))[0];
+        } else {
+          return { success: false, tool: toolName, error: "Provide a mediaId or a descriptive query." };
+        }
+        if (!record) return { success: false, tool: toolName, error: "No matching media library item was found for your account." };
+
+        const attachment = this.toMediaLibraryAttachment(record);
+        let analysis: string | undefined;
+        if (payload?.analyze === true) {
+          const content = await this.mediaLibraryService.download(userId, record);
+          analysis = await this.mediaLibraryService.analyze(record, content, String(payload?.question || ""));
+        }
+        return {
+          success: true,
+          tool: toolName,
+          data: {
+            summary: analysis || `Retrieved ${record.fileName} from your Aris Media Library.`,
+            analysis,
+            mediaLibraryAttachment: attachment,
+          },
+        };
+      }
+
+      return { success: false, tool: toolName, error: `Unsupported media library operation: ${toolName}` };
+    } catch (mediaError) {
+      const message = mediaError instanceof Error ? mediaError.message : String(mediaError);
+      error(`[arisService] ${toolName} failed`, message);
+      return { success: false, tool: toolName, error: message };
+    }
+  }
+
+  private toMediaLibrarySummary(record: MediaLibraryRecord) {
+    return {
+      mediaId: record.id,
+      fileName: record.fileName,
+      mimeType: record.mimeType,
+      sizeBytes: record.byteSize,
+      source: record.sourceType,
+      summary: record.summary,
+      driveUrl: record.driveUrl,
+      createdAt: record.createdAt,
+      similarity: record.similarity,
+    };
+  }
+
+  private toMediaLibraryAttachment(record: MediaLibraryRecord) {
+    return {
+      libraryId: record.id,
+      fileName: record.fileName,
+      mimeType: record.mimeType,
+      driveUrl: record.driveUrl,
+      downloadUrl: `/api/aris/media/${record.id}/download`,
+      summary: record.summary,
+    };
+  }
+
   private async executeToolCall(userId: number | undefined, invocation: ToolInvocation, sessionId?: string, replyToWhatsappMessage?: unknown): Promise<ToolExecutionResult> {
     const validatedToolName = this.validateToolName(invocation.tool);
     if (!validatedToolName) {
@@ -1919,6 +2140,10 @@ export class ArisService {
       };
     }
 
+    if (toolName.startsWith("media_library_")) {
+      return this.executeMediaLibraryTool(userId, toolName, invocation.payload);
+    }
+
     if (toolName === "vault_store") {
       try {
         const { key, value } = invocation.payload || {};
@@ -1936,6 +2161,7 @@ export class ArisService {
       } catch (e: any) {
         return { success: false, tool: toolName, error: e.message };
       }
+
     }
 
     if (toolName === "vault_retrieve") {
@@ -4123,6 +4349,13 @@ export class ArisService {
         : `NEWS ROUTING: Use {"tool":"fetch_news"} for current news, today's news, headlines, or a news brief. Use {"tool":"search","query":"..."} only for general web research.`,
       `ARTICLE DETAIL ROUTING: When fetch_news returns several article links and the user asks for full details, make one batch call with all relevant links: {"tool":"browser_read","urls":["https://example.com/article-1","https://example.com/article-2"]}. A single tool call may contain a urls array; do not read only the first article and do not emit separate calls for every URL. If browser_read cannot read the links, try one batched url_read call instead.`,
       `NEWS PODCAST: Use {"tool":"fetch_news_podcast","batch":true} when the user asks for podcasts. This selects four current RSS episodes, always including NPR, stores them in Google Drive, and returns ordered Drive references. After the successful observation use app_send_audio_batch with those Drive episode references to queue them for Aris app delivery; never send only one episode. After delivery ask which shows the user enjoyed and save that preference for the custom podcast list.`,
+      ...(activeCategories.has("media_library") ? [
+        `ARIS MEDIA LIBRARY: User uploads and Aris-generated media are privately stored in the authenticated user's Google Drive under "Aris Media Library" and indexed with searchable descriptions. Use media_library_search for semantic lookups, media_library_list for recent items, and media_library_download to retrieve a specific mediaId or query. Set analyze=true and provide question when the user asks about file contents; this downloads and analyzes the original. Downloading without analyze attaches the original file to the response. Never claim a file is available unless a library tool returned it.`,
+        `For user-uploaded media, reuse its archive reference and summary in the conversation context. Do not search the public web for a user's personal photo, video, audio, or document. If no matching item is found, say so rather than guessing.`,
+        `Example: {"tool":"media_library_search","query":"the receipt from my hotel trip"}`,
+        `Example: {"tool":"media_library_download","mediaId":42,"analyze":true,"question":"What is the invoice total and due date?"}`,
+        `Example: {"tool":"media_library_download","query":"the photo of my blue bicycle"}`,
+      ] : []),
       `MORNING BRIEF DELIVERY: A morning brief must include the complete text brief and a matching audio brief. Send the full text with app_send_message and the spoken version with audio_generate destination "app". If podcast episodes are present, also queue them with app_send_audio_batch. Do not finish with only a conversational summary when delivery was requested.`,
       `Only these exact tools are callable: ${canonicalToolManifest}`,
       `Never invent a tool name, translate a tool name, or use an alias.`,
@@ -4183,6 +4416,7 @@ export class ArisService {
     if (this.isCurrentLocationRequest(msgOnly)) categories.add("location");
     if (this.isLocalDateTimeRequest(msgOnly)) categories.add("time");
     if (/\b(?:join|enter|connect to|attend)\b.*\b(?:meet|meeting|call|conference)\b|meet\.google\.com|zoom\.us/i.test(msgOnly)) categories.add("meeting");
+    if (/\b(?:uploaded|attached|media library|attachment|file|photo|picture|image|video|audio file|document|pdf)\b/i.test(msgOnly)) categories.add("media_library");
     if (this.isExplicitWebResearchRequest(msgOnly)) categories.add("search");
 
     return categories;
@@ -4909,7 +5143,14 @@ export class ArisService {
   }
 
   private extractMediaAttachments(toolResults: Array<{ invocation: ToolInvocation; result: ToolExecutionResult }>) {
-    const attachments: Array<{ mimeType: string; base64: string }> = [];
+    const attachments: Array<{
+      mimeType: string;
+      base64?: string;
+      libraryId?: number;
+      fileName?: string;
+      driveUrl?: string;
+      downloadUrl?: string;
+    }> = [];
     for (const tr of toolResults) {
       if (!tr.result.success) continue;
       const data = tr.result.data as any;
@@ -4920,6 +5161,9 @@ export class ArisService {
           mimeType: data?.mimeType ?? data?.audio?.mimeType ?? "audio/mpeg",
           base64: directAudio,
         });
+      }
+      if (data?.mediaLibraryAttachment && tr.invocation.tool === "media_library_download") {
+        attachments.push(data.mediaLibraryAttachment);
       }
       
     }
@@ -5116,6 +5360,13 @@ export class ArisService {
       `Use 'join_meeting' if the user asks you to join a Google Meet or Zoom meeting to take notes. Example: {"tool":"join_meeting","url":"https://meet.google.com/xyz"}`,
       `APP SEND: Use 'app_send_message' to queue a text message to the authenticated user's Aris Android app. The tool enqueues it in the outbox for the connected app session — no phone number needed. Example: {"tool":"app_send_message","message":"Don't forget your 3pm meeting!"}`,
       `AUDIO TOOL: Use 'audio_generate' when the user asks Aris to speak, create an audio file, email audio, or send audio. Available destinations: "app" — returns the audio inline to the Android chat (no approval needed, use this when the session is the Android companion app); "download" — same as app, inline base64 return; "email" — email the file (requires approval); "whatsapp" — queues a voice note to the connected WhatsApp self-chat (requires approval). When responding in an Android app session (sessionId starts with "aris-android"), always default to destination "app". Example: {"tool":"audio_generate","text":"Here is your news brief...","destination":"app"}`,
+      ...(activeCategories.has("media_library") ? [
+        `ARIS MEDIA LIBRARY: User uploads and Aris-generated media are privately stored in the authenticated user's Google Drive under "Aris Media Library" and indexed with searchable descriptions. Use media_library_search for semantic lookups, media_library_list for recent items, and media_library_download to retrieve a specific mediaId or query. Set analyze=true and provide question when the user asks about file contents; this downloads and analyzes the original. Downloading without analyze attaches the original file to the response. Never claim a file is available unless a library tool returned it.`,
+        `For user-uploaded media, reuse its archive reference and summary in the conversation context. Do not search the public web for a user's personal photo, video, audio, or document. If no matching item is found, say so rather than guessing.`,
+        `Example: {"tool":"media_library_search","query":"the receipt from my hotel trip"}`,
+        `Example: {"tool":"media_library_download","mediaId":42,"analyze":true,"question":"What is the invoice total and due date?"}`,
+        `Example: {"tool":"media_library_download","query":"the photo of my blue bicycle"}`,
+      ] : []),
       `AUDIO NEWS RULE: When the user asks for today's news in audio on WhatsApp, first use fetch_news if no same-day result is available, then summarize the returned items into real spoken text and call audio_generate with destination "whatsapp". For an Android app request, use destination "app" instead. For a news podcast request, use fetch_news_podcast first and summarize its transcript. Never call audio_generate with "...", a placeholder.`,
       `Never invent tools named text_to_speech, send_audio_on_whatsapp, send_whatsapp_message, or similar. Use the exact registered tools audio_generate and app_send_message only. Never ask for a phone number or recipient — the outbox resolves the delivery target automatically.`,
       `OUTBOX HISTORY: Use 'whatsapp_outbox_history' when the user asks to see, list, review, or retrieve all queued messages (text, audio, podcasts) for the Aris app. Returns every message regardless of pending, sent, or failed status. Example: {"tool":"whatsapp_outbox_history"}`,

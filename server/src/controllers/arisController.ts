@@ -158,8 +158,22 @@ export async function arisVoice(req: Request, res: Response) {
       return res.status(400).json({ error: "Unable to transcribe audio." });
     }
 
-    const response = await arisService.handleChat({ message: transcript, sessionId, userId });
+    const response = await arisService.handleChat({
+      message: transcript,
+      sessionId,
+      userId,
+      mediaData: { mimeType, dataBase64: audioBase64, fileName: `voice-note-${Date.now()}` },
+    });
     const voice = await voiceService.synthesizeSpeech(response.arisReply);
+    const archivedVoice = await arisService.archiveGeneratedMedia(
+      userId,
+      sessionId,
+      `aris-voice-reply-${Date.now()}.wav`,
+      voice.mimeType,
+      Buffer.from(voice.audioBase64, "base64"),
+      "aris_voice_reply",
+      response.arisReply,
+    );
 
     res.json({
       transcript,
@@ -167,6 +181,7 @@ export async function arisVoice(req: Request, res: Response) {
       memoryUpdates: response.memoryUpdates,
       voiceBase64: voice.audioBase64,
       voiceMimeType: voice.mimeType,
+      voiceMediaLibraryId: archivedVoice.id,
     });
   } catch (err: any) {
     error("arisVoice error", {
@@ -177,6 +192,48 @@ export async function arisVoice(req: Request, res: Response) {
     });
     console.error("arisVoice error", err);
     res.status(500).json({ error: "Aris voice processing failed." });
+  }
+}
+
+export async function downloadArisMedia(req: Request, res: Response) {
+  try {
+    const userId = (req as AuthenticatedRequest).authUserId;
+    if (!userId) return res.status(401).json({ error: "Unauthorized user." });
+    const mediaId = Number(req.params.mediaId);
+    if (!Number.isInteger(mediaId) || mediaId < 1) {
+      return res.status(400).json({ error: "A valid media library ID is required." });
+    }
+    const media = await arisService.downloadLibraryMedia(userId, mediaId);
+    if (!media) return res.status(404).json({ error: "Media file not found in this user's library." });
+    res.setHeader("Content-Type", media.record.mimeType);
+    res.setHeader("Content-Length", String(media.content.length));
+    res.setHeader("Content-Disposition", `attachment; filename*=UTF-8''${encodeURIComponent(media.record.fileName)}`);
+    res.setHeader("Cache-Control", "private, no-store");
+    return res.send(media.content);
+  } catch (err) {
+    error("downloadArisMedia error", err);
+    return res.status(500).json({ error: "Unable to download this media file from Google Drive." });
+  }
+}
+
+export async function downloadArisMediaByDriveId(req: Request, res: Response) {
+  try {
+    const userId = (req as AuthenticatedRequest).authUserId;
+    if (!userId) return res.status(401).json({ error: "Unauthorized user." });
+    const driveFileId = String(req.params.driveFileId || "").trim();
+    if (!driveFileId || driveFileId.includes("/")) {
+      return res.status(400).json({ error: "A valid Google Drive file ID is required." });
+    }
+    const media = await arisService.downloadLibraryMediaByDriveId(userId, driveFileId);
+    if (!media) return res.status(404).json({ error: "Media file not found in this user's library." });
+    res.setHeader("Content-Type", media.record.mimeType);
+    res.setHeader("Content-Length", String(media.content.length));
+    res.setHeader("Content-Disposition", `attachment; filename*=UTF-8''${encodeURIComponent(media.record.fileName)}`);
+    res.setHeader("Cache-Control", "private, no-store");
+    return res.send(media.content);
+  } catch (err) {
+    error("downloadArisMediaByDriveId error", err);
+    return res.status(500).json({ error: "Unable to download this media file from Google Drive." });
   }
 }
 

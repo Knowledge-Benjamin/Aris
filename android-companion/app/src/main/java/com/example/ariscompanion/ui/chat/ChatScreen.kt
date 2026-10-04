@@ -4,6 +4,7 @@ import android.Manifest
 import android.content.Context
 import android.graphics.BitmapFactory
 import android.net.Uri
+import android.provider.OpenableColumns
 import android.util.Base64
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
@@ -170,7 +171,7 @@ fun ChatScreen(
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
                     Text(
-                        text = "Attached: ${attachment.mimeType}",
+                        text = "Attached: ${attachment.fileName} (${attachment.mimeType})",
                         modifier = Modifier.weight(1f),
                         style = MaterialTheme.typography.bodySmall,
                     )
@@ -342,6 +343,7 @@ private fun AttachmentPreview(
         is MediaAttachment.Video -> Text("Video attachment (${attachment.mimeType})")
         is MediaAttachment.Audio -> AudioAttachmentButton(messageId, index, attachment, state, onEvent)
         is MediaAttachment.VoiceNote -> AudioAttachmentButton(messageId, index, attachment, state, onEvent)
+        is MediaAttachment.Document -> Text("File: ${attachment.fileName} (${attachment.mimeType})")
     }
 }
 
@@ -363,21 +365,30 @@ private fun AudioAttachmentButton(
 }
 
 private suspend fun readAttachment(context: Context, uri: Uri): MediaAttachment = withContext(Dispatchers.IO) {
-    val mimeType = context.contentResolver.getType(uri)
-        ?: throw IOException("The selected file type could not be identified.")
-    if (!mimeType.startsWith("image/") && !mimeType.startsWith("video/") && !mimeType.startsWith("audio/")) {
-        throw IOException("Choose an image, video, or audio file.")
-    }
+    val mimeType = context.contentResolver.getType(uri) ?: "application/octet-stream"
+    val fileName = context.contentResolver.query(uri, arrayOf(OpenableColumns.DISPLAY_NAME), null, null, null)
+        ?.use { cursor ->
+            if (cursor.moveToFirst()) cursor.getString(0) else null
+        }?.takeIf(String::isNotBlank) ?: uri.lastPathSegment?.substringAfterLast('/') ?: "attachment"
     val bytes = context.contentResolver.openInputStream(uri)?.use { input ->
-        val data = input.readBytes()
-        if (data.size > MAX_ATTACHMENT_BYTES) throw IOException("Choose a file smaller than 20 MB.")
-        data
+        val output = java.io.ByteArrayOutputStream()
+        val buffer = ByteArray(8192)
+        var totalBytes = 0
+        while (true) {
+            val count = input.read(buffer)
+            if (count < 0) break
+            totalBytes += count
+            if (totalBytes > MAX_ATTACHMENT_BYTES) throw IOException("Choose a file smaller than 20 MB.")
+            output.write(buffer, 0, count)
+        }
+        output.toByteArray()
     } ?: throw IOException("The selected file could not be opened.")
     val base64 = Base64.encodeToString(bytes, Base64.NO_WRAP)
     when {
-        mimeType.startsWith("image/") -> MediaAttachment.Image(uri, base64, mimeType)
-        mimeType.startsWith("video/") -> MediaAttachment.Video(uri, base64, mimeType)
-        else -> MediaAttachment.Audio(uri, base64, mimeType)
+        mimeType.startsWith("image/") -> MediaAttachment.Image(uri, base64, mimeType, fileName)
+        mimeType.startsWith("video/") -> MediaAttachment.Video(uri, base64, mimeType, fileName)
+        mimeType.startsWith("audio/") -> MediaAttachment.Audio(uri, base64, mimeType, fileName = fileName)
+        else -> MediaAttachment.Document(uri, base64, mimeType, fileName)
     }
 }
 

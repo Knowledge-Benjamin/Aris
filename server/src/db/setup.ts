@@ -77,6 +77,34 @@ async function setup() {
     CREATE INDEX IF NOT EXISTS memories_embedding_idx ON memories USING hnsw (embedding vector_cosine_ops);
   `);
 
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS media_library (
+      id SERIAL PRIMARY KEY,
+      user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      drive_file_id TEXT NOT NULL,
+      drive_url TEXT NOT NULL,
+      file_name TEXT NOT NULL,
+      mime_type TEXT NOT NULL,
+      byte_size BIGINT NOT NULL DEFAULT 0,
+      source_type TEXT NOT NULL,
+      summary TEXT NOT NULL,
+      source_text TEXT NOT NULL DEFAULT '',
+      session_id TEXT,
+      embedding VECTOR(768),
+      created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+      UNIQUE (user_id, drive_file_id)
+    );
+  `);
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS media_library_embedding_idx
+    ON media_library USING hnsw (embedding vector_cosine_ops);
+  `);
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS media_library_user_created_idx
+    ON media_library (user_id, created_at DESC);
+  `);
+
   console.log("Creating session_context table...");
   await pool.query(`
     CREATE TABLE IF NOT EXISTS session_context (

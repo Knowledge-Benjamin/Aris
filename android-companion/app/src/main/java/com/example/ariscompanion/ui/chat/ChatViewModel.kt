@@ -265,15 +265,7 @@ class ChatViewModel(private val appContext: Context) : ViewModel() {
                             payload = pa["payload"] as? Map<String, Any?> ?: emptyMap()
                         )
                     }
-                    val attachments = result.mediaAttachments?.mapNotNull { att ->
-                        val mime = att["mimeType"] ?: return@mapNotNull null
-                        val base64 = att["base64"] ?: return@mapNotNull null
-                        if (mime.startsWith("audio/")) {
-                            MediaAttachment.Audio(Uri.EMPTY, base64, mime)
-                        } else if (mime.startsWith("image/")) {
-                            MediaAttachment.Image(Uri.EMPTY, base64, mime)
-                        } else null
-                    } ?: emptyList()
+                    val attachments = resolveArisAttachments(result.mediaAttachments)
                     
                     updateMessage(arisId) {
                         it.copy(
@@ -292,6 +284,32 @@ class ChatViewModel(private val appContext: Context) : ViewModel() {
                 appendMessage(ChatMessage(id = UUID.randomUUID().toString(), sender = Sender.ARIS, text = "⚠️ ${e.message}", status = MessageStatus.ERROR))
             }
         }
+    }
+
+    private suspend fun resolveArisAttachments(
+        descriptors: List<Map<String, String>>?,
+    ): List<MediaAttachment> {
+        val resolved = mutableListOf<MediaAttachment>()
+        for (descriptor in descriptors.orEmpty()) {
+            val mimeType = descriptor["mimeType"] ?: continue
+            val fileName = descriptor["fileName"] ?: "aris-media"
+            val base64 = descriptor["base64"] ?: descriptor["libraryId"]?.toIntOrNull()?.let { mediaId ->
+                val api = client ?: throw IOException("Sign in again to download Aris's media attachment.")
+                Base64.encodeToString(api.downloadMedia(mediaId), Base64.NO_WRAP)
+            } ?: continue
+            val attachment = when {
+                mimeType.startsWith("audio/") ->
+                    MediaAttachment.Audio(Uri.EMPTY, base64, mimeType, fileName = fileName)
+                mimeType.startsWith("image/") ->
+                    MediaAttachment.Image(Uri.EMPTY, base64, mimeType, fileName)
+                mimeType.startsWith("video/") ->
+                    MediaAttachment.Video(Uri.EMPTY, base64, mimeType, fileName)
+                else ->
+                    MediaAttachment.Document(Uri.EMPTY, base64, mimeType, fileName)
+            }
+            resolved.add(attachment)
+        }
+        return resolved
     }
 
     // ── Voice note ───────────────────────────────────────────────────────────
@@ -454,11 +472,12 @@ class ChatViewModel(private val appContext: Context) : ViewModel() {
                     is MediaAttachment.Video -> attachment.base64 to attachment.mimeType
                     is MediaAttachment.Audio -> attachment.base64 to attachment.mimeType
                     is MediaAttachment.VoiceNote -> attachment.base64 to attachment.mimeType
+                    is MediaAttachment.Document -> attachment.base64 to attachment.mimeType
                 }
 
                 var finalResult: ArisChatResult? = null
                 syncPhoneLocation()
-                client?.sendMediaChat(caption, base64, mime, SESSION_ID) { event ->
+                client?.sendMediaChat(caption, base64, mime, attachment.fileName, SESSION_ID) { event ->
                     when (event.type) {
                         "progress" -> _uiState.update { it.copy(progressMessage = event.message) }
                         "complete" -> {

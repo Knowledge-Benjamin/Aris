@@ -17,17 +17,20 @@ sealed class MediaAttachment {
     abstract val uri: Uri
     abstract val base64: String
     abstract val mimeType: String
+    abstract val fileName: String
 
     data class Image(
         override val uri: Uri,
         override val base64: String,
         override val mimeType: String,
+        override val fileName: String = "image",
     ) : MediaAttachment()
 
     data class Video(
         override val uri: Uri,
         override val base64: String,
         override val mimeType: String,
+        override val fileName: String = "video",
     ) : MediaAttachment()
 
     data class Audio(
@@ -35,6 +38,7 @@ sealed class MediaAttachment {
         override val base64: String,
         override val mimeType: String,
         val durationMs: Long = 0L,
+        override val fileName: String = "audio",
     ) : MediaAttachment()
 
     data class VoiceNote(
@@ -43,6 +47,14 @@ sealed class MediaAttachment {
         override val mimeType: String,
         val durationMs: Long,
         val waveform: List<Float>,
+        override val fileName: String = "voice-note",
+    ) : MediaAttachment()
+
+    data class Document(
+        override val uri: Uri,
+        override val base64: String,
+        override val mimeType: String,
+        override val fileName: String,
     ) : MediaAttachment()
 }
 

@@ -78,15 +78,30 @@ class ArisApiClient(serverUrl: String, private val token: String) {
         caption: String,
         base64: String,
         mimeType: String,
+        fileName: String,
         sessionId: String,
         onEvent: (ChatStreamEvent) -> Unit,
     ) {
         chatStream(
             message = caption.ifBlank { "Please analyze this attachment." },
             sessionId = sessionId,
-            mediaData = mapOf("mimeType" to mimeType, "dataBase64" to base64),
+            mediaData = mapOf("mimeType" to mimeType, "dataBase64" to base64, "fileName" to fileName),
             onEvent = onEvent,
         )
+    }
+
+    suspend fun downloadMedia(mediaId: Int): ByteArray = withContext(Dispatchers.IO) {
+        val connection = openConnection("GET", "/api/aris/media/$mediaId/download")
+        try {
+            val statusCode = connection.responseCode
+            if (statusCode !in 200..299) {
+                val errorText = connection.errorStream?.bufferedReader()?.use(BufferedReader::readText).orEmpty()
+                throw httpError(statusCode, errorText)
+            }
+            connection.inputStream.use { it.readBytes() }
+        } finally {
+            connection.disconnect()
+        }
     }
 
     suspend fun sendVoice(audioBase64: String, mimeType: String, sessionId: String): VoiceChatResult =
@@ -148,11 +163,14 @@ class ArisApiClient(serverUrl: String, private val token: String) {
             buildList {
                 for (index in 0 until array.length()) {
                     val item = array.optJSONObject(index) ?: continue
-                    val mimeType = item.optString("mimeType")
-                    val base64 = item.optString("base64")
-                    if (mimeType.isNotBlank() && base64.isNotBlank()) {
-                        add(mapOf("mimeType" to mimeType, "base64" to base64))
+                    val attachment = mutableMapOf<String, String>()
+                    listOf("mimeType", "base64", "fileName", "driveUrl", "downloadUrl").forEach { key ->
+                        item.optString(key).takeIf(String::isNotBlank)?.let { attachment[key] = it }
                     }
+                    item.optInt("libraryId").takeIf { it > 0 }?.let { attachment["libraryId"] = it.toString() }
+                    if (attachment["mimeType"].isNullOrBlank()) continue
+                    if (attachment["base64"].isNullOrBlank() && attachment["libraryId"].isNullOrBlank()) continue
+                    add(attachment)
                 }
             }
         }

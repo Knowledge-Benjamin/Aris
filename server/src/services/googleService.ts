@@ -67,7 +67,8 @@ export class GoogleService {
       expiry_date?: number | null;
       scope?: string | null;
     }) => Promise<void>,
-    makePublic = false
+    makePublic = false,
+    parentFolderId?: string
   ) {
     if (!fileName.trim() || !mimeType.trim() || content.length === 0) {
       throw new Error("Google Drive uploads require a filename, MIME type, and non-empty content.");
@@ -75,10 +76,15 @@ export class GoogleService {
 
     const authClient = this.buildAuthenticatedClient(account, tokenUpdateHandler);
     const drive = google.drive({ version: "v3", auth: authClient });
+    const safeName = fileName.replace(/[\\/\0]/g, "_").trim();
     const uploaded = await drive.files.create({
-      requestBody: { name: fileName, mimeType },
+      requestBody: {
+        name: safeName,
+        mimeType,
+        ...(parentFolderId ? { parents: [parentFolderId] } : {}),
+      },
       media: { mimeType, body: Readable.from(content) },
-      fields: "id,name,mimeType,webViewLink,webContentLink",
+      fields: "id,name,mimeType,size,webViewLink,webContentLink",
       supportsAllDrives: true,
     });
 
@@ -91,6 +97,75 @@ export class GoogleService {
     }
 
     return uploaded.data;
+  }
+
+  async ensureArisMediaFolder(
+    account: GoogleAccountRecord,
+    tokenUpdateHandler?: (tokens: {
+      access_token?: string | null;
+      refresh_token?: string | null;
+      expiry_date?: number | null;
+      scope?: string | null;
+    }) => Promise<void>
+  ): Promise<string> {
+    const authClient = this.buildAuthenticatedClient(account, tokenUpdateHandler);
+    const drive = google.drive({ version: "v3", auth: authClient });
+    const folderName = "Aris Media Library";
+    const existing = await drive.files.list({
+      q: `name = '${folderName}' and mimeType = 'application/vnd.google-apps.folder' and trashed = false`,
+      pageSize: 10,
+      fields: "files(id,name)",
+      spaces: "drive",
+    });
+    const folderId = existing.data.files?.find((file) => file.id)?.id;
+    if (folderId) return folderId;
+
+    const created = await drive.files.create({
+      requestBody: {
+        name: folderName,
+        mimeType: "application/vnd.google-apps.folder",
+      },
+      fields: "id",
+    });
+    if (!created.data.id) {
+      throw new Error("Google Drive did not return an ID for the Aris Media Library folder.");
+    }
+    return created.data.id;
+  }
+
+  async downloadDriveFile(
+    account: GoogleAccountRecord,
+    fileId: string,
+    tokenUpdateHandler?: (tokens: {
+      access_token?: string | null;
+      refresh_token?: string | null;
+      expiry_date?: number | null;
+      scope?: string | null;
+    }) => Promise<void>
+  ): Promise<Buffer> {
+    if (!fileId.trim()) throw new Error("A Google Drive file ID is required.");
+    const authClient = this.buildAuthenticatedClient(account, tokenUpdateHandler);
+    const drive = google.drive({ version: "v3", auth: authClient });
+    const response = await drive.files.get(
+      { fileId, alt: "media" },
+      { responseType: "arraybuffer" }
+    );
+    return Buffer.from(response.data as ArrayBuffer);
+  }
+
+  async deleteDriveFile(
+    account: GoogleAccountRecord,
+    fileId: string,
+    tokenUpdateHandler?: (tokens: {
+      access_token?: string | null;
+      refresh_token?: string | null;
+      expiry_date?: number | null;
+      scope?: string | null;
+    }) => Promise<void>
+  ): Promise<void> {
+    const authClient = this.buildAuthenticatedClient(account, tokenUpdateHandler);
+    const drive = google.drive({ version: "v3", auth: authClient });
+    await drive.files.delete({ fileId });
   }
 
   createAuthUrl(redirectUriOverride?: string): string {
