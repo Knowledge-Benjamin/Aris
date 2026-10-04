@@ -365,7 +365,7 @@ export class ArisService {
       error("[arisService] request routing failed; using conservative local routing", routeError);
     }
 
-    const categories = Array.from(this.determineToolCategories(message, []));
+    const categories = Array.from(this.determineToolCategories(message));
     const intent: RequestRouteIntent = this.isCurrentLocationRequest(message)
       ? "current_location"
       : this.isLocalDateTimeRequest(message)
@@ -696,12 +696,14 @@ export class ArisService {
     const messageWithReplyContext = input.replyContext?.trim()
       ? `${effectiveMessage}\n\nMessage being replied to:\n${input.replyContext.trim()}`
       : effectiveMessage;
-    const requestRoute = await this.classifyRequestRoute(
-      messageWithReplyContext,
-      conversationHistory,
-      input.userId,
-      sessionId,
-    );
+    const requestRoute = isShortConversational
+      ? { intent: "other", categories: [], reusePriorAnswer: false } satisfies RequestRoutingDecision
+      : await this.classifyRequestRoute(
+        messageWithReplyContext,
+        conversationHistory,
+        input.userId,
+        sessionId,
+      );
     
     // Similarly, don't fetch heavy semantic memories for basic greetings
     let memoryContext: string[] = [];
@@ -850,11 +852,14 @@ export class ArisService {
     return /\b(?:what(?:'s| is) (?:the )?time(?: right now)?|what time is it|tell me the time|current time|time right now|what(?:'s| is) (?:the )?date(?: today)?|today(?:'s)? date|current date|what day is it|what day is today)\b/i.test(message);
   }
 
-  private hasNativeCapabilityIntent(message: string): boolean {
+  private hasNativeCapabilityIntent(message: string, categories?: Set<string>): boolean {
+    if (categories && ["weather", "traffic", "location", "time"].some((category) => categories.has(category))) {
+      return true;
+    }
     return this.isCurrentLocationRequest(message)
       || this.isLocalDateTimeRequest(message)
       || /\b(?:weather|forecast|temperature|rainfall|rain|air quality|pollution|pollen|marine conditions|wave height|traffic|commute|congestion|route|directions|eta|estimated arrival)\b/i.test(message)
-      || this.determineToolCategories(message, []).size > 0;
+      || this.determineToolCategories(message).size > 0;
   }
 
   private isExplicitWebResearchRequest(message: string): boolean {
@@ -3937,8 +3942,7 @@ export class ArisService {
     const newsKeywords = /\b(news|headlines|current events|world events|breaking news|today's news|today news|news brief|news podcast|podcast episode)\b/i;
     const trafficKeywords = /\b(traffic|trafic|commute|congestion|route|ETA|estimated arrival|travel time|delay|jam|accident|roadwork|road work|gridlock|rush hour|leave now|leave at|when should I leave|how long will it take)\b/i;
     const searchKeywords = /\b(?:search (?:the )?(?:web|internet|online|for)|web search|look up online|research online|google (?:for|about)|browse (?:the )?(?:web|internet))\b/i;
-    const retryKeywords = /\b(try again|retry|again|repeat|re-run|rerun|run again)\b/i;
-    const anaphoraRef = /\b(this|that|it|same|previous|recent|last|first|second|third|fourth|fifth|the one|the other|those|these)\b/i;
+    const retryKeywords = /\b(?:try again|retry|repeat that|re-run|rerun|run that again)\b/i;
     const joinMeetingIntent = /\b(join|enter|connect to|attend)\b.*\b(meet|meeting|call|conference)\b|\b(join now|join it|join the call)\b/i;
 
     const recentMessages = this.getRecentGmailMessages(userId, sessionId);
@@ -3988,11 +3992,7 @@ export class ArisService {
       return lastToolInvocation;
     }
 
-    if (anaphoraRef.test(normalized) && lastToolInvocation) {
-      return lastToolInvocation;
-    }
-
-    if (emailKeywords.test(normalized) || (anaphoraRef.test(normalized) && recentMessages.length)) {
+    if (emailKeywords.test(normalized)) {
       const americanCenterOnly = recentMessages.filter((message) => /american center/i.test(message.from + " " + message.subject));
       const candidates = /american center/i.test(normalized) && americanCenterOnly.length ? americanCenterOnly : recentMessages;
 
@@ -4020,10 +4020,6 @@ export class ArisService {
         if (emailKeywords.test(normalized)) {
           return { tool: "google_gmail_messages", payload: { maxResults: 10 } };
         }
-      }
-
-      if (lastToolInvocation && anaphoraRef.test(normalized)) {
-        return lastToolInvocation;
       }
 
       if (emailKeywords.test(normalized)) {
@@ -4068,10 +4064,6 @@ export class ArisService {
       return { tool: "search", payload: { query: normalized } };
     }
 
-    if (anaphoraRef.test(normalized) && lastToolInvocation) {
-      return lastToolInvocation;
-    }
-
     return undefined;
   }
 
@@ -4081,7 +4073,8 @@ export class ArisService {
     memories: string[],
     conversationHistory: string[],
     toolResults: Array<{ invocation: ToolInvocation; result: ToolExecutionResult }>,
-    includeSearch: boolean
+    includeSearch: boolean,
+    activeCategories: Set<string>,
   ) {
     const profileLines = userProfile.length
       ? ["User profile:", ...userProfile.map((item) => `- ${item.profileKey}: ${item.profileValue}`), ""]
@@ -4093,8 +4086,8 @@ export class ArisService {
       toolLines.push(`Tool result: ${JSON.stringify(result, null, 2)}`);
       toolLines.push("");
     }
-    const suppressSearch = this.hasNativeCapabilityIntent(userMessage)
-      && !this.isExplicitWebResearchRequest(userMessage);
+    const suppressSearch = !includeSearch || (this.hasNativeCapabilityIntent(userMessage, activeCategories)
+      && !this.isExplicitWebResearchRequest(userMessage));
     const canonicalToolManifest = Array.from(this.supportedToolNames)
       .filter((tool) => !suppressSearch || !this.isWebSearchTool(tool))
       .sort()
@@ -4144,54 +4137,10 @@ export class ArisService {
     return prompt.join("\n");
   }
 
-  private levenshteinDistance(a: string, b: string): number {
-    if (a.length === 0) return b.length;
-    if (b.length === 0) return a.length;
-    const matrix = [];
-    for (let i = 0; i <= b.length; i++) { matrix[i] = [i]; }
-    for (let j = 0; j <= a.length; j++) { matrix[0][j] = j; }
-    for (let i = 1; i <= b.length; i++) {
-      for (let j = 1; j <= a.length; j++) {
-        if (b.charAt(i - 1) === a.charAt(j - 1)) {
-          matrix[i][j] = matrix[i - 1][j - 1];
-        } else {
-          matrix[i][j] = Math.min(matrix[i - 1][j - 1] + 1, Math.min(matrix[i][j - 1] + 1, matrix[i - 1][j] + 1));
-        }
-      }
-    }
-    return matrix[b.length][a.length];
-  }
-
-  private hasFuzzyMatch(words: string[], keywords: string[], maxDistance: number = 1): boolean {
-    for (const word of words) {
-      if (word.length < 3) {
-        if (keywords.includes(word)) return true;
-        continue;
-      }
-      for (const keyword of keywords) {
-        if (keyword.length < 3) {
-          if (word === keyword) return true;
-          continue;
-        }
-        // Allow higher distance for longer words
-        const allowedDistance = keyword.length > 5 ? maxDistance + 1 : maxDistance;
-        if (Math.abs(word.length - keyword.length) > allowedDistance) continue;
-        if (this.levenshteinDistance(word, keyword) <= allowedDistance) {
-          return true;
-        }
-      }
-    }
-    return false;
-  }
-
-  private determineToolCategories(userMessage: string, conversationHistory: string[]): Set<string> {
+  private determineToolCategories(userMessage: string): Set<string> {
     const categories = new Set<string>();
     const msgOnly = userMessage.toLowerCase().trim();
-    const words = msgOnly.split(/[^a-z0-9]+/);
 
-    // --- Conversational / emotional intent detection ---
-    // If the message is clearly casual chat, emotional venting, small talk, or
-    // a simple greeting, return an empty set so Aris responds conversationally.
     const conversationalPatterns = [
       /^(hey|hi|hello|sup|yo|howdy|hiya)[\s!?.,]*$/i,
       /^(thanks|thank you|thx|ty)[\s!?.,]*$/i,
@@ -4203,39 +4152,20 @@ export class ArisService {
       /^(how are you|how's it going|what's up|wassup)[\s!?.,]*$/i,
       /^(nothing|not much|same old|just chilling|just relaxing)[\s!?.,]*/i,
     ];
+    if (conversationalPatterns.some((pattern) => pattern.test(msgOnly))) return categories;
 
-    const isConversational = conversationalPatterns.some(p => p.test(msgOnly));
-    if (isConversational) {
-      // Return empty set — Aris will respond directly without any tools
-      return categories;
-    }
-
-    if (this.hasFuzzyMatch(words, ["brief", "summary", "overview", "update", "happening", "catch"])) {
-      categories.add("briefing");
-      categories.add("gmail");
-      categories.add("calendar");
-      categories.add("whatsapp");
-      categories.add("traffic");
-      categories.add("weather");
-    }
-
-    if (this.hasFuzzyMatch(words, ["email", "gmail", "inbox", "message", "draft", "send", "mail"])) categories.add("gmail");
-    if (this.hasFuzzyMatch(words, ["contact", "person", "phone", "number", "address", "profile"])) categories.add("contact");
-    if (this.hasFuzzyMatch(words, ["calendar", "schedule", "meeting", "event", "events", "appointment", "invite"])) categories.add("calendar");
-    if (this.hasFuzzyMatch(words, ["whatsapp", "wa", "chat"])) categories.add("whatsapp");
-    if (this.hasFuzzyMatch(words, ["traffic", "route", "commute", "drive", "directions", "eta"])) categories.add("traffic");
-    if (this.hasFuzzyMatch(words, ["weather", "forecast", "air", "quality", "marine", "ocean", "rain", "temperature", "temp", "cold", "hot"])) categories.add("weather");
+    if (this.isMorningBriefRequest(msgOnly)) categories.add("briefing");
+    if (/\b(?:email|gmail|inbox|mail|draft)\b/i.test(msgOnly)) categories.add("gmail");
+    if (/\b(?:contact|phone number|email address|address book)\b/i.test(msgOnly)) categories.add("contact");
+    if (/\b(?:calendar|appointment|meeting|schedule|event|events|availability)\b/i.test(msgOnly)) categories.add("calendar");
+    if (/\b(?:whatsapp|what.?s app|unread messages?)\b/i.test(msgOnly)) categories.add("whatsapp");
+    if (/\b(?:traffic|commute|route|directions|eta|travel time|congestion)\b/i.test(msgOnly)) categories.add("traffic");
+    if (/\b(?:weather|forecast|air quality|pollution|pollen|marine conditions|wave height)\b/i.test(msgOnly)) categories.add("weather");
     if (/\b(?:news|headlines|current events|breaking news|news brief|podcasts?)\b/i.test(msgOnly)) categories.add("news");
     if (this.isCurrentLocationRequest(msgOnly)) categories.add("location");
     if (this.isLocalDateTimeRequest(msgOnly)) categories.add("time");
-    if (
-      this.hasFuzzyMatch(words, ["join", "meet", "zoom", "meeting", "notetaker", "notes"]) &&
-      (msgOnly.includes("meet.google.com") || msgOnly.includes("zoom.us") || msgOnly.includes("join") )
-    ) categories.add("meeting");
-
-    if (categories.size === 0 && this.isExplicitWebResearchRequest(msgOnly)) {
-      categories.add("search");
-    }
+    if (/\b(?:join|enter|connect to|attend)\b.*\b(?:meet|meeting|call|conference)\b|meet\.google\.com|zoom\.us/i.test(msgOnly)) categories.add("meeting");
+    if (this.isExplicitWebResearchRequest(msgOnly)) categories.add("search");
 
     return categories;
   }
@@ -4246,6 +4176,7 @@ export class ArisService {
     userProfile: UserProfileEntry[],
     memories: string[],
     conversationHistory: string[],
+    requestRoute: RequestRoutingDecision,
     sessionId: string,
     includeSearch: boolean,
     coachPersona: string,
@@ -4270,20 +4201,36 @@ export class ArisService {
       toolResults.push({ invocation: approvedAction, result });
       await this.recordToolObservation(userId, sessionId, approvedAction, result);
     }
-    const activeCategories = this.determineToolCategories(userMessage, conversationHistory);
-    if (includeSearch && (!this.hasNativeCapabilityIntent(userMessage) || this.isExplicitWebResearchRequest(userMessage))) {
-      activeCategories.add("search");
+    const activeCategories = new Set(requestRoute.categories);
+    if (!includeSearch) {
+      activeCategories.delete("search");
+    }
+
+    if (!approvedAction && requestRoute.reusePriorAnswer) {
+      const previousReply = this.getLastAssistantReply(conversationHistory);
+      if (previousReply) {
+        info("[arisService] reusing prior assistant answer for a semantically matching, non-current request");
+        return {
+          status: "finished",
+          reply: previousReply,
+          memoryEntries: [],
+        };
+      }
     }
 
     if (!approvedAction && !this.isExplicitWebResearchRequest(userMessage)) {
-      if (this.isCurrentLocationRequest(userMessage)) {
+      if (requestRoute.intent === "current_location" || this.isCurrentLocationRequest(userMessage)) {
         return {
           status: "finished",
           reply: await this.answerLocationRequest(userId),
           memoryEntries: [],
         };
       }
-      if (this.isLocalDateTimeRequest(userMessage)) {
+      if (
+        requestRoute.intent === "current_time" ||
+        requestRoute.intent === "current_date" ||
+        this.isLocalDateTimeRequest(userMessage)
+      ) {
         const location = await this.locationService.getCurrentLocation(false, userId);
         return {
           status: "finished",
@@ -4607,7 +4554,8 @@ export class ArisService {
         memories,
         conversationHistory,
         toolResults,
-        includeSearch
+        includeSearch && activeCategories.has("search"),
+        activeCategories,
       );
     }
 
@@ -4673,12 +4621,16 @@ export class ArisService {
       );
       const forbiddenSearchCalls = normalizedInvocations.filter((invocation) =>
         this.isWebSearchTool(invocation.tool)
-        && this.hasNativeCapabilityIntent(userMessage)
-        && !this.isExplicitWebResearchRequest(userMessage)
+        && (
+          !includeSearch
+          || !activeCategories.has("search")
+          || (this.hasNativeCapabilityIntent(userMessage, activeCategories)
+            && !this.isExplicitWebResearchRequest(userMessage))
+        )
       );
       if (forbiddenSearchCalls.length > 0) {
         blockedNativeSearchAttempts += 1;
-        error(`[arisService] blocked web search for native-capability request="${userMessage.slice(0, 160)}" tools=${forbiddenSearchCalls.map((invocation) => invocation.tool).join(",")}`);
+        error(`[arisService] blocked web search outside the request route="${userMessage.slice(0, 160)}" tools=${forbiddenSearchCalls.map((invocation) => invocation.tool).join(",")}`);
         normalizedInvocations = normalizedInvocations.filter((invocation) => !this.isWebSearchTool(invocation.tool));
         if (normalizedInvocations.length === 0) {
           if (blockedNativeSearchAttempts > 1) {
@@ -4689,8 +4641,8 @@ export class ArisService {
             };
           }
           prompt = [
-            `A native tool already provides the relevant capability for the user's request. Web search is prohibited for this request.`,
-            `Do not call search or browser_search. Use the tool results below and respond with only the final JSON object.`,
+            `The request router did not authorize web research for this request. Do not call search or browser_search.`,
+            `Use relevant conversation, memory, and tool results to answer, or ask one focused clarification if required.`,
             `Original user request: ${userMessage}`,
             `Tool results:`,
             ...toolResults.map((entry) => `- ${entry.invocation.tool}: ${entry.result.success ? JSON.stringify(entry.result.data) : `FAILED: ${entry.result.error}`}`),
@@ -5019,45 +4971,6 @@ export class ArisService {
     return false;
   }
 
-  private rewriteUserMessageForCoreference(userMessage: string, userId: number | undefined, sessionId: string | undefined, conversationHistory: string[]) {
-    const normalized = userMessage.trim();
-    if (!sessionId || !normalized) {
-      return normalized;
-    }
-
-    const anaphoraRef = /\b(it|that|this|same|previous|recent|last|the one|the other|those|these|here)\b/i;
-    if (!anaphoraRef.test(normalized)) {
-      return normalized;
-    }
-
-    const lastToolInvocation = this.getLastToolInvocation(userId, sessionId);
-    const recentObservations = this.getRecentToolObservations(userId, sessionId);
-    let prefix = "";
-
-    if (lastToolInvocation?.tool?.startsWith("google_gmail")) {
-      if (lastToolInvocation.tool === "google_gmail_messages") {
-        prefix = "Regarding the recent Gmail messages, ";
-      } else if (lastToolInvocation.tool === "google_gmail_message") {
-        prefix = "Regarding the email details you asked about, ";
-      } else if (lastToolInvocation.tool === "google_gmail_threads") {
-        prefix = "Regarding the Gmail thread list, ";
-      }
-    } else if (lastToolInvocation?.tool?.startsWith("google_calendar")) {
-      prefix = "Regarding the calendar results, ";
-    }
-
-    if (!prefix && recentObservations.length) {
-      const latest = recentObservations[recentObservations.length - 1];
-      prefix = `Regarding the previous ${latest.tool.replace(/_/g, " ")} result, `;
-    }
-
-    if (prefix) {
-      return `${prefix}${normalized}`;
-    }
-
-    return normalized;
-  }
-
   private async attemptUrlExtraction(searchResponse: SearchResponse): Promise<ExtractResponse | undefined> {
     const urls = (searchResponse.results || [])
       .slice(0, 5)
@@ -5140,8 +5053,8 @@ export class ArisService {
       : [];
       
     const currentDateTime = this.formatCurrentDateTime();
-    const suppressSearch = this.hasNativeCapabilityIntent(userMessage)
-      && !this.isExplicitWebResearchRequest(userMessage);
+    const suppressSearch = !activeCategories.has("search") || (this.hasNativeCapabilityIntent(userMessage, activeCategories)
+      && !this.isExplicitWebResearchRequest(userMessage));
     const canonicalToolManifest = Array.from(this.supportedToolNames)
       .filter((tool) => !suppressSearch || !this.isWebSearchTool(tool))
       .sort()

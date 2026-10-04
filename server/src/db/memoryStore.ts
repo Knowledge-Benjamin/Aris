@@ -22,6 +22,7 @@ export interface UserProfileEntry {
 
 export class MemoryStore {
   private embeddingClient = new EmbeddingClient();
+  private readonly minimumMemorySimilarity = 0.65;
 
   constructor(private pool: Pool) {}
 
@@ -45,14 +46,14 @@ export class MemoryStore {
 
     try {
       const results = await this.getSemanticMemories(userId, sessionId, queryText, limit);
-      if (results.length) {
-        return results.map((row) => row.content);
-      }
+      return results
+        .filter((row) => (row.similarity ?? 0) >= this.minimumMemorySimilarity)
+        .map((row) => row.content);
     } catch (error) {
-      console.warn("[MemoryStore] vector memory search failed, falling back to recent memories", error);
+      console.warn("[MemoryStore] vector memory search failed; no query-irrelevant memories will be substituted", error);
     }
 
-    return this.getRecentMemories(userId, sessionId, limit);
+    return [];
   }
 
   async getSemanticMemories(
@@ -64,29 +65,12 @@ export class MemoryStore {
     const [queryEmbedding] = await this.embeddingClient.embedTexts([queryText]);
     const vectorLiteral = `[${queryEmbedding.join(",")}]`;
 
-    if (userId && sessionId) {
-      const query = `
-        SELECT id, content, created_at, embedding <#> $3::vector AS similarity
-        FROM memories
-        WHERE (user_id = $1 OR session_id = $2) AND embedding IS NOT NULL
-        ORDER BY similarity ASC
-        LIMIT $4
-      `;
-      const result = await this.pool.query(query, [userId, sessionId, vectorLiteral, limit]);
-      return result.rows.map((row) => ({
-        id: row.id,
-        content: row.content,
-        createdAt: row.created_at,
-        similarity: Number(row.similarity),
-      }));
-    }
-
     if (userId) {
       const query = `
-        SELECT id, content, created_at, embedding <#> $2::vector AS similarity
+        SELECT id, content, created_at, 1 - (embedding <=> $2::vector) AS similarity
         FROM memories
         WHERE user_id = $1 AND embedding IS NOT NULL
-        ORDER BY similarity ASC
+        ORDER BY embedding <=> $2::vector
         LIMIT $3
       `;
       const result = await this.pool.query(query, [userId, vectorLiteral, limit]);
@@ -100,10 +84,10 @@ export class MemoryStore {
 
     if (sessionId) {
       const query = `
-        SELECT id, content, created_at, embedding <#> $2::vector AS similarity
+        SELECT id, content, created_at, 1 - (embedding <=> $2::vector) AS similarity
         FROM memories
         WHERE session_id = $1 AND embedding IS NOT NULL
-        ORDER BY similarity ASC
+        ORDER BY embedding <=> $2::vector
         LIMIT $3
       `;
       const result = await this.pool.query(query, [sessionId, vectorLiteral, limit]);
@@ -146,11 +130,11 @@ export class MemoryStore {
       const query = `
         SELECT content
         FROM memories
-        WHERE user_id = $1 OR session_id = $2
+        WHERE user_id = $1
         ORDER BY updated_at DESC
-        LIMIT $3
+        LIMIT $2
       `;
-      const result = await this.pool.query(query, [userId, sessionId, limit]);
+      const result = await this.pool.query(query, [userId, limit]);
       return result.rows.map((row) => row.content);
     }
 
@@ -182,6 +166,18 @@ export class MemoryStore {
   }
 
   async getRecentConversationHistory(userId: number | undefined, sessionId: string | undefined, limit: number) {
+    if (userId && sessionId) {
+      const query = `
+        SELECT role, content
+        FROM conversations
+        WHERE user_id = $1 AND session_id = $2
+        ORDER BY created_at DESC
+        LIMIT $3
+      `;
+      const result = await this.pool.query(query, [userId, sessionId, limit]);
+      return result.rows.reverse().map((row) => `${row.role === "user" ? "User" : "Aris"}: ${row.content}`);
+    }
+
     if (userId) {
       const query = `
         SELECT role, content

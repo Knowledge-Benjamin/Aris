@@ -37,14 +37,21 @@ export class NewsResearchStore {
     sessionId: string | undefined,
     query: string
   ): Promise<NewsResearchRecord[]> {
-    const terms = [...new Set(query.toLowerCase().match(/[a-z0-9]{3,}/g) || [])].slice(0, 8);
+    const stopWords = new Set([
+      "about", "after", "also", "are", "day", "for", "from", "how", "latest",
+      "news", "now", "right", "search", "tell", "that", "the", "this", "today",
+      "was", "what", "when", "where", "which", "who", "why", "with",
+    ]);
+    const terms = [...new Set(query.toLowerCase().match(/[a-z0-9]{3,}/g) || [])]
+      .filter((term) => !stopWords.has(term))
+      .slice(0, 8);
     if (!terms.length) return [];
 
     const values: unknown[] = [userId ?? null, sessionId ?? null];
     const matches = terms.map((term) => {
       values.push(`%${term}%`);
       const parameter = values.length;
-      return `(query ILIKE $${parameter} OR articles::text ILIKE $${parameter})`;
+      return `query ILIKE $${parameter}`;
     });
     values.push(5);
 
