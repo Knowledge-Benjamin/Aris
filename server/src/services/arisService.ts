@@ -57,6 +57,28 @@ interface ToolChainResult {
   mediaAttachments?: Array<{ mimeType: string; base64: string }>;
 }
 
+type RequestRouteIntent =
+  | "current_time"
+  | "current_date"
+  | "current_location"
+  | "weather"
+  | "traffic"
+  | "news"
+  | "web_research"
+  | "calendar"
+  | "gmail"
+  | "whatsapp"
+  | "contact"
+  | "meeting"
+  | "briefing"
+  | "other";
+
+interface RequestRoutingDecision {
+  intent: RequestRouteIntent;
+  categories: string[];
+  reusePriorAnswer: boolean;
+}
+
 interface ArisResponse {
   arisReply: string;
   memoryUpdates: string[];
@@ -266,9 +288,104 @@ export class ArisService {
 
   private getContextKey(userId: number | undefined, sessionId: string | undefined) {
     if (userId !== undefined && userId !== null) {
-      return `user:${userId}`;
+      return sessionId ? `user:${userId}:session:${sessionId}` : `user:${userId}`;
     }
     return sessionId ? `session:${sessionId}` : "unknown";
+  }
+
+  private async classifyRequestRoute(
+    message: string,
+    conversationHistory: string[],
+    userId: number | undefined,
+    sessionId: string,
+  ): Promise<RequestRoutingDecision> {
+    const allowedCategories = [
+      "briefing", "calendar", "gmail", "contact", "whatsapp", "traffic",
+      "weather", "news", "search", "location", "time", "meeting",
+    ];
+    const observations = this.getRecentToolObservations(userId, sessionId)
+      .slice(-5)
+      .map((observation) => ({
+        tool: observation.tool,
+        payload: observation.payload,
+        success: observation.success,
+        summary: observation.summary.slice(0, 800),
+        recordedAt: observation.recordedAt,
+      }));
+    const history = conversationHistory.slice(-8).map((item) => item.slice(0, 500));
+    const prompt = [
+      "Classify the user's latest request for Aris's tool planner.",
+      "Understand meaning, paraphrases, and implied requests; do not classify by isolated keyword matches.",
+      "Use earlier turns and observations only to resolve a clear follow-up. A standalone question must not inherit the previous tool's topic just because it contains a pronoun such as 'it'.",
+      "Choose one intent from: current_time, current_date, current_location, weather, traffic, news, web_research, calendar, gmail, whatsapp, contact, meeting, briefing, other.",
+      `Choose zero or more categories from: ${allowedCategories.join(", ")}.`,
+      "Use time/location/weather/traffic native capabilities for local or device-context questions; do not route them to web search.",
+      "Choose search only when the user explicitly asks for web research or the answer genuinely needs current public web information. Do not choose search merely because no other category matches.",
+      "Set reusePriorAnswer=true only when a previous Aris response in this same conversation already fully answers the current request and the answer is not time-sensitive or otherwise requires fresh data. Otherwise false.",
+      `Web search enabled: ${searchToolEnabled}. If disabled, do not select the search category.`,
+      `Recent conversation:\n${history.join("\n") || "(none)"}`,
+      `Recent tool observations:\n${JSON.stringify(observations) || "[]"}`,
+      `Latest user request:\n${message}`,
+      'Return only JSON: {"intent":"other","categories":[],"reusePriorAnswer":false}.',
+    ].join("\n\n");
+
+    try {
+      const response = await this.gemmaService.requestArisAdvice(prompt);
+      const parsed = this.extractJsonObject(response.reply) as {
+        intent?: unknown;
+        categories?: unknown;
+        reusePriorAnswer?: unknown;
+      } | undefined;
+      const validIntents: RequestRouteIntent[] = [
+        "current_time", "current_date", "current_location", "weather", "traffic",
+        "news", "web_research", "calendar", "gmail", "whatsapp", "contact",
+        "meeting", "briefing", "other",
+      ];
+      if (parsed && validIntents.includes(parsed.intent as RequestRouteIntent) && Array.isArray(parsed.categories)) {
+        const categories = Array.from(new Set(
+          parsed.categories.filter((category): category is string =>
+            typeof category === "string" && allowedCategories.includes(category)
+          )
+        ));
+        if (!searchToolEnabled) {
+          const searchIndex = categories.indexOf("search");
+          if (searchIndex !== -1) categories.splice(searchIndex, 1);
+        }
+        const intent = parsed.intent as RequestRouteIntent;
+        if (intent === "current_time" || intent === "current_date") categories.push("time");
+        if (intent === "current_location") categories.push("location");
+        return {
+          intent,
+          categories: Array.from(new Set(categories)),
+          reusePriorAnswer: parsed.reusePriorAnswer === true,
+        };
+      }
+      error("[arisService] request router returned an invalid classification; using conservative local routing");
+    } catch (routeError) {
+      error("[arisService] request routing failed; using conservative local routing", routeError);
+    }
+
+    const categories = Array.from(this.determineToolCategories(message, []));
+    const intent: RequestRouteIntent = this.isCurrentLocationRequest(message)
+      ? "current_location"
+      : this.isLocalDateTimeRequest(message)
+        ? /\b(?:date|day of the week|what day)\b/i.test(message) ? "current_date" : "current_time"
+        : categories.includes("weather") ? "weather"
+          : categories.includes("traffic") ? "traffic"
+            : categories.includes("news") ? "news"
+              : categories.includes("calendar") ? "calendar"
+                : categories.includes("gmail") ? "gmail"
+                  : categories.includes("whatsapp") ? "whatsapp"
+                    : categories.includes("search") ? "web_research"
+                      : "other";
+    return { intent, categories, reusePriorAnswer: false };
+  }
+
+  private getLastAssistantReply(conversationHistory: string[]): string | undefined {
+    return [...conversationHistory].reverse()
+      .find((item) => item.startsWith("Aris:"))
+      ?.slice("Aris:".length)
+      .trim();
   }
 
   private async recordRecentGmailMessages(userId: number | undefined, sessionId: string | undefined, messages: Array<{ id: string; subject: string; from: string; date?: string }>) {
@@ -575,22 +692,39 @@ export class ArisService {
     });
 
     const [userProfile, conversationHistory] = await Promise.all([userProfilePromise, conversationHistoryPromise]);
-    const effectiveMessage = this.rewriteUserMessageForCoreference(input.message, input.userId, sessionId, conversationHistory);
+    const effectiveMessage = input.message.trim();
     const messageWithReplyContext = input.replyContext?.trim()
       ? `${effectiveMessage}\n\nMessage being replied to:\n${input.replyContext.trim()}`
       : effectiveMessage;
+    const requestRoute = await this.classifyRequestRoute(
+      messageWithReplyContext,
+      conversationHistory,
+      input.userId,
+      sessionId,
+    );
     
     // Similarly, don't fetch heavy semantic memories for basic greetings
     let memoryContext: string[] = [];
+    const recentGmailMessages = requestRoute.categories.includes("gmail") || requestRoute.categories.includes("briefing")
+      ? this.getRecentGmailMessages(input.userId, sessionId)
+      : [];
     if (!isShortConversational) {
       try {
         memoryContext = await this.memoryStore.getRelevantMemories(input.userId, sessionId, effectiveMessage, 12);
-        const researchContext = await this.getNewsResearchContext(input.userId, sessionId, effectiveMessage);
-        const recentGmailMessages = this.getRecentGmailMessages(input.userId, sessionId);
-        const messageContext = recentGmailMessages.slice(0, 10).map((message) =>
-          `Stored Gmail message index: id=${message.id} from=${message.from} subject=${message.subject} date=${message.date || "unknown"}`
-        );
-        memoryContext = [...memoryContext, ...researchContext, ...messageContext];
+        if (requestRoute.categories.includes("search") || requestRoute.categories.includes("news")) {
+          memoryContext = [
+            ...memoryContext,
+            ...await this.getNewsResearchContext(input.userId, sessionId, effectiveMessage),
+          ];
+        }
+        if (requestRoute.categories.includes("gmail") || requestRoute.categories.includes("briefing")) {
+          memoryContext = [
+            ...memoryContext,
+            ...recentGmailMessages.slice(0, 10).map((message) =>
+              `Stored Gmail message index: id=${message.id} from=${message.from} subject=${message.subject} date=${message.date || "unknown"}`
+            ),
+          ];
+        }
         info(`[arisService] grounding loaded profile=${userProfile.length} conversation=${conversationHistory.length} memories=${memoryContext.length} recentToolObservations=${this.getRecentToolObservations(input.userId, sessionId).length} recentGmail=${recentGmailMessages.length}`);
       } catch (err) {
         console.error("[arisService] Failed to load relevant memories:", err);
@@ -631,6 +765,7 @@ export class ArisService {
       userProfile,
       memoryContext,
       conversationHistory,
+      requestRoute,
       sessionId,
       searchToolEnabled,
       coachPersona,
@@ -707,6 +842,59 @@ export class ArisService {
     return hasPodcast && (hasNews || hasSendOrListen || hasWhatsApp);
   }
 
+  private isCurrentLocationRequest(message: string): boolean {
+    return /\b(?:my current location|current location|where am i|where i am|where(?:'s| is) my phone|my location|my coordinates|current coordinates|gps coordinates|my gps location|do you know where i am|what are my coordinates)\b/i.test(message);
+  }
+
+  private isLocalDateTimeRequest(message: string): boolean {
+    return /\b(?:what(?:'s| is) (?:the )?time(?: right now)?|what time is it|tell me the time|current time|time right now|what(?:'s| is) (?:the )?date(?: today)?|today(?:'s)? date|current date|what day is it|what day is today)\b/i.test(message);
+  }
+
+  private hasNativeCapabilityIntent(message: string): boolean {
+    return this.isCurrentLocationRequest(message)
+      || this.isLocalDateTimeRequest(message)
+      || /\b(?:weather|forecast|temperature|rainfall|rain|air quality|pollution|pollen|marine conditions|wave height|traffic|commute|congestion|route|directions|eta|estimated arrival)\b/i.test(message)
+      || this.determineToolCategories(message, []).size > 0;
+  }
+
+  private isExplicitWebResearchRequest(message: string): boolean {
+    return /\b(?:search (?:the )?(?:web|internet|online|for)|web search|look up online|research online|google (?:for|about)|browse (?:the )?(?:web|internet))\b/i.test(message);
+  }
+
+  private isWebSearchTool(toolName: string): boolean {
+    return toolName === "search" || toolName === "browser_search";
+  }
+
+  private formatCurrentDateTime(timezone?: string): string {
+    const options: Intl.DateTimeFormatOptions = {
+      weekday: "long",
+      year: "numeric",
+      month: "long",
+      day: "numeric",
+      hour: "numeric",
+      minute: "2-digit",
+      second: "2-digit",
+      timeZoneName: "long",
+    };
+    if (timezone) options.timeZone = timezone;
+    return new Intl.DateTimeFormat("en-US", options).format(new Date());
+  }
+
+  private async answerLocationRequest(userId: number | undefined): Promise<string> {
+    const location = await this.locationService.getCurrentLocation(true, userId);
+    if (!location || location.status !== "success") {
+      throw new Error("I couldn't retrieve a current location from this device or its network.");
+    }
+    const coordinates = Number.isFinite(location.lat) && Number.isFinite(location.lon)
+      ? `Coordinates: ${location.lat}, ${location.lon}.`
+      : "Coordinates are unavailable.";
+    const place = [location.city, location.regionName, location.country].filter(Boolean).join(", ");
+    const precision = location.source === "android"
+      ? `This is your phone's GPS/network location${location.accuracyMeters ? ` (reported accuracy about ${Math.round(location.accuracyMeters)} m)` : ""}.`
+      : "This is an approximate network-based location, not a precise GPS fix.";
+    return `${place ? `Your current location appears to be ${place}. ` : ""}${coordinates} ${precision}`;
+  }
+
   private isFinalModelResponse(response: { reply: string; isFinalAnswer?: boolean }): boolean {
     const reply = response.reply.trim();
     return response.isFinalAnswer === true || /^\s*\{[\s\S]*"final_answer"\s*:/i.test(reply);
@@ -742,6 +930,10 @@ export class ArisService {
 
     if (this.isWhatsappNewsAudioRequest(userMessage)) {
       return [{ tool: "fetch_news", payload: {} }];
+    }
+
+    if (this.isCurrentLocationRequest(userMessage) && !this.isExplicitWebResearchRequest(userMessage)) {
+      return [{ tool: "location_ip_details", payload: {} }];
     }
 
     return this.inferToolInvocations(userMessage, userId, sessionId, conversationHistory)
@@ -2429,14 +2621,38 @@ export class ArisService {
           resultData = await this.locationService.getCurrentLocation(true, userId);
         } else if (toolName === "weather_geocoding") {
           resultData = await this.weatherService.geocode(payload.name, payload.count);
-        } else if (toolName === "weather_forecast") {
-          resultData = await this.weatherService.getForecast(payload.lat, payload.lon, payload.current, payload.hourly, payload.daily);
-        } else if (toolName === "weather_historical") {
-          resultData = await this.weatherService.getHistorical(payload.lat, payload.lon, payload.start_date, payload.end_date, payload.hourly, payload.daily);
-        } else if (toolName === "weather_air_quality") {
-          resultData = await this.weatherService.getAirQuality(payload.lat, payload.lon, payload.hourly);
-        } else if (toolName === "weather_marine") {
-          resultData = await this.weatherService.getMarine(payload.lat, payload.lon, payload.hourly);
+        } else {
+          let lat = payload.lat;
+          let lon = payload.lon;
+          let timezone = payload.timezone;
+          if (typeof payload.location === "string" && payload.location.trim()) {
+            const geocoded = await this.weatherService.geocode(payload.location.trim(), 1) as {
+              results?: Array<{ latitude: number; longitude: number; timezone?: string }>;
+            };
+            const place = geocoded.results?.[0];
+            if (!place) throw new Error(`Could not resolve weather location "${payload.location}".`);
+            lat = place.latitude;
+            lon = place.longitude;
+            timezone = timezone || place.timezone;
+          } else if (!Number.isFinite(lat) || !Number.isFinite(lon)) {
+            const location = await this.locationService.getCurrentLocation(false, userId);
+            if (!location || !Number.isFinite(location.lat) || !Number.isFinite(location.lon)) {
+              throw new Error("Weather requires coordinates, and no current device or network location is available.");
+            }
+            lat = location.lat;
+            lon = location.lon;
+            timezone = timezone || location.timezone;
+          }
+
+          if (toolName === "weather_forecast") {
+            resultData = await this.weatherService.getForecast(lat, lon, payload.current, payload.hourly, payload.daily, timezone);
+          } else if (toolName === "weather_historical") {
+            resultData = await this.weatherService.getHistorical(lat, lon, payload.start_date, payload.end_date, payload.hourly, payload.daily, timezone);
+          } else if (toolName === "weather_air_quality") {
+            resultData = await this.weatherService.getAirQuality(lat, lon, payload.hourly, timezone);
+          } else if (toolName === "weather_marine") {
+            resultData = await this.weatherService.getMarine(lat, lon, payload.hourly, timezone);
+          }
         }
 
         const result = { success: true, tool: toolName, data: resultData };
@@ -3720,13 +3936,49 @@ export class ArisService {
     const calendarKeywords = /\b(calendar|appointment|meeting|schedule|event|events|availability|today|tomorrow|next week|next month|this week|next month)\b/i;
     const newsKeywords = /\b(news|headlines|current events|world events|breaking news|today's news|today news|news brief|news podcast|podcast episode)\b/i;
     const trafficKeywords = /\b(traffic|trafic|commute|congestion|route|ETA|estimated arrival|travel time|delay|jam|accident|roadwork|road work|gridlock|rush hour|leave now|leave at|when should I leave|how long will it take)\b/i;
-    const searchKeywords = /\b(search|look up|find|research|what is|who is|where is|latest|current|news|today's|today|tomorrow)\b/i;
+    const searchKeywords = /\b(?:search (?:the )?(?:web|internet|online|for)|web search|look up online|research online|google (?:for|about)|browse (?:the )?(?:web|internet))\b/i;
     const retryKeywords = /\b(try again|retry|again|repeat|re-run|rerun|run again)\b/i;
     const anaphoraRef = /\b(this|that|it|same|previous|recent|last|first|second|third|fourth|fifth|the one|the other|those|these)\b/i;
     const joinMeetingIntent = /\b(join|enter|connect to|attend)\b.*\b(meet|meeting|call|conference)\b|\b(join now|join it|join the call)\b/i;
 
     const recentMessages = this.getRecentGmailMessages(userId, sessionId);
     const lastToolInvocation = this.getLastToolInvocation(userId, sessionId);
+
+    if (this.isCurrentLocationRequest(normalized) && !this.isExplicitWebResearchRequest(normalized)) {
+      return { tool: "location_ip_details", payload: {} };
+    }
+
+    if (!this.isExplicitWebResearchRequest(normalized) &&
+        /\b(?:weather|forecast|temperature|rainfall|rain|air quality|pollution|pollen|marine conditions|wave height)\b/i.test(normalized)) {
+      const placeMatch = normalized.match(/\b(?:in|for|at)\s+(.+?)(?:\s+(?:today|tomorrow|this week|right now|currently))?[?.!]*$/i);
+      const place = placeMatch?.[1]?.trim();
+      const tool = /\b(?:air quality|pollution|pollen)\b/i.test(normalized)
+        ? "weather_air_quality"
+        : /\b(?:marine conditions|wave height|ocean current|ocean currents)\b/i.test(normalized)
+          ? "weather_marine"
+          : "weather_forecast";
+      const weatherFields = tool === "weather_air_quality"
+        ? { hourly: ["us_aqi", "pm2_5", "pm10", "pollen"] }
+        : tool === "weather_marine"
+          ? { hourly: ["wave_height", "wave_direction", "wave_period"] }
+          : {
+              current: ["temperature_2m", "relative_humidity_2m", "apparent_temperature", "precipitation", "rain", "weather_code", "wind_speed_10m"],
+              daily: ["temperature_2m_max", "temperature_2m_min", "precipitation_probability_max", "weather_code"],
+            };
+      if (place && !/\b(?:my area|my location|here|near me|my current location)\b/i.test(place)) {
+        return {
+          tool,
+          payload: {
+            location: place,
+            ...weatherFields,
+          },
+        };
+      }
+      return {
+        tool,
+        payload: weatherFields,
+      };
+    }
 
     if (retryKeywords.test(normalized) && lastToolInvocation) {
       return lastToolInvocation;
@@ -3841,7 +4093,12 @@ export class ArisService {
       toolLines.push(`Tool result: ${JSON.stringify(result, null, 2)}`);
       toolLines.push("");
     }
-    const canonicalToolManifest = Array.from(this.supportedToolNames).sort().join(", ");
+    const suppressSearch = this.hasNativeCapabilityIntent(userMessage)
+      && !this.isExplicitWebResearchRequest(userMessage);
+    const canonicalToolManifest = Array.from(this.supportedToolNames)
+      .filter((tool) => !suppressSearch || !this.isWebSearchTool(tool))
+      .sort()
+      .join(", ");
 
     const prompt = [
       `You are Aris, an extremely conversational digital friend, an expert advisor, and a life coach. You chain tools using a Thought-Action-Observation process.`,
@@ -3850,7 +4107,9 @@ export class ArisService {
       `Do not output internal reasoning, Thought lines, planning, or progress narration.`,
       `For each step, output only one valid JSON tool call.`,
       `If you are finished, output only this final JSON object: {"final_answer":"...","memory_entries":[]} .`,
-      `NEWS ROUTING: Use {"tool":"fetch_news"} for current news, today's news, headlines, or a news brief. Use {"tool":"search","query":"..."} only for general web research.`,
+      suppressSearch
+        ? `Use native tools already listed in the manifest for this request. Do not use web search or browser search.`
+        : `NEWS ROUTING: Use {"tool":"fetch_news"} for current news, today's news, headlines, or a news brief. Use {"tool":"search","query":"..."} only for general web research.`,
       `ARTICLE DETAIL ROUTING: When fetch_news returns several article links and the user asks for full details, make one batch call with all relevant links: {"tool":"browser_read","urls":["https://example.com/article-1","https://example.com/article-2"]}. A single tool call may contain a urls array; do not read only the first article and do not emit separate calls for every URL. If browser_read cannot read the links, try one batched url_read call instead.`,
       `NEWS PODCAST: Use {"tool":"fetch_news_podcast","batch":true} when the user asks for podcasts. This selects four current RSS episodes, always including NPR, stores them in Google Drive, and returns ordered Drive references. After the successful observation use app_send_audio_batch with those Drive episode references to queue them for Aris app delivery; never send only one episode. After delivery ask which shows the user enjoyed and save that preference for the custom podcast list.`,
       `MORNING BRIEF DELIVERY: A morning brief must include the complete text brief and a matching audio brief. Send the full text with app_send_message and the spoken version with audio_generate destination "app". If podcast episodes are present, also queue them with app_send_audio_batch. Do not finish with only a conversational summary when delivery was requested.`,
@@ -3873,7 +4132,7 @@ export class ArisService {
       ...toolLines,
     ];
 
-    if (includeSearch) {
+    if (includeSearch && !suppressSearch) {
       prompt.splice(5, 0,
         `If the user query requires an internet search, output exactly one tool call and nothing else:`,
         `  TOOL_SEARCH: <search query>`,
@@ -3929,8 +4188,6 @@ export class ArisService {
     const categories = new Set<string>();
     const msgOnly = userMessage.toLowerCase().trim();
     const words = msgOnly.split(/[^a-z0-9]+/);
-    const textToAnalyze = [userMessage, ...conversationHistory].join(" ").toLowerCase();
-    const allWords = textToAnalyze.split(/[^a-z0-9]+/);
 
     // --- Conversational / emotional intent detection ---
     // If the message is clearly casual chat, emotional venting, small talk, or
@@ -3953,7 +4210,7 @@ export class ArisService {
       return categories;
     }
 
-    if (this.hasFuzzyMatch(allWords, ["brief", "summary", "overview", "update", "happening", "catch"])) {
+    if (this.hasFuzzyMatch(words, ["brief", "summary", "overview", "update", "happening", "catch"])) {
       categories.add("briefing");
       categories.add("gmail");
       categories.add("calendar");
@@ -3962,20 +4219,21 @@ export class ArisService {
       categories.add("weather");
     }
 
-    if (this.hasFuzzyMatch(allWords, ["email", "gmail", "inbox", "message", "draft", "send", "mail"])) categories.add("gmail");
-    if (this.hasFuzzyMatch(allWords, ["contact", "person", "phone", "number", "address", "profile"])) categories.add("contact");
-    if (this.hasFuzzyMatch(allWords, ["calendar", "schedule", "meeting", "event", "appointment", "invite"])) categories.add("calendar");
-    if (this.hasFuzzyMatch(allWords, ["whatsapp", "wa", "chat"])) categories.add("whatsapp");
-    if (this.hasFuzzyMatch(allWords, ["traffic", "route", "commute", "drive", "directions", "eta"])) categories.add("traffic");
-    if (this.hasFuzzyMatch(allWords, ["weather", "forecast", "air", "quality", "marine", "ocean", "rain", "temperature", "temp", "cold", "hot"])) categories.add("weather");
+    if (this.hasFuzzyMatch(words, ["email", "gmail", "inbox", "message", "draft", "send", "mail"])) categories.add("gmail");
+    if (this.hasFuzzyMatch(words, ["contact", "person", "phone", "number", "address", "profile"])) categories.add("contact");
+    if (this.hasFuzzyMatch(words, ["calendar", "schedule", "meeting", "event", "events", "appointment", "invite"])) categories.add("calendar");
+    if (this.hasFuzzyMatch(words, ["whatsapp", "wa", "chat"])) categories.add("whatsapp");
+    if (this.hasFuzzyMatch(words, ["traffic", "route", "commute", "drive", "directions", "eta"])) categories.add("traffic");
+    if (this.hasFuzzyMatch(words, ["weather", "forecast", "air", "quality", "marine", "ocean", "rain", "temperature", "temp", "cold", "hot"])) categories.add("weather");
+    if (/\b(?:news|headlines|current events|breaking news|news brief|podcasts?)\b/i.test(msgOnly)) categories.add("news");
+    if (this.isCurrentLocationRequest(msgOnly)) categories.add("location");
+    if (this.isLocalDateTimeRequest(msgOnly)) categories.add("time");
     if (
-      this.hasFuzzyMatch(allWords, ["join", "meet", "zoom", "meeting", "notetaker", "notes"]) &&
-      (textToAnalyze.includes("meet.google.com") || textToAnalyze.includes("zoom.us") || textToAnalyze.includes("join") )
+      this.hasFuzzyMatch(words, ["join", "meet", "zoom", "meeting", "notetaker", "notes"]) &&
+      (msgOnly.includes("meet.google.com") || msgOnly.includes("zoom.us") || msgOnly.includes("join") )
     ) categories.add("meeting");
 
-    // Only fall back to search+generic tools if no specific category was detected
-    // and this is clearly NOT a casual conversational message.
-    if (categories.size === 0) {
+    if (categories.size === 0 && this.isExplicitWebResearchRequest(msgOnly)) {
       categories.add("search");
     }
 
@@ -4013,7 +4271,27 @@ export class ArisService {
       await this.recordToolObservation(userId, sessionId, approvedAction, result);
     }
     const activeCategories = this.determineToolCategories(userMessage, conversationHistory);
-    if (includeSearch) activeCategories.add("search");
+    if (includeSearch && (!this.hasNativeCapabilityIntent(userMessage) || this.isExplicitWebResearchRequest(userMessage))) {
+      activeCategories.add("search");
+    }
+
+    if (!approvedAction && !this.isExplicitWebResearchRequest(userMessage)) {
+      if (this.isCurrentLocationRequest(userMessage)) {
+        return {
+          status: "finished",
+          reply: await this.answerLocationRequest(userId),
+          memoryEntries: [],
+        };
+      }
+      if (this.isLocalDateTimeRequest(userMessage)) {
+        const location = await this.locationService.getCurrentLocation(false, userId);
+        return {
+          status: "finished",
+          reply: `It's currently ${this.formatCurrentDateTime(location?.timezone)}.`,
+          memoryEntries: [],
+        };
+      }
+    }
 
     let initialInvocations = approvedAction
       ? []
@@ -4022,8 +4300,8 @@ export class ArisService {
       this.applyRequestSpecificDefaults(invocation, userMessage, sessionId)
     );
     const executionPlan = this.buildExecutionPlan(userMessage, initialInvocations);
-    if (!approvedAction && (initialInvocations.length > 0 || userMessage.trim().length > 30)) {
-      await this.createExecutionPlanTasks(userId, userMessage, initialInvocations.length ? initialInvocations : [{ tool: "search", payload: { query: userMessage } }]);
+    if (!approvedAction && initialInvocations.length > 0) {
+      await this.createExecutionPlanTasks(userId, userMessage, initialInvocations);
       const { goalsStore } = await import("../db/goalsStore");
       pendingTasks = await goalsStore.getPendingTasks(userId!).catch(() => []);
     }
@@ -4119,6 +4397,7 @@ export class ArisService {
     }
     let lastModelReply = "";
     let recoveryAttempts = 0;
+    let blockedNativeSearchAttempts = 0;
 
     // Execute obvious read-only first steps before asking the model to plan the
     // rest of the chain. This is also the fallback when the model starts with
@@ -4389,9 +4668,37 @@ export class ArisService {
         };
       }
 
-      const normalizedInvocations = invocations.map((inv) =>
+      let normalizedInvocations = invocations.map((inv) =>
         this.applyRequestSpecificDefaults(this.normalizeToolInvocation(inv), userMessage, sessionId)
       );
+      const forbiddenSearchCalls = normalizedInvocations.filter((invocation) =>
+        this.isWebSearchTool(invocation.tool)
+        && this.hasNativeCapabilityIntent(userMessage)
+        && !this.isExplicitWebResearchRequest(userMessage)
+      );
+      if (forbiddenSearchCalls.length > 0) {
+        blockedNativeSearchAttempts += 1;
+        error(`[arisService] blocked web search for native-capability request="${userMessage.slice(0, 160)}" tools=${forbiddenSearchCalls.map((invocation) => invocation.tool).join(",")}`);
+        normalizedInvocations = normalizedInvocations.filter((invocation) => !this.isWebSearchTool(invocation.tool));
+        if (normalizedInvocations.length === 0) {
+          if (blockedNativeSearchAttempts > 1) {
+            return {
+              status: "error",
+              reply: "I retrieved the available local capability data, but couldn't produce an answer without trying an unrelated web search.",
+              memoryEntries: modelResponse.memoryEntries || [],
+            };
+          }
+          prompt = [
+            `A native tool already provides the relevant capability for the user's request. Web search is prohibited for this request.`,
+            `Do not call search or browser_search. Use the tool results below and respond with only the final JSON object.`,
+            `Original user request: ${userMessage}`,
+            `Tool results:`,
+            ...toolResults.map((entry) => `- ${entry.invocation.tool}: ${entry.result.success ? JSON.stringify(entry.result.data) : `FAILED: ${entry.result.error}`}`),
+            `Return only {"final_answer":"...","memory_entries":[]}.`,
+          ].join("\n");
+          continue;
+        }
+      }
       info(`[arisService] executing ${normalizedInvocations.length} normalized tool invocation(s): ${normalizedInvocations.map((invocation) => `${invocation.tool}:${JSON.stringify(invocation.payload).slice(0, 500)}`).join(" | ")}`);
 
       const pendingIndex = normalizedInvocations.findIndex((inv) => this.needsHumanApproval(inv, sessionId));
@@ -4832,8 +5139,13 @@ export class ArisService {
       ? ["User profile:", ...userProfile.map((item) => `- ${item.profileKey}: ${item.profileValue}`), ""]
       : [];
       
-    const currentDateTime = new Date().toLocaleString("en-US", { weekday: "long", year: "numeric", month: "long", day: "numeric", hour: "numeric", minute: "numeric", timeZoneName: "short" });
-    const canonicalToolManifest = Array.from(this.supportedToolNames).sort().join(", ");
+    const currentDateTime = this.formatCurrentDateTime();
+    const suppressSearch = this.hasNativeCapabilityIntent(userMessage)
+      && !this.isExplicitWebResearchRequest(userMessage);
+    const canonicalToolManifest = Array.from(this.supportedToolNames)
+      .filter((tool) => !suppressSearch || !this.isWebSearchTool(tool))
+      .sort()
+      .join(", ");
 
     const toolInstructions = [
       `You are Aris, an extremely conversational digital friend, an expert advisor, an emotional helper, and an aggressive, tactical life coach.`,
@@ -4847,15 +5159,17 @@ export class ArisService {
       `Use 'goal_set' to create a new goal. Example: {"tool":"goal_set", "title": "Become a billionaire", "description": "in 10 years"}`,
       `Use 'goal_update_state' to update the user's Initial Know profile based on conversation. You can also add topics for Aris to monitor on the internet by setting "monitored_topics" (array of strings). Example: {"tool":"goal_update_state", "stateUpdates": {"net_worth": "100k", "monitored_topics": ["AI news", "TSLA stock"]}}`,
       `Use 'goal_view_tasks' to check the status of today's tasks.`,
-      `INTERNET READING TOOL:`,
-      `Use 'url_read' whenever the user shares a link or asks you to read/summarize a webpage, article, or any URL. Also use it to deeply verify information from search results. Example: {"tool":"url_read","url":"https://example.com/article"}`,
-      `You can pass multiple URLs at once: {"tool":"url_read","urls":["https://example.com/a","https://example.com/b"]}`,
-      `Use 'url_read' after a 'search' to go deeper — don't just rely on snippets, read the actual pages. One tool invocation may contain multiple URLs: {"tool":"url_read","urls":["https://example.com/a","https://example.com/b"]}.`,
-      `BROWSER RESEARCH: Use 'browser_read' when an article requires JavaScript, client-side rendering, interaction, or visual inspection. Use 'browser_action' for bounded click, type, keypress, JavaScript evaluation, or screenshot actions. Browser actions must remain focused on research and may not submit forms, log in, purchase, send messages, or perform external side effects without explicit approval.`,
-      `Use 'browser_search' when you need to search the web through a browser session. Then use 'browser_read' on relevant result URLs and read the full article before making claims. Example: {"tool":"browser_search","query":"latest topic"}. When reading several articles, make ONE browser_read call with a urls array, for example: {"tool":"browser_read","urls":["https://example.com/a","https://example.com/b"]}. Do not emit five separate browser_read calls when one batch can read them.`,
-      `ADVANCED SEARCH: Both 'search' and 'browser_search' accept structured constraints. Use them instead of burying requirements in prose: {"tool":"search","query":"battery storage","domains":["reuters.com","iea.org"],"excludeDomains":["reddit.com"],"exactPhrase":"grid scale","location":"Kenya","timeRange":"month","after":"2026-08-01","before":"2026-09-07","intitle":"policy","inurl":"report","filetype":"pdf"}. 'site' is an alias for one domain; 'domains' accepts several. Use 'after' and 'before' for exact date ranges, 'timeRange' for relative freshness (day, week, month, year), 'location' for geographic relevance, 'intitle' for title matching, 'inurl' for URL path matching, and 'filetype' for documents. Normalize domains without https://. For high-precision research, start with the narrowest site/date constraints, then broaden only if results are insufficient. Use browser_search when the target site requires JavaScript or visual inspection, and use browser_read on the strongest results before answering.`,
-      `For visual pages use {"tool":"browser_action","type":"screenshot"} or browser_read with includeScreenshot=true. Inspect the returned screenshot directly with your multimodal vision capability; do not call an external OCR service or claim that OCR is unavailable.`,
-      `When a browser action fails, inspect the returned error, screenshot or DOM state, correct the selector or script, and retry with a bounded alternative. Do not repeat an identical failed action indefinitely.`,
+      ...(suppressSearch ? [] : [
+        `INTERNET READING TOOL:`,
+        `Use 'url_read' whenever the user shares a link or asks you to read/summarize a webpage, article, or any URL. Also use it to deeply verify information from search results. Example: {"tool":"url_read","url":"https://example.com/article"}`,
+        `You can pass multiple URLs at once: {"tool":"url_read","urls":["https://example.com/a","https://example.com/b"]}`,
+        `Use 'url_read' after a 'search' to go deeper — don't just rely on snippets, read the actual pages. One tool invocation may contain multiple URLs: {"tool":"url_read","urls":["https://example.com/a","https://example.com/b"]}.`,
+        `BROWSER RESEARCH: Use 'browser_read' when an article requires JavaScript, client-side rendering, interaction, or visual inspection. Use 'browser_action' for bounded click, type, keypress, JavaScript evaluation, or screenshot actions. Browser actions must remain focused on research and may not submit forms, log in, purchase, send messages, or perform external side effects without explicit approval.`,
+        `Use 'browser_search' when you need to search the web through a browser session. Then use 'browser_read' on relevant result URLs and read the full article before making claims. Example: {"tool":"browser_search","query":"latest topic"}. When reading several articles, make ONE browser_read call with a urls array, for example: {"tool":"browser_read","urls":["https://example.com/a","https://example.com/b"]}. Do not emit five separate browser_read calls when one batch can read them.`,
+        `ADVANCED SEARCH: Both 'search' and 'browser_search' accept structured constraints. Use them instead of burying requirements in prose: {"tool":"search","query":"battery storage","domains":["reuters.com","iea.org"],"excludeDomains":["reddit.com"],"exactPhrase":"grid scale","location":"Kenya","timeRange":"month","after":"2026-08-01","before":"2026-09-07","intitle":"policy","inurl":"report","filetype":"pdf"}. 'site' is an alias for one domain; 'domains' accepts several. Use 'after' and 'before' for exact date ranges, 'timeRange' for relative freshness (day, week, month, year), 'location' for geographic relevance, 'intitle' for title matching, 'inurl' for URL path matching, and 'filetype' for documents. Normalize domains without https://. For high-precision research, start with the narrowest site/date constraints, then broaden only if results are insufficient. Use browser_search when the target site requires JavaScript or visual inspection, and use browser_read on the strongest results before answering.`,
+        `For visual pages use {"tool":"browser_action","type":"screenshot"} or browser_read with includeScreenshot=true. Inspect the returned screenshot directly with your multimodal vision capability; do not call an external OCR service or claim that OCR is unavailable.`,
+        `When a browser action fails, inspect the returned error, screenshot or DOM state, correct the selector or script, and retry with a bounded alternative. Do not repeat an identical failed action indefinitely.`,
+      ]),
       `RUNTIME SKILLS: Use 'skill_list' to inspect saved skills, 'skill_run' to execute one, and 'skill_create' or 'skill_revise' to build or correct a reusable workflow. A skill definition must contain a stable name, description, triggers, and 1-20 ordered steps. Each step calls an existing registered tool and may use {{input.field}} or {{savedResult.field}} templates.`,
       `When a research workflow succeeds repeatedly, propose saving it as a skill. When a skill fails, inspect its trace and error, correct the definition with 'skill_revise', and record a bounded retry. Never put credentials or destructive actions into a skill, and never use a skill to bypass approval requirements. Skill definitions are persisted in PostgreSQL and backed up as private JSON files in Google Drive.`,
       `MEETING BOT TOOL:`,
@@ -4910,7 +5224,7 @@ export class ArisService {
       ""
     ];
 
-    const searchInstructions = activeCategories.has("search")
+    const searchInstructions = activeCategories.has("search") && !suppressSearch
       ? [
           `If the user query requires an internet search, output exactly one tool call and nothing else:`,
           `  TOOL_SEARCH: <search query>`,
@@ -5302,4 +5616,3 @@ ${this.truncateText(item.content, 1200)}`);
     return `${text.slice(0, maxLength).trim()}...`;
   }
 }
-

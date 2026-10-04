@@ -1,3 +1,5 @@
 <resources>
     <string name="app_name">ArisCompanion</string>
+    <string name="accessibility_service_description">Aris Companion uses accessibility access to understand the active screen and assist with actions when you enable it.</string>
+    <string name="aris_widget_description">Quick access to your Aris companion.</string>
 </resources>
