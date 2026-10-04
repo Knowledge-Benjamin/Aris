@@ -13,6 +13,10 @@ function readPort(): number {
   return port;
 }
 
+function isPlaceholder(value: string): boolean {
+  return /^(replace[-_ ]|your[-_ ])/i.test(value);
+}
+
 async function startServer(): Promise<void> {
   const port = readPort();
   const { app } = await import("./app");
