@@ -12,7 +12,7 @@ import { WhatsappService } from "./whatsappService";
 import { TomTomService } from "./tomtomService";
 import { upsertContacts, getContactCount, searchContacts as searchContactsDb, getAllContacts, resolveNameToPhones, updateContactProfileSummary } from "../db/contactsStore";
 import { info, error } from "../utils/logger";
-import { LocationService } from "./locationService";
+import { LocationService, sharedLocationService } from "./locationService";
 import { WeatherService } from "./weatherService";
 import { SunbirdService } from "./sunbirdService";
 import { NewsService } from "./newsService";
@@ -108,7 +108,7 @@ export class ArisService {
   }
 
   private tomtomService = new TomTomService();
-  private locationService = new LocationService();
+  private locationService: LocationService = sharedLocationService;
   private weatherService = new WeatherService();
   private sunbirdService = new SunbirdService();
   private newsService = new NewsService();
@@ -123,6 +123,7 @@ export class ArisService {
     "tomtom_flow",
     "tomtom_incidents",
     "tomtom_traffic",
+    "tomtom_nearby",
     "weather_geocoding",
     "weather_forecast",
     "weather_historical",
@@ -685,7 +686,7 @@ export class ArisService {
   }
 
   private isCurrentLocationRequest(message: string): boolean {
-    return /\b(?:where\s+am\s+i(?:\s+located)?|where\s+am\s+i\s+right\s+now|do\s+you\s+know\s+(?:my\s+)?(?:current\s+)?location|do\s+you\s+know\s+where\s+i\s+am|can\s+you\s+(?:tell|find)\s+(?:me\s+)?(?:my\s+)?(?:current\s+)?location|what(?:'s| is)?\s+my\s+(?:current\s+)?location|my\s+current\s+location)\b/i.test(message);
+    return /\b(?:where\s+am\s+i(?:\s+located)?|where\s+am\s+i\s+right\s+now|do\s+you\s+know\s+(?:my\s+)?(?:current\s+)?location|do\s+you\s+know\s+where\s+i\s+am|can\s+you\s+(?:tell|find)\s+(?:me\s+)?(?:my\s+)?(?:current\s+)?(?:location|coordinates)|what(?:'s| is)?\s+my\s+(?:current\s+)?(?:location|coordinates)|my\s+current\s+(?:location|coordinates)|(?:exact|precise)\s+(?:gps\s+)?coordinates)\b/i.test(message);
   }
 
   private formatCurrentDateTime(timeZone?: string): string {
@@ -714,7 +715,7 @@ export class ArisService {
     sessionId: string,
     userMessage: string
   ): Promise<ArisResponse> {
-    const location = await this.locationService.getCurrentLocation();
+    const location = await this.locationService.getCurrentLocation(false, userId);
     const locationLabel = [location?.city, location?.country].filter(Boolean).join(", ");
     const localTime = this.formatCurrentDateTime(location?.timezone);
     const arisReply = locationLabel
@@ -730,13 +731,26 @@ export class ArisService {
     sessionId: string,
     userMessage: string
   ): Promise<ArisResponse> {
-    const location = await this.locationService.getCurrentLocation();
-    const locationLabel = [location?.city, location?.regionName, location?.country]
+    const location = await this.locationService.getCurrentLocation(false, userId);
+    let reverseGeocodedLabel: string | undefined;
+    if (location?.source === "android" && location.lat !== undefined && location.lon !== undefined) {
+      try {
+        reverseGeocodedLabel = (await this.tomtomService.reverseGeocode({ lat: location.lat, lon: location.lon }))?.displayName;
+      } catch (err) {
+        error("[arisService] phone location reverse geocoding failed", err);
+      }
+    }
+    const locationLabel = [reverseGeocodedLabel || location?.city, location?.regionName, location?.country]
       .filter((part, index, parts) => Boolean(part) && parts.indexOf(part) === index)
       .join(", ");
-    const arisReply = locationLabel
-      ? `Based on your network location, you appear to be in ${locationLabel}.`
-      : "I couldn't determine your current location from the available network location data.";
+    const coordinates = location?.lat !== undefined && location?.lon !== undefined
+      ? `${location.lat.toFixed(6)}, ${location.lon.toFixed(6)}`
+      : undefined;
+    const arisReply = location?.source === "android" && coordinates
+      ? `Your phone places you at ${coordinates}${locationLabel ? ` (${locationLabel})` : ""}${location.accuracyMeters !== undefined ? `, with an estimated accuracy of about ${Math.round(location.accuracyMeters)} m` : ""}.`
+      : locationLabel
+        ? `Based on approximate network location, you appear to be in ${locationLabel}${coordinates ? ` (roughly ${coordinates})` : ""}.`
+        : "I couldn't determine your current location. Allow location access in the Android app and try again for phone GPS coordinates.";
 
     await this.persistDirectChatExchange(userId, sessionId, userMessage, arisReply);
     return { arisReply, memoryUpdates: [], status: "finished" };
@@ -2394,13 +2408,20 @@ export class ArisService {
     if (toolName === "tomtom_route") {
       try {
         const payload = invocation.payload || {};
-        const origin = payload.origin || payload.from || payload.start;
+        let origin = payload.origin || payload.from || payload.start;
         const destination = payload.destination || payload.to || payload.end;
         const mode = payload.mode || payload.travelMode || "car";
         const departureTime = payload.departureTime || payload.when || payload.time;
 
-        if (!origin || !destination) {
-          return { success: false, tool: toolName, error: "TomTom route tool requires both origin and destination." };
+        if (!destination) {
+          return { success: false, tool: toolName, error: "TomTom route tool requires a destination." };
+        }
+        if (!origin) {
+          const currentLocation = await this.locationService.getCurrentLocation(false, userId);
+          if (currentLocation?.lat === undefined || currentLocation.lon === undefined) {
+            return { success: false, tool: toolName, error: "No current location is available for the route origin." };
+          }
+          origin = { lat: currentLocation.lat, lon: currentLocation.lon };
         }
 
         const data = await this.tomtomService.getTrafficRoute(origin, destination, { mode, departureTime });
@@ -2415,9 +2436,14 @@ export class ArisService {
     if (toolName === "tomtom_flow") {
       try {
         const payload = invocation.payload || {};
-        const location = payload.location || payload.query || payload.place || payload.point || payload.address;
-        if (!location) {
-          return { success: false, tool: toolName, error: "TomTom flow tool requires a location or traffic query." };
+        const requestedLocation = payload.location || payload.query || payload.place || payload.point || payload.address;
+        let location = requestedLocation;
+        if (!requestedLocation || this.isCurrentLocationReference(String(requestedLocation))) {
+          const currentLocation = await this.locationService.getCurrentLocation(false, userId);
+          if (currentLocation?.lat === undefined || currentLocation.lon === undefined) {
+            return { success: false, tool: toolName, error: "No current location is available for traffic lookup." };
+          }
+          location = { lat: currentLocation.lat, lon: currentLocation.lon };
         }
 
         const data = await this.tomtomService.getTrafficFlow(location);
@@ -2432,15 +2458,20 @@ export class ArisService {
     if (toolName === "tomtom_incidents") {
       try {
         const payload = invocation.payload || {};
-        const location = payload.location || payload.query || payload.place || payload.bbox || payload.area;
+        const requestedLocation = payload.location || payload.query || payload.place || payload.bbox || payload.area;
+        let location = requestedLocation;
         const options = {
           categoryFilter: payload.categoryFilter,
           timeValidityFilter: payload.timeValidityFilter,
           language: payload.language,
         };
 
-        if (!location) {
-          return { success: false, tool: toolName, error: "TomTom incidents tool requires a location, area, or bbox." };
+        if (!requestedLocation || this.isCurrentLocationReference(String(requestedLocation))) {
+          const currentLocation = await this.locationService.getCurrentLocation(false, userId);
+          if (currentLocation?.lat === undefined || currentLocation.lon === undefined) {
+            return { success: false, tool: toolName, error: "No current location is available for incident lookup." };
+          }
+          location = { lat: currentLocation.lat, lon: currentLocation.lon };
         }
 
         const incidentLocation = payload.bbox ? { bbox: payload.bbox, label: payload.location || payload.place } : location;
@@ -2456,7 +2487,7 @@ export class ArisService {
     if (toolName === "tomtom_traffic") {
       try {
         const payload = invocation.payload || {};
-        const origin = payload.origin || payload.from || payload.start;
+        let origin = payload.origin || payload.from || payload.start;
         const destination = payload.destination || payload.to || payload.end;
         const query = payload.query || payload.text || payload.message;
         const mode = payload.mode || payload.travelMode || "car";
@@ -2467,9 +2498,27 @@ export class ArisService {
           return { success: false, tool: toolName, error: "TomTom traffic tool requires at least an origin, destination, or traffic query." };
         }
 
-        const data = destination
-          ? await this.tomtomService.getTrafficRoute(origin || "current location", destination, { mode, departureTime })
-          : await this.tomtomService.getTrafficFromQuery(query);
+        let data;
+        if (destination && !origin) {
+          const currentLocation = await this.locationService.getCurrentLocation(false, userId);
+          if (currentLocation?.lat === undefined || currentLocation.lon === undefined) {
+            return { success: false, tool: toolName, error: "No current location is available for the route origin." };
+          }
+          origin = { lat: currentLocation.lat, lon: currentLocation.lon };
+        }
+        if (destination) {
+          data = await this.tomtomService.getTrafficRoute(origin, destination, { mode, departureTime });
+        } else if (this.isCurrentLocationReference(String(query || ""))) {
+          const currentLocation = await this.locationService.getCurrentLocation(false, userId);
+          if (currentLocation?.lat === undefined || currentLocation.lon === undefined) {
+            return { success: false, tool: toolName, error: "No current location is available for traffic lookup." };
+          }
+          data = /\b(incident|accident|roadwork|closure|crash|hazard|breakdown)\b/i.test(String(query))
+            ? await this.tomtomService.getTrafficIncidents({ lat: currentLocation.lat, lon: currentLocation.lon })
+            : await this.tomtomService.getTrafficFlow({ lat: currentLocation.lat, lon: currentLocation.lon });
+        } else {
+          data = await this.tomtomService.getTrafficFromQuery(query);
+        }
 
         const result = { success: true, tool: toolName, data };
         this.recordLastToolInvocation(userId, sessionId, invocation);
@@ -2479,23 +2528,55 @@ export class ArisService {
       }
     }
 
+    if (toolName === "tomtom_nearby") {
+      try {
+        const payload = invocation.payload || {};
+        const query = String(payload.query || payload.category || "").trim();
+        if (!query) {
+          return { success: false, tool: toolName, error: "Nearby-place search requires a place or service type." };
+        }
+        const currentLocation = await this.locationService.getCurrentLocation(false, userId);
+        if (currentLocation?.lat === undefined || currentLocation.lon === undefined) {
+          return { success: false, tool: toolName, error: "No current location is available for nearby-place search." };
+        }
+        const data = await this.tomtomService.getNearbyPlaces(
+          query,
+          { lat: currentLocation.lat, lon: currentLocation.lon },
+          { radiusMeters: payload.radiusMeters, limit: payload.limit }
+        );
+        const result = { success: true, tool: toolName, data };
+        this.recordLastToolInvocation(userId, sessionId, invocation);
+        return result;
+      } catch (err: any) {
+        return { success: false, tool: toolName, error: err?.message || "Nearby-place search failed." };
+      }
+    }
+
     if (toolName.startsWith("weather_") || toolName === "location_ip_details") {
       try {
         const payload = invocation.payload || {};
         let resultData: any;
         
         if (toolName === "location_ip_details") {
-          resultData = await this.locationService.getCurrentLocation(true);
+          resultData = await this.locationService.getCurrentLocation(true, userId);
         } else if (toolName === "weather_geocoding") {
           resultData = await this.weatherService.geocode(payload.name, payload.count);
-        } else if (toolName === "weather_forecast") {
-          resultData = await this.weatherService.getForecast(payload.lat, payload.lon, payload.current, payload.hourly, payload.daily);
-        } else if (toolName === "weather_historical") {
-          resultData = await this.weatherService.getHistorical(payload.lat, payload.lon, payload.start_date, payload.end_date, payload.hourly, payload.daily);
-        } else if (toolName === "weather_air_quality") {
-          resultData = await this.weatherService.getAirQuality(payload.lat, payload.lon, payload.hourly);
-        } else if (toolName === "weather_marine") {
-          resultData = await this.weatherService.getMarine(payload.lat, payload.lon, payload.hourly);
+        } else {
+          const currentLocation = await this.locationService.getCurrentLocation(false, userId);
+          const lat = payload.lat ?? currentLocation?.lat;
+          const lon = payload.lon ?? currentLocation?.lon;
+          if (typeof lat !== "number" || typeof lon !== "number") {
+            return { success: false, tool: toolName, error: "No coordinates are available for this weather request." };
+          }
+          if (toolName === "weather_forecast") {
+            resultData = await this.weatherService.getForecast(lat, lon, payload.current, payload.hourly, payload.daily);
+          } else if (toolName === "weather_historical") {
+            resultData = await this.weatherService.getHistorical(lat, lon, payload.start_date, payload.end_date, payload.hourly, payload.daily);
+          } else if (toolName === "weather_air_quality") {
+            resultData = await this.weatherService.getAirQuality(lat, lon, payload.hourly);
+          } else if (toolName === "weather_marine") {
+            resultData = await this.weatherService.getMarine(lat, lon, payload.hourly);
+          }
         }
 
         const result = { success: true, tool: toolName, data: resultData };
@@ -4132,7 +4213,7 @@ export class ArisService {
       : "No media attachment is present.";
     
     // Inject Live Location Awareness
-    const locationData = await this.locationService.getCurrentLocation();
+    const locationData = await this.locationService.getCurrentLocation(false, userId);
     const locationContext = this.locationService.formatLocationContext(locationData);
     
     // If we have seeded tool results (from an approved action), build a focused
@@ -5361,5 +5442,3 @@ ${this.truncateText(item.content, 1200)}`);
     return `${text.slice(0, maxLength).trim()}...`;
   }
 }
-
-
