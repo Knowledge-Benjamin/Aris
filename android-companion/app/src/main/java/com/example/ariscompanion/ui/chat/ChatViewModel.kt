@@ -11,8 +11,6 @@ import android.net.Uri
 import android.os.Build
 import android.util.Base64
 import android.util.Log
-import com.example.ariscompanion.ServerConfig
-import com.example.ariscompanion.PhoneLocationProvider
 import com.example.ariscompanion.VisionState
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
@@ -34,8 +32,9 @@ import org.json.JSONArray
 import org.json.JSONObject
 
 private const val TAG = "ChatViewModel"
+private const val PREFS_NAME = "aris_chat_prefs"
 private const val PREF_AUTH_TOKEN = "auth_token"
-private const val PREF_SERVER_URL = ServerConfig.SERVER_URL_PREFERENCE
+private const val PREF_SERVER_URL = "server_url"
 private const val PREF_EMAIL = "email"
 private const val PREF_MESSAGES = "chat_messages"
 private const val SESSION_ID = "aris-android-chat"
@@ -45,12 +44,12 @@ private const val WAVEFORM_SAMPLES = 40
 
 class ChatViewModel(private val appContext: Context) : ViewModel() {
 
-    private val prefs: SharedPreferences = appContext.getSharedPreferences(ServerConfig.PREFERENCES_NAME, Context.MODE_PRIVATE)
+    private val prefs: SharedPreferences = appContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
 
     private val _uiState = MutableStateFlow(
         ChatUiState(
             messages = loadPersistedMessages(),
-            serverUrl = ServerConfig.savedBaseUrl(appContext),
+            serverUrl = prefs.getString(PREF_SERVER_URL, "https://impose-persuaded-unjustly.ngrok-free.dev") ?: "https://impose-persuaded-unjustly.ngrok-free.dev",
             email = prefs.getString(PREF_EMAIL, "") ?: "",
             isAuthenticated = prefs.getString(PREF_AUTH_TOKEN, null) != null,
         )
@@ -134,15 +133,6 @@ class ChatViewModel(private val appContext: Context) : ViewModel() {
     private val client: ArisApiClient?
         get() = authToken?.let { ArisApiClient(_uiState.value.serverUrl, it) }
 
-    private suspend fun syncPhoneLocation() {
-        val token = authToken ?: return
-        try {
-            PhoneLocationProvider.uploadCurrentLocation(appContext, _uiState.value.serverUrl, token)
-        } catch (e: Exception) {
-            Log.w(TAG, "Phone location could not be shared; the server will use its network-location fallback", e)
-        }
-    }
-
     // Voice recording state
     private var audioRecord: AudioRecord? = null
     private var recordingJob: Job? = null
@@ -194,22 +184,21 @@ class ChatViewModel(private val appContext: Context) : ViewModel() {
     // ── Login ────────────────────────────────────────────────────────────────
 
     private fun doLogin(serverUrl: String, email: String, password: String) {
-        val normalizedServerUrl = ServerConfig.normalizeBaseUrl(serverUrl)
         _uiState.update { it.copy(isLoggingIn = true, loginError = null) }
         viewModelScope.launch {
             try {
-                val result = ArisApiClient.login(normalizedServerUrl, email, password)
+                val result = ArisApiClient.login(serverUrl, email, password)
                 authToken = result.token
                 prefs.edit()
                     .putString(PREF_AUTH_TOKEN, result.token)
-                    .putString(PREF_SERVER_URL, normalizedServerUrl)
+                    .putString(PREF_SERVER_URL, serverUrl)
                     .putString(PREF_EMAIL, email)
                     .apply()
                 _uiState.update {
                     it.copy(
                         isLoggingIn = false,
                         isAuthenticated = true,
-                        serverUrl = normalizedServerUrl,
+                        serverUrl = serverUrl,
                         email = email,
                         loginError = null,
                     )
@@ -247,7 +236,6 @@ class ChatViewModel(private val appContext: Context) : ViewModel() {
                 }
 
                 var finalResult: ArisChatResult? = null
-                syncPhoneLocation()
                 client?.chatStream(
                     text,
                     SESSION_ID,
@@ -509,7 +497,6 @@ class ChatViewModel(private val appContext: Context) : ViewModel() {
                 val arisId = UUID.randomUUID().toString()
                 appendMessage(ChatMessage(id = arisId, sender = Sender.ARIS, text = "", status = MessageStatus.SENDING))
                 var finalResult: ArisChatResult? = null
-                syncPhoneLocation()
                 client?.chatStream("approved", SESSION_ID, approvedActionPayload) { event ->
                     when (event.type) {
                         "progress" -> _uiState.update { it.copy(progressMessage = event.message) }

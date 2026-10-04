@@ -50,7 +50,7 @@ export async function pollAppOutbox(req: Request, res: Response) {
       body: m.body,
       content: m.body,
       quotedMessage: m.quotedMessage,
-      mediaDriveRef: m.mediaDriveRef,
+      mediaDriveRef: m.mediaGcsUri,
       mediaMimeType: m.mediaMimeType,
       createdAt: m.createdAt.toISOString(),
     }));

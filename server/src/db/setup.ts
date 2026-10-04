@@ -297,10 +297,15 @@ async function setup() {
       body TEXT,
       media_gcs_uri TEXT,
       media_mime_type TEXT,
+      quoted_message JSONB,
       status TEXT NOT NULL DEFAULT 'pending',
       created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
       sent_at TIMESTAMP WITH TIME ZONE
     );
+  `).catch(() => undefined);
+
+  await pool.query(`
+    ALTER TABLE whatsapp_outbox ADD COLUMN IF NOT EXISTS quoted_message JSONB;
   `).catch(() => undefined);
 
   await pool.query(`

@@ -12,7 +12,7 @@ import { WhatsappService } from "./whatsappService";
 import { TomTomService } from "./tomtomService";
 import { upsertContacts, getContactCount, searchContacts as searchContactsDb, getAllContacts, resolveNameToPhones, updateContactProfileSummary } from "../db/contactsStore";
 import { info, error } from "../utils/logger";
-import { LocationService, sharedLocationService } from "./locationService";
+import { sharedLocationService } from "./locationService";
 import { WeatherService } from "./weatherService";
 import { SunbirdService } from "./sunbirdService";
 import { NewsService } from "./newsService";
@@ -89,6 +89,36 @@ export class ArisService {
     return data?.summary ?? data?.text ?? JSON.stringify(data).slice(0, 4000);
   }
 
+  private cleanSpeechText(text: string): string {
+    return text
+      .replace(/```[\s\S]*?```/g, " ")
+      .replace(/!\[([^\]]*)\]\([^)]+\)/g, "$1")
+      .replace(/\[([^\]]+)\]\([^)]+\)/g, "$1")
+      .replace(/https?:\/\/\S+/g, " ")
+      .replace(/[*_~`#>]/g, "")
+      .replace(/\s+/g, " ")
+      .trim();
+  }
+
+  private splitTextForSynthesis(text: string, maxChars = 4000): string[] {
+    const chunks: string[] = [];
+    let remaining = text.trim();
+    while (remaining.length > maxChars) {
+      let splitAt = remaining.lastIndexOf(" ", maxChars);
+      const sentenceBoundary = Math.max(
+        remaining.lastIndexOf(". ", maxChars),
+        remaining.lastIndexOf("? ", maxChars),
+        remaining.lastIndexOf("! ", maxChars),
+      );
+      if (sentenceBoundary > maxChars * 0.6) splitAt = sentenceBoundary + 1;
+      if (splitAt <= 0) splitAt = maxChars;
+      chunks.push(remaining.slice(0, splitAt).trim());
+      remaining = remaining.slice(splitAt).trim();
+    }
+    if (remaining) chunks.push(remaining);
+    return chunks;
+  }
+
   private extractBrowserMediaParts(toolResults: Array<{ invocation: ToolInvocation; result: ToolExecutionResult }>) {
     const parts: Array<{ inlineData: { mimeType: string; data: string } }> = [];
     for (const entry of toolResults) {
@@ -108,7 +138,7 @@ export class ArisService {
   }
 
   private tomtomService = new TomTomService();
-  private locationService: LocationService = sharedLocationService;
+  private locationService = sharedLocationService;
   private weatherService = new WeatherService();
   private sunbirdService = new SunbirdService();
   private newsService = new NewsService();
@@ -123,7 +153,6 @@ export class ArisService {
     "tomtom_flow",
     "tomtom_incidents",
     "tomtom_traffic",
-    "tomtom_nearby",
     "weather_geocoding",
     "weather_forecast",
     "weather_historical",
@@ -367,7 +396,7 @@ export class ArisService {
           extractedAt: new Date().toISOString(),
         }));
       if (entries.length) {
-        await this.memoryStore.storeMemoryEntries(userId, sessionId, entries);
+        await this.storeMemoryEntries(userId, sessionId, entries);
         info(`[arisService] extracted evidence tool=${invocation.tool} entries=${entries.length}`);
       }
     } catch (extractionError: any) {
@@ -379,6 +408,12 @@ export class ArisService {
     const observations = this.getRecentToolObservations(userId, sessionId);
     if (!observations.length) {
       return "FOLLOW-UP CONTEXT: No durable tool observations are available for this user/session.";
+    }
+
+    private async storeMemoryEntries(userId: number | undefined, sessionId: string | undefined, entries: string[]) {
+      for (const entry of entries) {
+        await this.memoryStore.storeMemoryEntry(userId, sessionId, entry);
+      }
     }
 
     const lines = observations.map((observation, index) => [
@@ -490,13 +525,6 @@ export class ArisService {
 
     await this.contextStore.warmCache(this.getContextKey(input.userId, sessionId));
 
-    if (!approvedAction && !input.mediaData && this.isCurrentDateTimeRequest(input.message)) {
-      return this.answerCurrentDateTime(input.userId, sessionId, input.message);
-    }
-    if (!approvedAction && !input.mediaData && this.isCurrentLocationRequest(input.message)) {
-      return this.answerCurrentLocation(input.userId, sessionId, input.message);
-    }
-
     // Auto-sync contacts on first use (when table is empty for this user)
     if (input.userId) {
       this.ensureContactsSynced(input.userId).catch(err =>
@@ -526,7 +554,7 @@ export class ArisService {
 
     const directMemoryEntries = this.extractDirectMemoryEntries(input.message);
     const directMemorySavePromises = directMemoryEntries.length
-      ? [this.memoryStore.storeMemoryEntries(input.userId, sessionId, directMemoryEntries)]
+      ? [this.storeMemoryEntries(input.userId, sessionId, directMemoryEntries)]
       : [];
 
     const userProfilePromise = input.userId 
@@ -642,7 +670,7 @@ export class ArisService {
     }
 
     const memoryStorePromises = memoryEntries.length
-      ? [this.memoryStore.storeMemoryEntries(input.userId, sessionId, memoryEntries)]
+      ? [this.storeMemoryEntries(input.userId, sessionId, memoryEntries)]
       : [];
 
     // Fire-and-forget saving to the database to prevent database timeouts 
@@ -677,107 +705,6 @@ export class ArisService {
     const hasSendOrListen = /(send|listen|play|download|get|deliver)/i.test(normalized);
     const hasWhatsApp = /whatsapp|voice note|audio/i.test(normalized);
     return hasPodcast && (hasNews || hasSendOrListen || hasWhatsApp);
-  }
-
-  private isCurrentDateTimeRequest(message: string): boolean {
-    const asksForAnotherLocation = /\b(?:in|for)\s+(?!my\b|here\b|this\s+area\b|my\s+location\b)[\p{L}]/iu.test(message);
-    return !asksForAnotherLocation &&
-      /\b(?:what(?:'s| is)?\s+(?:the\s+)?time(?:\s+(?:right\s+)?now)?|what\s+time\s+is\s+it(?:\s+(?:right\s+)?now)?|time\s+right\s+now|current\s+time|what(?:'s| is)?\s+(?:the\s+)?date\s+(?:today|right\s+now)|what\s+date\s+is\s+it|today'?s\s+date|current\s+date)\b/i.test(message);
-  }
-
-  private isCurrentLocationRequest(message: string): boolean {
-    return /\b(?:where\s+am\s+i(?:\s+located)?|where\s+am\s+i\s+right\s+now|do\s+you\s+know\s+(?:my\s+)?(?:current\s+)?location|do\s+you\s+know\s+where\s+i\s+am|can\s+you\s+(?:tell|find|give)\s+(?:me\s+)?(?:my\s+)?(?:current\s+)?(?:location|coordinates)|what(?:'s| is| are)?\s+my\s+(?:current\s+)?(?:location|coordinates)|my\s+current\s+(?:location|coordinates)|(?:exact|precise)\s+(?:gps\s+)?coordinates)\b/i.test(message);
-  }
-
-  private formatCurrentDateTime(timeZone?: string): string {
-    const options: Intl.DateTimeFormatOptions = {
-      weekday: "long",
-      year: "numeric",
-      month: "long",
-      day: "numeric",
-      hour: "numeric",
-      minute: "2-digit",
-      timeZoneName: "long",
-    };
-    try {
-      return new Intl.DateTimeFormat("en-US", {
-        ...options,
-        ...(timeZone ? { timeZone } : {}),
-      }).format(new Date());
-    } catch (formatError) {
-      error(`[arisService] invalid location timezone "${timeZone}"; using server timezone`, formatError);
-      return new Intl.DateTimeFormat("en-US", options).format(new Date());
-    }
-  }
-
-  private async answerCurrentDateTime(
-    userId: number | undefined,
-    sessionId: string,
-    userMessage: string
-  ): Promise<ArisResponse> {
-    const location = await this.locationService.getCurrentLocation(false, userId);
-    const locationLabel = [location?.city, location?.country].filter(Boolean).join(", ");
-    const localTime = this.formatCurrentDateTime(location?.timezone);
-    const arisReply = locationLabel
-      ? `It's ${localTime} in ${locationLabel}.`
-      : `It's ${localTime}.`;
-
-    await this.persistDirectChatExchange(userId, sessionId, userMessage, arisReply);
-    return { arisReply, memoryUpdates: [], status: "finished" };
-  }
-
-  private async answerCurrentLocation(
-    userId: number | undefined,
-    sessionId: string,
-    userMessage: string
-  ): Promise<ArisResponse> {
-    const location = await this.locationService.getCurrentLocation(false, userId);
-    let reverseGeocodedLabel: string | undefined;
-    if (location?.source === "android" && location.lat !== undefined && location.lon !== undefined) {
-      try {
-        reverseGeocodedLabel = (await this.tomtomService.reverseGeocode({ lat: location.lat, lon: location.lon }))?.displayName;
-      } catch (err) {
-        error("[arisService] phone location reverse geocoding failed", err);
-      }
-    }
-    const locationLabel = [reverseGeocodedLabel || location?.city, location?.regionName, location?.country]
-      .filter((part, index, parts) => Boolean(part) && parts.indexOf(part) === index)
-      .join(", ");
-    const coordinates = location?.lat !== undefined && location?.lon !== undefined
-      ? `${location.lat.toFixed(6)}, ${location.lon.toFixed(6)}`
-      : undefined;
-    const arisReply = location?.source === "android" && coordinates
-      ? `Your phone places you at ${coordinates}${locationLabel ? ` (${locationLabel})` : ""}${location.accuracyMeters !== undefined ? `, with an estimated accuracy of about ${Math.round(location.accuracyMeters)} m` : ""}.`
-      : locationLabel
-        ? `Based on approximate network location, you appear to be in ${locationLabel}${coordinates ? ` (roughly ${coordinates})` : ""}.`
-        : "I couldn't determine your current location. Allow location access in the Android app and try again for phone GPS coordinates.";
-
-    await this.persistDirectChatExchange(userId, sessionId, userMessage, arisReply);
-    return { arisReply, memoryUpdates: [], status: "finished" };
-  }
-
-  private async persistDirectChatExchange(
-    userId: number | undefined,
-    sessionId: string,
-    userMessage: string,
-    arisReply: string
-  ): Promise<void> {
-    await Promise.all([
-      this.memoryStore.saveConversationMessage({
-        userId,
-        sessionId,
-        role: "user",
-        content: userMessage,
-      }),
-      this.memoryStore.saveConversationMessage({
-        userId,
-        sessionId,
-        role: "aris",
-        content: arisReply,
-      }),
-    ]).catch((saveError) => {
-      error("[arisService] failed to persist direct response", saveError);
-    });
   }
 
   private isFinalModelResponse(response: { reply: string; isFinalAnswer?: boolean }): boolean {
@@ -1226,7 +1153,7 @@ export class ArisService {
         `Stories: ${JSON.stringify(news)}`,
       ].join("\n");
       const scriptResponse = await this.gemmaService.requestArisAdvice(summaryPrompt);
-      const script = this.voiceService.cleanSpeechText(scriptResponse.reply);
+      const script = this.cleanSpeechText(scriptResponse.reply);
       if (!script || script.length < 40) {
         throw new Error("News brief script generation returned too little text.");
       }
@@ -2408,20 +2335,13 @@ export class ArisService {
     if (toolName === "tomtom_route") {
       try {
         const payload = invocation.payload || {};
-        let origin = payload.origin || payload.from || payload.start;
+        const origin = payload.origin || payload.from || payload.start;
         const destination = payload.destination || payload.to || payload.end;
         const mode = payload.mode || payload.travelMode || "car";
         const departureTime = payload.departureTime || payload.when || payload.time;
 
-        if (!destination) {
-          return { success: false, tool: toolName, error: "TomTom route tool requires a destination." };
-        }
-        if (!origin) {
-          const currentLocation = await this.locationService.getCurrentLocation(false, userId);
-          if (currentLocation?.lat === undefined || currentLocation.lon === undefined) {
-            return { success: false, tool: toolName, error: "No current location is available for the route origin." };
-          }
-          origin = { lat: currentLocation.lat, lon: currentLocation.lon };
+        if (!origin || !destination) {
+          return { success: false, tool: toolName, error: "TomTom route tool requires both origin and destination." };
         }
 
         const data = await this.tomtomService.getTrafficRoute(origin, destination, { mode, departureTime });
@@ -2436,21 +2356,12 @@ export class ArisService {
     if (toolName === "tomtom_flow") {
       try {
         const payload = invocation.payload || {};
-        const requestedLocation = payload.location || payload.query || payload.place || payload.point || payload.address;
-        let location = requestedLocation;
-        if (!requestedLocation || this.isCurrentLocationReference(String(requestedLocation))) {
-          const currentLocation = await this.locationService.getCurrentLocation(false, userId);
-          if (currentLocation?.lat === undefined || currentLocation.lon === undefined) {
-            return { success: false, tool: toolName, error: "No current location is available for traffic lookup." };
-          }
-          location = { lat: currentLocation.lat, lon: currentLocation.lon };
+        const location = payload.location || payload.query || payload.place || payload.point || payload.address;
+        if (!location) {
+          return { success: false, tool: toolName, error: "TomTom flow tool requires a location or traffic query." };
         }
 
-        const data = typeof requestedLocation === "string" &&
-          payload.query === requestedLocation &&
-          !this.isCurrentLocationReference(requestedLocation)
-          ? await this.tomtomService.getTrafficFromQuery(requestedLocation)
-          : await this.tomtomService.getTrafficFlow(location);
+        const data = await this.tomtomService.getTrafficFlow(location);
         const result = { success: true, tool: toolName, data };
         this.recordLastToolInvocation(userId, sessionId, invocation);
         return result;
@@ -2462,20 +2373,15 @@ export class ArisService {
     if (toolName === "tomtom_incidents") {
       try {
         const payload = invocation.payload || {};
-        const requestedLocation = payload.location || payload.query || payload.place || payload.bbox || payload.area;
-        let location = requestedLocation;
+        const location = payload.location || payload.query || payload.place || payload.bbox || payload.area;
         const options = {
           categoryFilter: payload.categoryFilter,
           timeValidityFilter: payload.timeValidityFilter,
           language: payload.language,
         };
 
-        if (!requestedLocation || this.isCurrentLocationReference(String(requestedLocation))) {
-          const currentLocation = await this.locationService.getCurrentLocation(false, userId);
-          if (currentLocation?.lat === undefined || currentLocation.lon === undefined) {
-            return { success: false, tool: toolName, error: "No current location is available for incident lookup." };
-          }
-          location = { lat: currentLocation.lat, lon: currentLocation.lon };
+        if (!location) {
+          return { success: false, tool: toolName, error: "TomTom incidents tool requires a location, area, or bbox." };
         }
 
         const incidentLocation = payload.bbox ? { bbox: payload.bbox, label: payload.location || payload.place } : location;
@@ -2491,7 +2397,7 @@ export class ArisService {
     if (toolName === "tomtom_traffic") {
       try {
         const payload = invocation.payload || {};
-        let origin = payload.origin || payload.from || payload.start;
+        const origin = payload.origin || payload.from || payload.start;
         const destination = payload.destination || payload.to || payload.end;
         const query = payload.query || payload.text || payload.message;
         const mode = payload.mode || payload.travelMode || "car";
@@ -2502,57 +2408,15 @@ export class ArisService {
           return { success: false, tool: toolName, error: "TomTom traffic tool requires at least an origin, destination, or traffic query." };
         }
 
-        let data;
-        if (destination && !origin) {
-          const currentLocation = await this.locationService.getCurrentLocation(false, userId);
-          if (currentLocation?.lat === undefined || currentLocation.lon === undefined) {
-            return { success: false, tool: toolName, error: "No current location is available for the route origin." };
-          }
-          origin = { lat: currentLocation.lat, lon: currentLocation.lon };
-        }
-        if (destination) {
-          data = await this.tomtomService.getTrafficRoute(origin, destination, { mode, departureTime });
-        } else if (this.isCurrentLocationReference(String(query || ""))) {
-          const currentLocation = await this.locationService.getCurrentLocation(false, userId);
-          if (currentLocation?.lat === undefined || currentLocation.lon === undefined) {
-            return { success: false, tool: toolName, error: "No current location is available for traffic lookup." };
-          }
-          data = /\b(incident|accident|roadwork|closure|crash|hazard|breakdown)\b/i.test(String(query))
-            ? await this.tomtomService.getTrafficIncidents({ lat: currentLocation.lat, lon: currentLocation.lon })
-            : await this.tomtomService.getTrafficFlow({ lat: currentLocation.lat, lon: currentLocation.lon });
-        } else {
-          data = await this.tomtomService.getTrafficFromQuery(query);
-        }
+        const data = destination
+          ? await this.tomtomService.getTrafficRoute(origin || "current location", destination, { mode, departureTime })
+          : await this.tomtomService.getTrafficFromQuery(query);
 
         const result = { success: true, tool: toolName, data };
         this.recordLastToolInvocation(userId, sessionId, invocation);
         return result;
       } catch (err: any) {
         return { success: false, tool: toolName, error: err?.message || "TomTom traffic execution failed." };
-      }
-    }
-
-    if (toolName === "tomtom_nearby") {
-      try {
-        const payload = invocation.payload || {};
-        const query = String(payload.query || payload.category || "").trim();
-        if (!query) {
-          return { success: false, tool: toolName, error: "Nearby-place search requires a place or service type." };
-        }
-        const currentLocation = await this.locationService.getCurrentLocation(false, userId);
-        if (currentLocation?.lat === undefined || currentLocation.lon === undefined) {
-          return { success: false, tool: toolName, error: "No current location is available for nearby-place search." };
-        }
-        const data = await this.tomtomService.getNearbyPlaces(
-          query,
-          { lat: currentLocation.lat, lon: currentLocation.lon },
-          { radiusMeters: payload.radiusMeters, limit: payload.limit }
-        );
-        const result = { success: true, tool: toolName, data };
-        this.recordLastToolInvocation(userId, sessionId, invocation);
-        return result;
-      } catch (err: any) {
-        return { success: false, tool: toolName, error: err?.message || "Nearby-place search failed." };
       }
     }
 
@@ -2565,27 +2429,14 @@ export class ArisService {
           resultData = await this.locationService.getCurrentLocation(true, userId);
         } else if (toolName === "weather_geocoding") {
           resultData = await this.weatherService.geocode(payload.name, payload.count);
-        } else {
-          const currentLocation = await this.locationService.getCurrentLocation(false, userId);
-          const hasLatitude = payload.lat !== undefined;
-          const hasLongitude = payload.lon !== undefined;
-          if (hasLatitude !== hasLongitude) {
-            return { success: false, tool: toolName, error: "Weather coordinates must include both latitude and longitude." };
-          }
-          const lat = hasLatitude ? payload.lat : currentLocation?.lat;
-          const lon = hasLongitude ? payload.lon : currentLocation?.lon;
-          if (typeof lat !== "number" || typeof lon !== "number") {
-            return { success: false, tool: toolName, error: "No coordinates are available for this weather request." };
-          }
-          if (toolName === "weather_forecast") {
-            resultData = await this.weatherService.getForecast(lat, lon, payload.current, payload.hourly, payload.daily);
-          } else if (toolName === "weather_historical") {
-            resultData = await this.weatherService.getHistorical(lat, lon, payload.start_date, payload.end_date, payload.hourly, payload.daily);
-          } else if (toolName === "weather_air_quality") {
-            resultData = await this.weatherService.getAirQuality(lat, lon, payload.hourly);
-          } else if (toolName === "weather_marine") {
-            resultData = await this.weatherService.getMarine(lat, lon, payload.hourly);
-          }
+        } else if (toolName === "weather_forecast") {
+          resultData = await this.weatherService.getForecast(payload.lat, payload.lon, payload.current, payload.hourly, payload.daily);
+        } else if (toolName === "weather_historical") {
+          resultData = await this.weatherService.getHistorical(payload.lat, payload.lon, payload.start_date, payload.end_date, payload.hourly, payload.daily);
+        } else if (toolName === "weather_air_quality") {
+          resultData = await this.weatherService.getAirQuality(payload.lat, payload.lon, payload.hourly);
+        } else if (toolName === "weather_marine") {
+          resultData = await this.weatherService.getMarine(payload.lat, payload.lon, payload.hourly);
         }
 
         const result = { success: true, tool: toolName, data: resultData };
@@ -2651,7 +2502,7 @@ export class ArisService {
           ? "whatsapp"
           : requestedDestination || "download";
         const rawText = String(invocation.payload.text);
-        const text = this.voiceService.cleanSpeechText(rawText);
+        const text = this.cleanSpeechText(rawText);
         info(`[arisService] audio_generate cleaned speech rawChars=${rawText.length} speechChars=${text.length}`);
         if (!text || text === "..." || text === "…" || text.length < 3) {
           return { success: false, tool: toolName, error: "Audio text must contain the actual brief or message, not a placeholder." };
@@ -2659,7 +2510,7 @@ export class ArisService {
         const isAppSession = sessionId?.startsWith("aris-android") || sessionId === "aris-android-chat";
         const encoding = (destination === "whatsapp") ? "OGG_OPUS" : "MP3";
         const speechChunks = destination === "whatsapp"
-          ? this.voiceService.splitTextForSynthesis(text)
+          ? this.splitTextForSynthesis(text)
           : [text];
         if (destination !== "whatsapp" && text.length > 11000) {
           return {
@@ -2691,8 +2542,8 @@ export class ArisService {
           const existingAudio = await audioContextStore.getRecentForUser(userId, 50);
           const matchingAudio = existingAudio.find((record) => this.isReusableAudioMatch(stableAudioType, record));
           if (matchingAudio) {
-            const { getSelfJidForUser } = await import("../db/whatsappAuthStore");
-            const selfJid = await getSelfJidForUser(userId);
+            const { getSelfJid } = await import("../db/whatsappAuthStore");
+            const selfJid = await getSelfJid();
             if (!selfJid) {
               return { success: false, tool: toolName, error: "Connect your WhatsApp self-chat before sending a voice note." };
             }
@@ -2766,8 +2617,8 @@ export class ArisService {
           return { success: true, tool: toolName, data: { summary: `Audio emailed to ${to}.`, messageId: sent.id } };
         }
 
-        const { getSelfJidForUser } = await import("../db/whatsappAuthStore");
-        const selfJid = await getSelfJidForUser(userId);
+        const { getSelfJid } = await import("../db/whatsappAuthStore");
+        const selfJid = await getSelfJid();
         if (!selfJid) {
           return { success: false, tool: toolName, error: "Connect your WhatsApp self-chat before sending a voice note." };
         }
@@ -3869,7 +3720,6 @@ export class ArisService {
     const calendarKeywords = /\b(calendar|appointment|meeting|schedule|event|events|availability|today|tomorrow|next week|next month|this week|next month)\b/i;
     const newsKeywords = /\b(news|headlines|current events|world events|breaking news|today's news|today news|news brief|news podcast|podcast episode)\b/i;
     const trafficKeywords = /\b(traffic|trafic|commute|congestion|route|ETA|estimated arrival|travel time|delay|jam|accident|roadwork|road work|gridlock|rush hour|leave now|leave at|when should I leave|how long will it take)\b/i;
-    const nearbyIntent = /\b(near me|nearby|near here|closest|nearest|around me|close to me|in my area)\b/i;
     const searchKeywords = /\b(search|look up|find|research|what is|who is|where is|latest|current|news|today's|today|tomorrow)\b/i;
     const retryKeywords = /\b(try again|retry|again|repeat|re-run|rerun|run again)\b/i;
     const anaphoraRef = /\b(this|that|it|same|previous|recent|last|first|second|third|fourth|fifth|the one|the other|those|these)\b/i;
@@ -3935,16 +3785,6 @@ export class ArisService {
 
     if (calendarKeywords.test(normalized)) {
       return { tool: "google_calendar_events", payload: { maxResults: 10 } };
-    }
-
-    if (nearbyIntent.test(normalized) && !trafficKeywords.test(normalized) && !/\b(weather|forecast|rain|temperature|air quality)\b/i.test(normalized)) {
-      const query = normalized
-        .replace(/\b(?:near me|nearby|near here|closest|nearest|around me|close to me|in my area)\b/gi, " ")
-        .replace(/\b(?:find|show|list|locate|what are|where are|is there|are there|the|a|an|good|best)\b/gi, " ")
-        .replace(/[?.!,]/g, " ")
-        .replace(/\s+/g, " ")
-        .trim() || "services";
-      return { tool: "tomtom_nearby", payload: { query, radiusMeters: 5000, limit: 10 } };
     }
 
     if (trafficKeywords.test(normalized)) {
@@ -4128,9 +3968,6 @@ export class ArisService {
     if (this.hasFuzzyMatch(allWords, ["whatsapp", "wa", "chat"])) categories.add("whatsapp");
     if (this.hasFuzzyMatch(allWords, ["traffic", "route", "commute", "drive", "directions", "eta"])) categories.add("traffic");
     if (this.hasFuzzyMatch(allWords, ["weather", "forecast", "air", "quality", "marine", "ocean", "rain", "temperature", "temp", "cold", "hot"])) categories.add("weather");
-    if (/\b(near me|nearby|near here|closest|nearest|around me|close to me|in my area|location|coordinates)\b/i.test(msgOnly)) {
-      categories.add("location");
-    }
     if (
       this.hasFuzzyMatch(allWords, ["join", "meet", "zoom", "meeting", "notetaker", "notes"]) &&
       (textToAnalyze.includes("meet.google.com") || textToAnalyze.includes("zoom.us") || textToAnalyze.includes("join") )
@@ -4143,16 +3980,6 @@ export class ArisService {
     }
 
     return categories;
-  }
-
-  private isCurrentLocationReference(query: string): boolean {
-    if (/\b(?:near me|around me|nearby|near here|close to me|in my area|my location|current location|here)\b/i.test(query)) {
-      return true;
-    }
-    if (/\b(?:in|near|around|at|from|to|on)\s+(?!me\b|here\b|my area\b|my location\b)[a-z0-9]/i.test(query)) {
-      return false;
-    }
-    return /\b(?:traffic|incidents?|accidents?|roadworks?|closures?|crashes?|hazards?|breakdowns?)\b/i.test(query);
   }
 
   private async executeToolChain(
@@ -4186,7 +4013,7 @@ export class ArisService {
       await this.recordToolObservation(userId, sessionId, approvedAction, result);
     }
     const activeCategories = this.determineToolCategories(userMessage, conversationHistory);
-    if (!includeSearch) activeCategories.delete("search");
+    if (includeSearch) activeCategories.add("search");
 
     let initialInvocations = approvedAction
       ? []
@@ -5119,13 +4946,6 @@ export class ArisService {
       ""
     ] : [];
 
-    const locationInstructions = activeCategories.has("location") ? [
-      `For nearby places or services, use tomtom_nearby with a concise POI query such as "pharmacy", "restaurant", or "fuel station".`,
-      `Search relative to the coordinates in Current User Location; do not substitute a web search for a nearby-place lookup.`,
-      `Example: {"tool":"tomtom_nearby","query":"pharmacy","radiusMeters":5000,"limit":10}`,
-      ""
-    ] : [];
-
     const whatsappInstructions = activeCategories.has("whatsapp") ? [
       `WHATSAPP TOOL ROUTING — choose the correct tool based on the user's intent:`,
       `  - whatsapp_summary   → "any new messages?", "check WhatsApp", "unread messages". RUNS the service to pull FRESH messages.`,
@@ -5292,7 +5112,6 @@ export class ArisService {
       ...searchInstructions,
       ...trafficInstructions,
       ...weatherInstructions,
-      ...locationInstructions,
       ...whatsappInstructions,
       ...briefingInstructions,
       ...googleInstructions,
@@ -5483,3 +5302,5 @@ ${this.truncateText(item.content, 1200)}`);
     return `${text.slice(0, maxLength).trim()}...`;
   }
 }
+
+

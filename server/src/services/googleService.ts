@@ -2,6 +2,7 @@ import dotenv from "dotenv";
 import path from "path";
 import { google } from "googleapis";
 import type { OAuth2Client } from "google-auth-library";
+import { Readable } from "stream";
 import { GoogleAccountRecord } from "../db/googleAccountStore";
 import { info, error } from "../utils/logger";
 
@@ -22,6 +23,7 @@ const DEFAULT_SCOPES = [
   "https://mail.google.com",
   "https://www.googleapis.com/auth/calendar",
   "https://www.googleapis.com/auth/calendar.events",
+  "https://www.googleapis.com/auth/drive.file",
   "https://www.googleapis.com/auth/contacts.readonly",
   "openid",
   "email",
@@ -54,6 +56,43 @@ function buildExplicitGoogleAuthUrl(clientId: string, redirectUri: string): stri
 }
 
 export class GoogleService {
+  async uploadDriveFile(
+    account: GoogleAccountRecord,
+    fileName: string,
+    mimeType: string,
+    content: Buffer,
+    tokenUpdateHandler?: (tokens: {
+      access_token?: string | null;
+      refresh_token?: string | null;
+      expiry_date?: number | null;
+      scope?: string | null;
+    }) => Promise<void>,
+    makePublic = false
+  ) {
+    if (!fileName.trim() || !mimeType.trim() || content.length === 0) {
+      throw new Error("Google Drive uploads require a filename, MIME type, and non-empty content.");
+    }
+
+    const authClient = this.buildAuthenticatedClient(account, tokenUpdateHandler);
+    const drive = google.drive({ version: "v3", auth: authClient });
+    const uploaded = await drive.files.create({
+      requestBody: { name: fileName, mimeType },
+      media: { mimeType, body: Readable.from(content) },
+      fields: "id,name,mimeType,webViewLink,webContentLink",
+      supportsAllDrives: true,
+    });
+
+    if (makePublic && uploaded.data.id) {
+      await drive.permissions.create({
+        fileId: uploaded.data.id,
+        requestBody: { type: "anyone", role: "reader" },
+        supportsAllDrives: true,
+      });
+    }
+
+    return uploaded.data;
+  }
+
   createAuthUrl(redirectUriOverride?: string): string {
     const { clientId, redirectUri } = getGoogleEnvConfig();
     const effectiveRedirectUri = redirectUriOverride?.trim() || redirectUri;

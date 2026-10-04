@@ -120,8 +120,6 @@ export class LocationService {
     }
   }
 
-  export const sharedLocationService = new LocationService();
-
   formatLocationContext(loc: LocationData | null): string {
     if (!loc) return "Current User Location: Unknown";
 
@@ -146,3 +144,5 @@ export class LocationService {
     return `Current User Location: ${parts.join(". ")}`;
   }
 }
+
+export const sharedLocationService = new LocationService();
