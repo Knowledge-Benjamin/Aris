@@ -5,6 +5,7 @@ import makeWASocket, {
   AnyMessageContent,
   WASocket,
   fetchLatestBaileysVersion,
+  fetchLatestWaWebVersion,
   proto,
   downloadMediaMessage,
   jidNormalizedUser,
