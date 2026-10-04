@@ -12,9 +12,18 @@ export interface ToolInvocationRecord {
   payload: any;
 }
 
+export interface ToolObservationRecord {
+  tool: string;
+  payload: unknown;
+  success: boolean;
+  summary: string;
+  recordedAt: string;
+}
+
 export interface SessionContext {
   recentGmailMessages: GmailMessageSummary[];
   lastToolInvocation: ToolInvocationRecord | undefined;
+  recentToolObservations: ToolObservationRecord[];
 }
 
 /**
@@ -39,7 +48,7 @@ export class ContextStore {
 
     try {
       const result = await this.pool.query(
-        `SELECT recent_gmail_messages, last_tool_invocation
+        `SELECT recent_gmail_messages, last_tool_invocation, recent_tool_observations
          FROM session_context
          WHERE context_key = $1`,
         [key]
@@ -49,13 +58,22 @@ export class ContextStore {
         this.cache.set(key, {
           recentGmailMessages: result.rows[0].recent_gmail_messages ?? [],
           lastToolInvocation: result.rows[0].last_tool_invocation ?? undefined,
+          recentToolObservations: result.rows[0].recent_tool_observations ?? [],
         });
       } else {
-        this.cache.set(key, { recentGmailMessages: [], lastToolInvocation: undefined });
+        this.cache.set(key, {
+          recentGmailMessages: [],
+          lastToolInvocation: undefined,
+          recentToolObservations: [],
+        });
       }
     } catch {
       // On DB error, initialise to empty so the caller still works.
-      this.cache.set(key, { recentGmailMessages: [], lastToolInvocation: undefined });
+      this.cache.set(key, {
+        recentGmailMessages: [],
+        lastToolInvocation: undefined,
+        recentToolObservations: [],
+      });
     }
   }
 
@@ -67,8 +85,16 @@ export class ContextStore {
     return this.cache.get(key)?.lastToolInvocation;
   }
 
+  getRecentToolObservations(key: string): ToolObservationRecord[] {
+    return this.cache.get(key)?.recentToolObservations ?? [];
+  }
+
   async setRecentGmailMessages(key: string, messages: GmailMessageSummary[]): Promise<void> {
-    const existing = this.cache.get(key) ?? { recentGmailMessages: [], lastToolInvocation: undefined };
+    const existing = this.cache.get(key) ?? {
+      recentGmailMessages: [],
+      lastToolInvocation: undefined,
+      recentToolObservations: [],
+    };
     this.cache.set(key, { ...existing, recentGmailMessages: messages });
 
     try {
@@ -86,7 +112,11 @@ export class ContextStore {
   }
 
   async setLastToolInvocation(key: string, invocation: ToolInvocationRecord): Promise<void> {
-    const existing = this.cache.get(key) ?? { recentGmailMessages: [], lastToolInvocation: undefined };
+    const existing = this.cache.get(key) ?? {
+      recentGmailMessages: [],
+      lastToolInvocation: undefined,
+      recentToolObservations: [],
+    };
     this.cache.set(key, { ...existing, lastToolInvocation: invocation });
 
     try {
@@ -99,6 +129,28 @@ export class ContextStore {
       );
     } catch {
       // DB write failure is non-fatal.
+    }
+  }
+
+  async setRecentToolObservation(key: string, observation: ToolObservationRecord): Promise<void> {
+    const existing = this.cache.get(key) ?? {
+      recentGmailMessages: [],
+      lastToolInvocation: undefined,
+      recentToolObservations: [],
+    };
+    const observations = [...existing.recentToolObservations, observation].slice(-12);
+    this.cache.set(key, { ...existing, recentToolObservations: observations });
+
+    try {
+      await this.pool.query(
+        `INSERT INTO session_context (context_key, recent_tool_observations, updated_at)
+         VALUES ($1, $2::jsonb, NOW())
+         ON CONFLICT (context_key)
+         DO UPDATE SET recent_tool_observations = $2::jsonb, updated_at = NOW()`,
+        [key, JSON.stringify(observations)]
+      );
+    } catch {
+      // Keep the in-memory context usable if the database write fails.
     }
   }
 }

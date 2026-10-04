@@ -9,6 +9,7 @@ import rateLimit from "express-rate-limit";
 
 export const app = express();
 
+app.set("trust proxy", 1);
 app.use(json({ limit: "50mb" }));
 
 // Tighten CORS

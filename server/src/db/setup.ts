@@ -83,9 +83,15 @@ async function setup() {
       context_key VARCHAR(255) PRIMARY KEY,
       recent_gmail_messages JSONB DEFAULT '[]',
       last_tool_invocation JSONB,
+      recent_tool_observations JSONB NOT NULL DEFAULT '[]',
       updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     );
   `).catch(() => undefined);
+
+  await pool.query(`
+    ALTER TABLE session_context
+    ADD COLUMN IF NOT EXISTS recent_tool_observations JSONB NOT NULL DEFAULT '[]';
+  `);
 
   await pool.query(`
     CREATE TABLE IF NOT EXISTS news_research_records (
