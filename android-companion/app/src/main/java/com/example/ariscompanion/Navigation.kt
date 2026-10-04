@@ -9,6 +9,7 @@ import androidx.navigation3.runtime.entryProvider
 import androidx.navigation3.runtime.rememberNavBackStack
 import androidx.navigation3.ui.NavDisplay
 import com.example.ariscompanion.ui.main.MainScreen
+import com.example.ariscompanion.ui.chat.ChatScreen
 
 @Composable
 fun MainNavigation() {
@@ -21,6 +22,12 @@ fun MainNavigation() {
       entryProvider {
         entry<Main> {
           MainScreen(onItemClick = { navKey -> backStack.add(navKey) }, modifier = Modifier.safeDrawingPadding().padding(16.dp))
+        }
+        entry<Chat> {
+          ChatScreen(
+            onBack = { backStack.removeLastOrNull() },
+            modifier = Modifier.safeDrawingPadding(),
+          )
         }
       },
   )

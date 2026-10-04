@@ -150,6 +150,7 @@ fun MainScreen(
             isListening = isListening,
             isVisionActive = isVisionActive,
             amplitude = amplitude,
+            pulseScale = pulseScale,
             isOnline = isOnline,
             notificationCount = notificationCount,
             modifier = Modifier.padding(4.dp),
@@ -277,12 +278,61 @@ fun MainScreen(
 }
 
 private fun startAudioService(context: Context) {
-    val preferences = context.getSharedPreferences("aris_chat_prefs", Context.MODE_PRIVATE)
-    val serverUrl = preferences.getString("server_url", null)
-    val authToken = preferences.getString("auth_token", null)
-    val serviceIntent = Intent(context, SensorStreamService::class.java).apply {
-        if (!serverUrl.isNullOrBlank()) putExtra(SensorStreamService.EXTRA_SERVER_URL, serverUrl)
-        if (!authToken.isNullOrBlank()) putExtra(SensorStreamService.EXTRA_AUTH_TOKEN, authToken)
-    }
+    val serviceIntent = Intent(context, SensorStreamService::class.java)
     ContextCompat.startForegroundService(context, serviceIntent)
+}
+
+@Composable
+private fun ArisCharacter(
+    isListening: Boolean,
+    isVisionActive: Boolean,
+    amplitude: Float,
+    pulseScale: Float,
+    isOnline: Boolean,
+    notificationCount: Int,
+    modifier: Modifier = Modifier,
+) {
+    val pulse = pulseScale * (if (isListening) 1f + (amplitude / 32767f).coerceIn(0f, 1f) * 0.16f else 1f)
+    val characterColor = when {
+        !isOnline -> Color(0xFFFFB86B)
+        isListening -> Color(0xFF00F0FF)
+        isVisionActive -> Color(0xFF00FF88)
+        notificationCount > 0 -> Color(0xFFFF668E)
+        else -> Color(0xFF8A2BE2)
+    }
+
+    Box(
+        modifier = modifier.size(240.dp),
+        contentAlignment = Alignment.Center,
+    ) {
+        Canvas(Modifier.fillMaxSize()) {
+            val radius = size.minDimension * 0.32f
+            drawCircle(
+                color = characterColor.copy(alpha = 0.10f),
+                radius = radius * 1.65f * pulse,
+            )
+            drawCircle(
+                color = characterColor.copy(alpha = 0.20f),
+                radius = radius * 1.3f * pulse,
+            )
+            drawCircle(
+                brush = Brush.radialGradient(
+                    colors = listOf(characterColor.copy(alpha = 0.95f), characterColor.copy(alpha = 0.3f), Color.Transparent),
+                    center = center,
+                    radius = radius * 1.2f * pulse,
+                ),
+                radius = radius * 1.2f * pulse,
+            )
+            drawCircle(
+                color = Color.White.copy(alpha = 0.75f),
+                radius = radius * 0.23f,
+                center = Offset(center.x - radius * 0.27f, center.y - radius * 0.08f),
+            )
+            drawCircle(
+                color = Color.White.copy(alpha = 0.75f),
+                radius = radius * 0.23f,
+                center = Offset(center.x + radius * 0.27f, center.y - radius * 0.08f),
+            )
+        }
+    }
 }

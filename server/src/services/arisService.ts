@@ -410,12 +410,6 @@ export class ArisService {
       return "FOLLOW-UP CONTEXT: No durable tool observations are available for this user/session.";
     }
 
-    private async storeMemoryEntries(userId: number | undefined, sessionId: string | undefined, entries: string[]) {
-      for (const entry of entries) {
-        await this.memoryStore.storeMemoryEntry(userId, sessionId, entry);
-      }
-    }
-
     const lines = observations.map((observation, index) => [
       `${index + 1}. tool=${observation.tool}`,
       `payload=${JSON.stringify(observation.payload)}`,
@@ -429,6 +423,12 @@ export class ArisService {
       "Treat the observations as context, not as a substitute for a fresh read when the user asks for current state.",
       ...lines,
     ].join("\n");
+  }
+
+  private async storeMemoryEntries(userId: number | undefined, sessionId: string | undefined, entries: string[]) {
+    for (const entry of entries) {
+      await this.memoryStore.storeMemoryEntry(userId, sessionId, entry);
+    }
   }
 
   /**
@@ -5302,5 +5302,4 @@ ${this.truncateText(item.content, 1200)}`);
     return `${text.slice(0, maxLength).trim()}...`;
   }
 }
-
 

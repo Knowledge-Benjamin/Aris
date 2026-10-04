@@ -25,12 +25,15 @@ class ArisAccessibilityService : AccessibilityService(), TextToSpeech.OnInitList
     private var tts: TextToSpeech? = null
     private var windowManager: WindowManager? = null
     private var overlayView: TextView? = null
+    private var floatingArisEnabled = false
     private val mainHandler = Handler(Looper.getMainLooper())
 
     override fun onServiceConnected() {
         super.onServiceConnected()
         Log.d("ArisAccessibility", "Service Connected!")
         AccessibilityState.activeService = this
+        floatingArisEnabled = getSharedPreferences("aris_chat_prefs", MODE_PRIVATE)
+            .getBoolean("floating_aris_enabled", false)
         
         tts = TextToSpeech(this, this)
         setupOverlay()
@@ -52,7 +55,8 @@ class ArisAccessibilityService : AccessibilityService(), TextToSpeech.OnInitList
             setBackgroundColor(Color.parseColor("#CC07070B")) // Semi-transparent dark
             setPadding(32, 16, 32, 16)
             gravity = Gravity.CENTER
-            alpha = 0f // Hidden by default
+            alpha = if (floatingArisEnabled) 1f else 0f
+            text = if (floatingArisEnabled) "Aris is ready" else "Aris Autonomy Active"
         }
 
         val params = WindowManager.LayoutParams(
@@ -85,13 +89,23 @@ class ArisAccessibilityService : AccessibilityService(), TextToSpeech.OnInitList
         // Show Overlay
         mainHandler.post {
             overlayView?.text = "Aris: $message"
-            overlayView?.animate()?.alpha(1f)?.setDuration(300)?.start()
+            if (floatingArisEnabled) overlayView?.animate()?.alpha(1f)?.setDuration(300)?.start()
             
             // Auto-hide after 3 seconds
             mainHandler.removeCallbacksAndMessages(null)
-            mainHandler.postDelayed({
-                overlayView?.animate()?.alpha(0f)?.setDuration(500)?.start()
-            }, 3000)
+            if (floatingArisEnabled) {
+                mainHandler.postDelayed({
+                    overlayView?.animate()?.alpha(0f)?.setDuration(500)?.start()
+                }, 3000)
+            }
+        }
+    }
+
+    fun setFloatingArisEnabled(enabled: Boolean) {
+        floatingArisEnabled = enabled
+        mainHandler.post {
+            overlayView?.text = if (enabled) "Aris is ready" else "Aris Autonomy Active"
+            overlayView?.animate()?.alpha(if (enabled) 1f else 0f)?.setDuration(200)?.start()
         }
     }
 

@@ -49,7 +49,7 @@ export async function updateCompanionLocation(req: Request, res: Response) {
 
 export async function arisChat(req: Request, res: Response) {
   try {
-    const { message, sessionId, approvedAction } = req.body;
+    const { message, sessionId, approvedAction, mediaData, replyContext } = req.body;
     const authReq = req as AuthenticatedRequest;
     const userId = authReq.authUserId;
 
@@ -65,7 +65,7 @@ export async function arisChat(req: Request, res: Response) {
       return res.status(401).json({ error: "Unauthorized user." });
     }
 
-    const response = await arisService.handleChat({ message, sessionId, userId, approvedAction });
+    const response = await arisService.handleChat({ message, sessionId, userId, approvedAction, mediaData, replyContext });
     res.json(response);
   } catch (error) {
     console.error("arisChat error", error);
@@ -75,7 +75,7 @@ export async function arisChat(req: Request, res: Response) {
 
 export async function arisChatStream(req: Request, res: Response) {
   try {
-    const { message, sessionId, approvedAction } = req.body;
+    const { message, sessionId, approvedAction, mediaData, replyContext } = req.body;
     const authReq = req as AuthenticatedRequest;
     const userId = authReq.authUserId;
 
@@ -111,7 +111,10 @@ export async function arisChatStream(req: Request, res: Response) {
     };
 
     try {
-      const response = await arisService.handleChat({ message, sessionId, userId, approvedAction }, onProgress);
+      const response = await arisService.handleChat(
+        { message, sessionId, userId, approvedAction, mediaData, replyContext },
+        onProgress
+      );
       clearInterval(heartbeat);
       res.write(`${JSON.stringify({ type: 'complete', data: response })}\n`);
       res.end();

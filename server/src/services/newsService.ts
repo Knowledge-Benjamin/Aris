@@ -67,8 +67,9 @@ export class NewsService {
       error(`[newsService] Failed to fetch news: ${err.message}`);
       throw new Error(`Failed to fetch news: ${err.message}`);
     }
+  }
 
-    async getBestPodcastCandidates(limit = 4): Promise<PodcastCandidate[]> {
+  async getBestPodcastCandidates(limit = 4): Promise<PodcastCandidate[]> {
       const configuredFeeds = (process.env.NEWS_PODCAST_RSS_URL || "")
         .split(",")
         .map((url) => url.trim())
@@ -98,11 +99,11 @@ export class NewsService {
       return unique.slice(0, Math.max(0, Math.min(20, Math.floor(limit))));
     }
 
-    async downloadPodcastCandidate(candidate: PodcastCandidate): Promise<DownloadedPodcast> {
-      return this.downloadPodcast(candidate);
-    }
+  async downloadPodcastCandidate(candidate: PodcastCandidate): Promise<DownloadedPodcast> {
+    return this.downloadPodcast(candidate);
+  }
 
-    async downloadLatestPodcast(feedUrl?: string): Promise<DownloadedPodcast> {
+  async downloadLatestPodcast(feedUrl?: string): Promise<DownloadedPodcast> {
       const url = feedUrl?.trim() || process.env.NEWS_PODCAST_RSS_URL?.split(",")[0]?.trim() || DEFAULT_PODCAST_FEED;
       const feed = await this.parser.parseURL(url);
       const item = feed.items.find((entry) => {
@@ -124,18 +125,17 @@ export class NewsService {
       });
     }
 
-    private async downloadPodcast(candidate: PodcastCandidate): Promise<DownloadedPodcast> {
-      const response = await axios.get<ArrayBuffer>(candidate.episodeUrl, {
-        responseType: "arraybuffer",
-        timeout: 120_000,
-        maxContentLength: 100 * 1024 * 1024,
-        maxBodyLength: 100 * 1024 * 1024,
-      });
-      const contentType = response.headers["content-type"];
-      const mimeType = typeof contentType === "string"
-        ? contentType.split(";")[0].trim()
-        : candidate.mimeType.split(";")[0].trim();
-      return { ...candidate, mimeType, audio: Buffer.from(response.data) };
-    }
+  private async downloadPodcast(candidate: PodcastCandidate): Promise<DownloadedPodcast> {
+    const response = await axios.get<ArrayBuffer>(candidate.episodeUrl, {
+      responseType: "arraybuffer",
+      timeout: 120_000,
+      maxContentLength: 100 * 1024 * 1024,
+      maxBodyLength: 100 * 1024 * 1024,
+    });
+    const contentType = response.headers["content-type"];
+    const mimeType = typeof contentType === "string"
+      ? contentType.split(";")[0].trim()
+      : candidate.mimeType.split(";")[0].trim();
+    return { ...candidate, mimeType, audio: Buffer.from(response.data) };
   }
 }

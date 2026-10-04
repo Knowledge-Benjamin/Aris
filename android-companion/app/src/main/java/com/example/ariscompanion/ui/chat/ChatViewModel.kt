@@ -11,6 +11,7 @@ import android.net.Uri
 import android.os.Build
 import android.util.Base64
 import android.util.Log
+import com.example.ariscompanion.PhoneLocationProvider
 import com.example.ariscompanion.VisionState
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
@@ -236,6 +237,7 @@ class ChatViewModel(private val appContext: Context) : ViewModel() {
                 }
 
                 var finalResult: ArisChatResult? = null
+                syncPhoneLocation()
                 client?.chatStream(
                     text,
                     SESSION_ID,
@@ -410,6 +412,7 @@ class ChatViewModel(private val appContext: Context) : ViewModel() {
                 appendMessage(ChatMessage(id = arisId, sender = Sender.ARIS, text = "", status = MessageStatus.SENDING))
                 _uiState.update { it.copy(progressMessage = "🎧 Transcribing voice note…") }
 
+                syncPhoneLocation()
                 val result = client?.sendVoice(attachment.base64, attachment.mimeType, SESSION_ID)
                     ?: throw Exception("Not connected")
 
@@ -454,6 +457,7 @@ class ChatViewModel(private val appContext: Context) : ViewModel() {
                 }
 
                 var finalResult: ArisChatResult? = null
+                syncPhoneLocation()
                 client?.sendMediaChat(caption, base64, mime, SESSION_ID) { event ->
                     when (event.type) {
                         "progress" -> _uiState.update { it.copy(progressMessage = event.message) }
@@ -497,6 +501,7 @@ class ChatViewModel(private val appContext: Context) : ViewModel() {
                 val arisId = UUID.randomUUID().toString()
                 appendMessage(ChatMessage(id = arisId, sender = Sender.ARIS, text = "", status = MessageStatus.SENDING))
                 var finalResult: ArisChatResult? = null
+                syncPhoneLocation()
                 client?.chatStream("approved", SESSION_ID, approvedActionPayload) { event ->
                     when (event.type) {
                         "progress" -> _uiState.update { it.copy(progressMessage = event.message) }
@@ -672,6 +677,15 @@ class ChatViewModel(private val appContext: Context) : ViewModel() {
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────
+
+    private suspend fun syncPhoneLocation() {
+        val token = authToken ?: return
+        try {
+            PhoneLocationProvider.uploadCurrentLocation(appContext, _uiState.value.serverUrl, token)
+        } catch (e: Exception) {
+            Log.w(TAG, "Phone location sync failed; server will use its available fallback", e)
+        }
+    }
 
     private fun appendMessage(msg: ChatMessage) {
         _uiState.update {
