@@ -489,6 +489,13 @@ export class ArisService {
 
     await this.contextStore.warmCache(this.getContextKey(input.userId, sessionId));
 
+    if (!approvedAction && !input.mediaData && this.isCurrentDateTimeRequest(input.message)) {
+      return this.answerCurrentDateTime(input.userId, sessionId, input.message);
+    }
+    if (!approvedAction && !input.mediaData && this.isCurrentLocationRequest(input.message)) {
+      return this.answerCurrentLocation(input.userId, sessionId, input.message);
+    }
+
     // Auto-sync contacts on first use (when table is empty for this user)
     if (input.userId) {
       this.ensureContactsSynced(input.userId).catch(err =>
@@ -669,6 +676,94 @@ export class ArisService {
     const hasSendOrListen = /(send|listen|play|download|get|deliver)/i.test(normalized);
     const hasWhatsApp = /whatsapp|voice note|audio/i.test(normalized);
     return hasPodcast && (hasNews || hasSendOrListen || hasWhatsApp);
+  }
+
+  private isCurrentDateTimeRequest(message: string): boolean {
+    const asksForAnotherLocation = /\b(?:in|for)\s+(?!my\b|here\b|this\s+area\b|my\s+location\b)[\p{L}]/iu.test(message);
+    return !asksForAnotherLocation &&
+      /\b(?:what(?:'s| is)?\s+(?:the\s+)?time(?:\s+(?:right\s+)?now)?|what\s+time\s+is\s+it(?:\s+(?:right\s+)?now)?|time\s+right\s+now|current\s+time|what(?:'s| is)?\s+(?:the\s+)?date\s+(?:today|right\s+now)|what\s+date\s+is\s+it|today'?s\s+date|current\s+date)\b/i.test(message);
+  }
+
+  private isCurrentLocationRequest(message: string): boolean {
+    return /\b(?:where\s+am\s+i|what(?:'s| is)?\s+my\s+(?:current\s+)?location|my\s+current\s+location)\b/i.test(message);
+  }
+
+  private formatCurrentDateTime(timeZone?: string): string {
+    const options: Intl.DateTimeFormatOptions = {
+      weekday: "long",
+      year: "numeric",
+      month: "long",
+      day: "numeric",
+      hour: "numeric",
+      minute: "2-digit",
+      timeZoneName: "long",
+    };
+    try {
+      return new Intl.DateTimeFormat("en-US", {
+        ...options,
+        ...(timeZone ? { timeZone } : {}),
+      }).format(new Date());
+    } catch (formatError) {
+      error(`[arisService] invalid location timezone "${timeZone}"; using server timezone`, formatError);
+      return new Intl.DateTimeFormat("en-US", options).format(new Date());
+    }
+  }
+
+  private async answerCurrentDateTime(
+    userId: number | undefined,
+    sessionId: string,
+    userMessage: string
+  ): Promise<ArisResponse> {
+    const location = await this.locationService.getCurrentLocation();
+    const locationLabel = [location?.city, location?.country].filter(Boolean).join(", ");
+    const localTime = this.formatCurrentDateTime(location?.timezone);
+    const arisReply = locationLabel
+      ? `It's ${localTime} in ${locationLabel}.`
+      : `It's ${localTime}.`;
+
+    await this.persistDirectChatExchange(userId, sessionId, userMessage, arisReply);
+    return { arisReply, memoryUpdates: [], status: "finished" };
+  }
+
+  private async answerCurrentLocation(
+    userId: number | undefined,
+    sessionId: string,
+    userMessage: string
+  ): Promise<ArisResponse> {
+    const location = await this.locationService.getCurrentLocation();
+    const locationLabel = [location?.city, location?.regionName, location?.country]
+      .filter((part, index, parts) => Boolean(part) && parts.indexOf(part) === index)
+      .join(", ");
+    const arisReply = locationLabel
+      ? `Based on your network location, you appear to be in ${locationLabel}.`
+      : "I couldn't determine your current location from the available network location data.";
+
+    await this.persistDirectChatExchange(userId, sessionId, userMessage, arisReply);
+    return { arisReply, memoryUpdates: [], status: "finished" };
+  }
+
+  private async persistDirectChatExchange(
+    userId: number | undefined,
+    sessionId: string,
+    userMessage: string,
+    arisReply: string
+  ): Promise<void> {
+    await Promise.all([
+      this.memoryStore.saveConversationMessage({
+        userId,
+        sessionId,
+        role: "user",
+        content: userMessage,
+      }),
+      this.memoryStore.saveConversationMessage({
+        userId,
+        sessionId,
+        role: "aris",
+        content: arisReply,
+      }),
+    ]).catch((saveError) => {
+      error("[arisService] failed to persist direct response", saveError);
+    });
   }
 
   private isFinalModelResponse(response: { reply: string; isFinalAnswer?: boolean }): boolean {
@@ -3977,7 +4072,7 @@ export class ArisService {
       await this.recordToolObservation(userId, sessionId, approvedAction, result);
     }
     const activeCategories = this.determineToolCategories(userMessage, conversationHistory);
-    if (includeSearch) activeCategories.add("search");
+    if (!includeSearch) activeCategories.delete("search");
 
     let initialInvocations = approvedAction
       ? []
@@ -5266,8 +5361,6 @@ ${this.truncateText(item.content, 1200)}`);
     return `${text.slice(0, maxLength).trim()}...`;
   }
 }
-
-
 
 
 
