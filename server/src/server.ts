@@ -1,6 +1,6 @@
 import dotenv from "dotenv";
 import * as ngrok from "@ngrok/ngrok";
-import { Server } from "http";
+import type { Server } from "http";
 
 dotenv.config();
 
@@ -40,7 +40,7 @@ async function startServer(): Promise<void> {
   let tunnelStarted = false;
 
   if (!authToken || /^(replace[-_ ]|your[-_ ])/i.test(authToken)) {
-    console.info("[ngrok] Tunnel disabled; set NGROK_AUTHTOKEN and NGROK_DOMAIN to enable it.");
+    console.info("[ngrok] Tunnel disabled; set NGROK_AUTHTOKEN to enable it.");
   } else {
     try {
       const listener = await ngrok.forward({
