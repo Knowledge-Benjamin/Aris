@@ -1,3 +1,7 @@
 [submodule "search-server"]
 	path = search-server
 	url = https://github.com/Knowledge-Benjamin/Search-Service.git
+
+[submodule "tts-server"]
+	path = tts-server
+	url = https://github.com/Knowledge-Benjamin/Speech_server.git

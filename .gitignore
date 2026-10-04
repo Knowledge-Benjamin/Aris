@@ -2,10 +2,20 @@ node_modules/
 dist/
 .env
 .env.*
+*.env
+*.env.*
+**/.env
+**/.env.*
+**/*.env
+**/*.env.*
 !.env.example
 (2).env
-(2).gitignore
+ (2).env
+ (2).gitignore
+ (2).gitmodules
+ (2).gitmodlues
 .meeting-profile/
 .research-browser-profile/
 **/build/
 *.log
+/Recovered data*/
