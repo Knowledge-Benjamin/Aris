@@ -27,6 +27,7 @@ export interface MediaLibraryInput {
   sourceType: string;
   summary: string;
   sourceText?: string;
+  sourceReference?: string;
   sessionId?: string;
 }
 
@@ -51,8 +52,8 @@ export class MediaLibraryStore {
     const result = await this.pool.query(
       `INSERT INTO media_library
        (user_id, drive_file_id, drive_url, file_name, mime_type, byte_size,
-        source_type, summary, source_text, session_id, embedding, created_at, updated_at)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::vector, NOW(), NOW())
+        source_type, summary, source_text, source_reference, session_id, embedding, created_at, updated_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12::vector, NOW(), NOW())
        ON CONFLICT (user_id, drive_file_id) DO UPDATE SET
          drive_url = EXCLUDED.drive_url,
          file_name = EXCLUDED.file_name,
@@ -61,6 +62,7 @@ export class MediaLibraryStore {
          source_type = EXCLUDED.source_type,
          summary = EXCLUDED.summary,
          source_text = EXCLUDED.source_text,
+         source_reference = EXCLUDED.source_reference,
          session_id = EXCLUDED.session_id,
          embedding = EXCLUDED.embedding,
          updated_at = NOW()
@@ -76,6 +78,7 @@ export class MediaLibraryStore {
         input.sourceType,
         input.summary,
         sourceText,
+        input.sourceReference ?? null,
         input.sessionId ?? null,
         vector,
       ]
@@ -103,6 +106,18 @@ export class MediaLibraryStore {
        WHERE user_id = $1 AND drive_file_id = $2
        LIMIT 1`,
       [userId, driveFileId]
+    );
+    return result.rows[0] ? mapRow(result.rows[0]) : undefined;
+  }
+
+  async findBySourceReference(userId: number, sourceType: string, sourceReference: string): Promise<MediaLibraryRecord | undefined> {
+    const result = await this.pool.query(
+      `SELECT id, user_id, drive_file_id, drive_url, file_name, mime_type,
+         byte_size, source_type, summary, source_text, session_id, created_at
+       FROM media_library
+       WHERE user_id = $1 AND source_type = $2 AND source_reference = $3
+       LIMIT 1`,
+      [userId, sourceType, sourceReference]
     );
     return result.rows[0] ? mapRow(result.rows[0]) : undefined;
   }

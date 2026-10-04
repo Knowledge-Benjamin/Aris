@@ -89,12 +89,21 @@ async function setup() {
       source_type TEXT NOT NULL,
       summary TEXT NOT NULL,
       source_text TEXT NOT NULL DEFAULT '',
+      source_reference TEXT,
       session_id TEXT,
       embedding VECTOR(768),
       created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
       updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
       UNIQUE (user_id, drive_file_id)
     );
+  `);
+  await pool.query(`
+    ALTER TABLE media_library ADD COLUMN IF NOT EXISTS source_reference TEXT;
+  `);
+  await pool.query(`
+    CREATE UNIQUE INDEX IF NOT EXISTS media_library_source_reference_idx
+    ON media_library (user_id, source_type, source_reference)
+    WHERE source_reference IS NOT NULL;
   `);
   await pool.query(`
     CREATE INDEX IF NOT EXISTS media_library_embedding_idx

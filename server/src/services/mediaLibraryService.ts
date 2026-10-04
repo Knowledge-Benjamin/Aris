@@ -10,6 +10,7 @@ export interface StoredMediaInput {
   mimeType: string;
   content: Buffer;
   sourceType: string;
+  sourceReference?: string;
   description?: string;
   summary?: string;
   sourceText?: string;
@@ -19,6 +20,8 @@ export interface MediaDownload {
   record: MediaLibraryRecord;
   content: Buffer;
 }
+
+const MAX_MEDIA_LIBRARY_BYTES = 100 * 1024 * 1024;
 
 export class MediaLibraryService {
   private readonly folderIds = new Map<number, string>();
@@ -35,8 +38,16 @@ export class MediaLibraryService {
     if (!input.fileName.trim() || !input.mimeType.trim()) {
       throw new Error("Media uploads require a filename and MIME type.");
     }
-    if (input.content.length > 20 * 1024 * 1024) {
-      throw new Error("Media library uploads are limited to 20 MiB per file.");
+    if (input.content.length > MAX_MEDIA_LIBRARY_BYTES) {
+      throw new Error("Media library files are limited to 100 MiB each.");
+    }
+    if (input.sourceReference) {
+      const existing = await this.mediaStore.findBySourceReference(
+        input.userId,
+        input.sourceType,
+        input.sourceReference,
+      );
+      if (existing) return existing;
     }
 
     const account = await this.requireAccount(input.userId);
@@ -70,11 +81,15 @@ export class MediaLibraryService {
         mimeType: driveFile.mimeType || input.mimeType,
         byteSize: Number(driveFile.size) || input.content.length,
         sourceType: input.sourceType,
+        sourceReference: input.sourceReference,
         summary,
         sourceText: input.sourceText || input.description || summary,
         sessionId: input.sessionId,
       });
     } catch (indexError) {
+      const existing = input.sourceReference
+        ? await this.mediaStore.findBySourceReference(input.userId, input.sourceType, input.sourceReference)
+        : undefined;
       try {
         await this.googleService.deleteDriveFile(account, driveFile.id, this.tokenUpdater(input.userId));
       } catch (cleanupError) {
@@ -82,6 +97,7 @@ export class MediaLibraryService {
           `The file was uploaded to Drive but its library index failed (${errorMessage(indexError)}); cleanup also failed (${errorMessage(cleanupError)}).`
         );
       }
+      if (existing) return existing;
       throw new Error(`The media library index failed; the unindexed Drive upload was removed. ${errorMessage(indexError)}`);
     }
   }
@@ -93,6 +109,7 @@ export class MediaLibraryService {
     fileName: string;
     mimeType: string;
     sourceType: string;
+    sourceReference?: string;
     summary: string;
     sourceText?: string;
     byteSize?: number;
@@ -107,6 +124,7 @@ export class MediaLibraryService {
       mimeType: input.mimeType,
       byteSize: input.byteSize ?? 0,
       sourceType: input.sourceType,
+      sourceReference: input.sourceReference,
       summary: input.summary,
       sourceText: input.sourceText || input.summary,
       sessionId: input.sessionId,
@@ -139,6 +157,9 @@ export class MediaLibraryService {
     if (content.length > 20 * 1024 * 1024) {
       throw new Error("This file is too large for inline content analysis. The original is available in the media library.");
     }
+    if (!isInlineModelMimeType(record.mimeType)) {
+      throw new Error(`Aris cannot analyze ${record.mimeType} inline yet. The original file is available to download.`);
+    }
     const response = await this.gemmaService.requestArisAdvice(
       [
         "Analyze the user's stored media file and answer the supplied request using only evidence in the file.",
@@ -156,6 +177,15 @@ export class MediaLibraryService {
   }
 
   private async summarizeUpload(fileName: string, mimeType: string, content: Buffer, description?: string): Promise<string> {
+    if (!isInlineModelMimeType(mimeType)) {
+      const caption = description?.trim();
+      return [
+        `Description: User-uploaded ${mimeType} file "${fileName}".`,
+        caption ? `User-provided context: ${caption}` : "",
+        "Content: The file is stored in the media library; its contents have not been analyzed.",
+        `Search terms: ${fileName} ${mimeType} ${caption || ""}`,
+      ].filter(Boolean).join(" ").slice(0, 12000);
+    }
     const response = await this.gemmaService.requestArisAdvice(
       [
         "Create a searchable media-library record for the attached user file.",
@@ -213,4 +243,12 @@ function sanitizeFileName(fileName: string): string {
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
+}
+
+function isInlineModelMimeType(mimeType: string): boolean {
+  return mimeType.startsWith("image/")
+    || mimeType.startsWith("audio/")
+    || mimeType.startsWith("video/")
+    || mimeType === "application/pdf"
+    || mimeType === "text/plain";
 }

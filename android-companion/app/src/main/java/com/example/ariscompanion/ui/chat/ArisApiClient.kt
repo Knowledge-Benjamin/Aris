@@ -91,7 +91,15 @@ class ArisApiClient(serverUrl: String, private val token: String) {
     }
 
     suspend fun downloadMedia(mediaId: Int): ByteArray = withContext(Dispatchers.IO) {
-        val connection = openConnection("GET", "/api/aris/media/$mediaId/download")
+        downloadBinary("/api/aris/media/$mediaId/download")
+    }
+
+    suspend fun downloadDriveMedia(driveFileId: String): ByteArray = withContext(Dispatchers.IO) {
+        downloadBinary("/api/aris/media/drive/${java.net.URLEncoder.encode(driveFileId, "UTF-8")}/download")
+    }
+
+    private fun downloadBinary(path: String): ByteArray {
+        val connection = openConnection("GET", path)
         try {
             val statusCode = connection.responseCode
             if (statusCode !in 200..299) {

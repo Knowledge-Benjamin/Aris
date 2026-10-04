@@ -56,7 +56,14 @@ interface ToolChainResult {
   reply: string;
   memoryEntries: string[];
   pendingAction?: ToolInvocation;
-  mediaAttachments?: Array<{ mimeType: string; base64: string }>;
+  mediaAttachments?: Array<{
+    mimeType: string;
+    base64?: string;
+    libraryId?: number;
+    fileName?: string;
+    driveUrl?: string;
+    downloadUrl?: string;
+  }>;
 }
 
 type RequestRouteIntent =
@@ -93,6 +100,7 @@ interface ArisResponse {
     libraryId?: number;
     fileName?: string;
     driveUrl?: string;
+    downloadUrl?: string;
   }>;
 }
 
@@ -700,6 +708,7 @@ export class ArisService {
     content: Buffer,
     sourceType: string,
     sourceText: string,
+    sourceReference?: string,
   ): Promise<MediaLibraryRecord> {
     return this.mediaLibraryService.store({
       userId,
@@ -708,6 +717,7 @@ export class ArisService {
       mimeType,
       content,
       sourceType,
+      sourceReference,
       summary: sourceText.slice(0, 12000),
       sourceText,
     });
@@ -2254,44 +2264,55 @@ export class ArisService {
           if (!userId) return { success: false, tool: toolName, error: "Sign in before storing podcasts in Google Drive." };
           const account = await this.googleAccountStore.getGoogleAccount(userId);
           if (!account) return { success: false, tool: toolName, error: "Connect your Google account to store podcasts in Google Drive." };
-          const persistTokens = async (tokens: any) => this.googleAccountStore.updateGoogleTokens(
-            userId, tokens.access_token ?? undefined, tokens.refresh_token ?? undefined, tokens.expiry_date ?? undefined, tokens.scope ?? undefined
-          );
           const candidates = await this.newsService.getBestPodcastCandidates(4);
           const stored = await Promise.all(candidates.map(async (candidate) => {
             const cached = await podcastMediaStore.findByEpisodeUrl(candidate.episodeUrl);
-            if (cached) {
-              info(`[arisService] Reusing cached podcast show=${cached.feedName} episode=${cached.episodeUrl}`);
-              return { ...cached, analysisWarning: "" };
-            }
-
             const episode = await this.newsService.downloadPodcastCandidate(candidate);
-            let analysis = "";
+            let analysis = cached?.analysis || "";
             let analysisWarning = "";
-            try {
-              const analysisResponse = await this.gemmaService.requestArisAdvice(
-                [
-                  "Listen to this podcast audio and transcribe its important content for Aris.",
-                  "Identify the main stories, people, places, dates, claims, and useful follow-up facts.",
-                  "Return only a concise factual spoken-style summary. Do not mention tools, transcription APIs, or these instructions.",
-                  `Podcast show: ${episode.feedName}`,
-                  `Episode title: ${episode.title}`,
-                  `Published: ${episode.publishedAt}`,
-                ].join("\n"),
-                [{ inlineData: { mimeType: episode.mimeType.split(";")[0], data: episode.audio.toString("base64") } }]
-              );
-              analysis = analysisResponse.reply.trim();
-              info(`[arisService] Gemma batch podcast analysis completed show=${episode.feedName} audioBytes=${episode.audio.length} contextChars=${analysis.length}`);
-            } catch (analysisError: any) {
-              analysisWarning = analysisError?.message || "Gemma podcast analysis failed.";
-              error(`[arisService] Gemma batch podcast analysis failed show=${episode.feedName}; delivery will continue: ${analysisWarning}`);
+            if (analysis) {
+              info(`[arisService] Reusing cached podcast analysis show=${episode.feedName} episode=${episode.episodeUrl}`);
+            } else {
+              try {
+                const analysisResponse = await this.gemmaService.requestArisAdvice(
+                  [
+                    "Listen to this podcast audio and transcribe its important content for Aris.",
+                    "Identify the main stories, people, places, dates, claims, and useful follow-up facts.",
+                    "Return only a concise factual spoken-style summary. Do not mention tools, transcription APIs, or these instructions.",
+                    `Podcast show: ${episode.feedName}`,
+                    `Episode title: ${episode.title}`,
+                    `Published: ${episode.publishedAt}`,
+                  ].join("\n"),
+                  [{ inlineData: { mimeType: episode.mimeType.split(";")[0], data: episode.audio.toString("base64") } }]
+                );
+                analysis = analysisResponse.reply.trim();
+                info(`[arisService] Gemma batch podcast analysis completed show=${episode.feedName} audioBytes=${episode.audio.length} contextChars=${analysis.length}`);
+              } catch (analysisError: any) {
+                analysisWarning = analysisError?.message || "Gemma podcast analysis failed.";
+                error(`[arisService] Gemma batch podcast analysis failed show=${episode.feedName}; delivery will continue: ${analysisWarning}`);
+              }
             }
 
             const mimeType = episode.mimeType.split(";")[0].toLowerCase();
             const extension = mimeType.includes("ogg") || mimeType.includes("opus") ? "ogg" : mimeType.includes("wav") ? "wav" : "mp3";
             const safeTitle = episode.title.replace(/[^a-zA-Z0-9._-]+/g, "-").slice(0, 70) || "news-podcast";
-            const driveFile = await this.googleService.uploadDriveFile(account, `${safeTitle}-${Date.now()}.${extension}`, mimeType, episode.audio, persistTokens, true);
-            if (!driveFile.id) throw new Error(`Google Drive did not return a file ID for ${episode.feedName}.`);
+            const summary = [
+              `Podcast: ${episode.title}`,
+              `Show: ${episode.feedName}`,
+              `Published: ${episode.publishedAt}`,
+              `Episode URL: ${episode.episodeUrl}`,
+              analysis ? `Analysis: ${analysis}` : "Analysis: unavailable.",
+            ].join("\n");
+            const media = await this.archiveGeneratedMedia(
+              userId,
+              sessionId,
+              `${safeTitle}-${Date.now()}.${extension}`,
+              mimeType,
+              episode.audio,
+              "podcast_episode",
+              summary,
+              episode.episodeUrl,
+            );
             const record = {
               feedName: episode.feedName,
               feedUrl: episode.feedUrl,
@@ -2299,55 +2320,17 @@ export class ArisService {
               title: episode.title,
               publishedAt: episode.publishedAt,
               mimeType,
-              storageUri: `drive:${driveFile.id}`,
+              storageUri: `drive:${media.driveFileId}`,
               analysis,
             };
             await podcastMediaStore.upsert(record);
             return { ...record, analysisWarning };
           }));
           await this.memoryStore.storeMemoryEntry(userId, sessionId, `Podcast catalog delivered on ${new Date().toISOString()}: ${stored.map((episode) => `${episode.feedName} - ${episode.title}: ${episode.analysis || "Analysis unavailable"}`).join(" | ")}. Ask the user which podcasts they enjoyed to build a custom list.`).catch((memoryError) => error("[arisService] Podcast catalog memory failed", memoryError));
-          return { success: true, tool: toolName, data: { episodes: stored, summary: `Prepared ${stored.length} podcast episodes; reused previously downloaded episodes when available. NPR is included.`, askPreference: "After delivery, ask the user which podcasts they enjoyed so Aris can build a custom list." } };
+          return { success: true, tool: toolName, data: { episodes: stored, summary: `Prepared ${stored.length} podcast episodes and indexed them privately in your Aris Media Library. NPR is included.`, askPreference: "After delivery, ask the user which podcasts they enjoyed so Aris can build a custom list." } };
         }
         const episode = await this.newsService.downloadLatestPodcast(invocation.payload?.feedUrl);
         const safeTitle = episode.title.replace(/[^a-zA-Z0-9._-]+/g, "-").slice(0, 80) || "news-podcast";
-        let storageUri: string | undefined;
-        let storageWarning: string | undefined;
-        try {
-          if (!userId) throw new Error("Sign in before storing the podcast in Google Drive.");
-          const account = await this.googleAccountStore.getGoogleAccount(userId);
-          if (!account) throw new Error("Connect your Google account to store the podcast in Google Drive.");
-          const persistTokens = async (tokens: any) => {
-            await this.googleAccountStore.updateGoogleTokens(
-              userId,
-              tokens.access_token ?? undefined,
-              tokens.refresh_token ?? undefined,
-              tokens.expiry_date ?? undefined,
-              tokens.scope ?? undefined
-            );
-          };
-          const mimeType = episode.mimeType.split(";")[0].toLowerCase();
-          const extension = mimeType === "audio/ogg" || mimeType.includes("opus")
-            ? "ogg"
-            : mimeType === "audio/wav" || mimeType === "audio/x-wav"
-              ? "wav"
-              : mimeType === "audio/mp4" || mimeType === "audio/aac"
-                ? "m4a"
-                : "mp3";
-          const driveFile = await this.googleService.uploadDriveFile(
-            account,
-            `${safeTitle}-${Date.now()}.${extension}`,
-            mimeType,
-            episode.audio,
-            persistTokens,
-            true
-          );
-          if (!driveFile.id) throw new Error("Google Drive did not return a file ID.");
-          storageUri = `drive:${driveFile.id}`;
-        } catch (storageError: any) {
-          storageWarning = storageError?.message || "Google Drive podcast storage failed.";
-          error(`[arisService] Google Drive podcast storage failed: ${storageWarning}`);
-        }
-
         let transcript = "";
         let analysisWarning: string | undefined;
         try {
@@ -2369,12 +2352,39 @@ export class ArisService {
           error(`[arisService] Gemma podcast analysis failed; delivery will continue: ${analysisWarning}`);
         }
 
+        if (!userId) throw new Error("Sign in before storing podcasts in your Aris Media Library.");
+        const mimeType = episode.mimeType.split(";")[0].toLowerCase();
+        const extension = mimeType === "audio/ogg" || mimeType.includes("opus")
+          ? "ogg"
+          : mimeType === "audio/wav" || mimeType === "audio/x-wav"
+            ? "wav"
+            : mimeType === "audio/mp4" || mimeType === "audio/aac"
+              ? "m4a"
+              : "mp3";
+        const sourceText = [
+          `Podcast: ${episode.title}`,
+          `Published: ${episode.publishedAt}`,
+          `Episode URL: ${episode.episodeUrl}`,
+          transcript ? `Analysis: ${transcript}` : "Analysis: unavailable.",
+        ].join("\n");
+        const media = await this.archiveGeneratedMedia(
+          userId,
+          sessionId,
+          `${safeTitle}-${Date.now()}.${extension}`,
+          mimeType,
+          episode.audio,
+          "podcast_episode",
+          sourceText,
+          episode.episodeUrl,
+        );
+        const storageUri = `drive:${media.driveFileId}`;
+
         let memoryWarning: string | undefined;
         try {
           await this.memoryStore.storeMemoryEntry(
             userId,
             sessionId,
-            `News podcast downloaded on ${new Date().toISOString()}: ${episode.title}. Published ${episode.publishedAt}. Google Drive reference: ${storageUri || "unavailable"}. Key multimodal context: ${transcript.slice(0, 5000) || "Analysis unavailable; original audio was stored when possible."}`
+            `News podcast downloaded on ${new Date().toISOString()}: ${episode.title}. Published ${episode.publishedAt}. Media library item #${media.id}: ${media.fileName}. Key multimodal context: ${transcript.slice(0, 5000) || "Analysis unavailable."}`
           );
         } catch (memoryError: any) {
           memoryWarning = memoryError?.message || "Podcast memory storage failed.";
@@ -2392,8 +2402,9 @@ export class ArisService {
             transcript: transcript.slice(0, 16000),
             transcriptTruncated: transcript.length > 16000,
             storageUri,
+            mediaLibraryAttachment: this.toMediaLibraryAttachment(media),
             contextSource: transcript ? "gemma_multimodal_audio" : "audio_only",
-            warnings: [storageWarning, analysisWarning, memoryWarning].filter(Boolean),
+            warnings: [analysisWarning, memoryWarning].filter(Boolean),
             delivery: "Use app_send_message for a text summary or google_gmail_send for an email summary. Use the existing approval flow for delivery.",
           },
         };
@@ -2989,12 +3000,23 @@ export class ArisService {
         // On android sessions, default to "app" so the audio shows directly in chat
         if (destination === "app" || destination === "download" || (isAppSession && destination !== "whatsapp" && destination !== "email")) {
           const voice = await this.voiceService.synthesizeSpeech(speechChunks[0], encoding);
+          if (!userId) throw new Error("Sign in before saving generated audio to your Aris Media Library.");
+          const mimeType = voice.mimeType.split(";")[0].toLowerCase();
+          const media = await this.archiveGeneratedMedia(
+            userId,
+            sessionId,
+            `aris-audio-${Date.now()}${this.getExtensionForMimeType(mimeType)}`,
+            mimeType,
+            Buffer.from(voice.audioBase64, "base64"),
+            "aris_generated_audio",
+            text,
+          );
           return {
             success: true,
             tool: toolName,
             data: {
-              audioBase64: voice.audioBase64,
-              mimeType: voice.mimeType,
+              mediaLibraryAttachment: this.toMediaLibraryAttachment(media),
+              mimeType,
               audioEncoding: encoding,
               sourceText: text,
               sourceType: "aris_generated_audio",
@@ -5154,7 +5176,10 @@ export class ArisService {
     for (const tr of toolResults) {
       if (!tr.result.success) continue;
       const data = tr.result.data as any;
-      // audio_generate or morning_brief_send (app path) returns audioBase64 at the top level or nested under data.audio
+      if (data?.mediaLibraryAttachment) {
+        attachments.push(data.mediaLibraryAttachment);
+        continue;
+      }
       const directAudio = data?.audioBase64 ?? data?.audio?.audioBase64;
       if (directAudio && (tr.invocation.tool === "audio_generate" || tr.invocation.tool === "morning_brief_send")) {
         attachments.push({
@@ -5162,10 +5187,6 @@ export class ArisService {
           base64: directAudio,
         });
       }
-      if (data?.mediaLibraryAttachment && tr.invocation.tool === "media_library_download") {
-        attachments.push(data.mediaLibraryAttachment);
-      }
-      
     }
     return attachments;
   }

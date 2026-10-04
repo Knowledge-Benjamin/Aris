@@ -28,6 +28,7 @@ import kotlinx.coroutines.withContext
 import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.FileOutputStream
+import java.io.IOException
 import java.util.UUID
 import org.json.JSONArray
 import org.json.JSONObject
@@ -95,18 +96,20 @@ class ChatViewModel(private val appContext: Context) : ViewModel() {
             var attachment: MediaAttachment? = null
             if (mediaDriveRef.startsWith("drive:")) {
                 val fileId = mediaDriveRef.removePrefix("drive:")
-                val downloadUrl = "https://drive.google.com/uc?export=download&id=$fileId"
                 try {
                     val bytes = withContext(Dispatchers.IO) {
-                        java.net.URL(downloadUrl).readBytes()
+                        val api = client ?: throw IOException("Sign in again to retrieve this audio.")
+                        api.downloadDriveMedia(fileId)
                     }
                     val base64 = android.util.Base64.encodeToString(bytes, android.util.Base64.DEFAULT)
-                    val tempFile = File(appContext.cacheDir, "$fileId.mp3")
+                    val mimeType = msg.optString("mediaMimeType").ifBlank { "audio/mpeg" }
+                    val tempFile = File(appContext.cacheDir, "$fileId.audio")
                     tempFile.writeBytes(bytes)
                     attachment = MediaAttachment.Audio(
                         uri = Uri.fromFile(tempFile),
                         base64 = base64,
-                        mimeType = "audio/mpeg"
+                        mimeType = mimeType,
+                        fileName = msg.optString("body").ifBlank { "Aris audio" },
                     )
                 } catch (e: Exception) {
                     Log.e(TAG, "Failed to download drive audio", e)
@@ -756,12 +759,14 @@ class ChatViewModel(private val appContext: Context) : ViewModel() {
             is MediaAttachment.Video -> attachment.base64
             is MediaAttachment.Audio -> attachment.base64
             is MediaAttachment.VoiceNote -> attachment.base64
+            is MediaAttachment.Document -> attachment.base64
         }
         val mimeType = when (attachment) {
             is MediaAttachment.Image -> attachment.mimeType
             is MediaAttachment.Video -> attachment.mimeType
             is MediaAttachment.Audio -> attachment.mimeType
             is MediaAttachment.VoiceNote -> attachment.mimeType
+            is MediaAttachment.Document -> attachment.mimeType
         }
         val bytes = Base64.decode(base64, Base64.DEFAULT)
         File(appContext.filesDir, fileName).writeBytes(bytes)
@@ -773,12 +778,15 @@ class ChatViewModel(private val appContext: Context) : ViewModel() {
                 is MediaAttachment.Video -> "video"
                 is MediaAttachment.Audio -> "audio"
                 is MediaAttachment.VoiceNote -> "voice"
+                is MediaAttachment.Document -> "document"
             })
+            put("displayName", attachment.fileName)
             put("durationMs", when (attachment) {
                 is MediaAttachment.Audio -> attachment.durationMs
                 is MediaAttachment.Video -> 0L
                 is MediaAttachment.Image -> 0L
                 is MediaAttachment.VoiceNote -> attachment.durationMs
+                is MediaAttachment.Document -> 0L
             })
             if (attachment is MediaAttachment.VoiceNote) {
                 put("waveform", JSONArray(attachment.waveform))
@@ -794,9 +802,10 @@ class ChatViewModel(private val appContext: Context) : ViewModel() {
         val base64 = Base64.encodeToString(file.readBytes(), Base64.NO_WRAP)
         val mimeType = metadata.optString("mimeType", "application/octet-stream")
         val durationMs = metadata.optLong("durationMs", 0L)
+        val displayName = metadata.optString("displayName", fileName)
         return when (metadata.optString("type")) {
-            "image" -> MediaAttachment.Image(uri, base64, mimeType)
-            "video" -> MediaAttachment.Video(uri, base64, mimeType)
+            "image" -> MediaAttachment.Image(uri, base64, mimeType, displayName)
+            "video" -> MediaAttachment.Video(uri, base64, mimeType, displayName)
             "voice" -> {
                 val waveformJson = metadata.optJSONArray("waveform")
                 val waveform = buildList {
@@ -804,9 +813,10 @@ class ChatViewModel(private val appContext: Context) : ViewModel() {
                         add(waveformJson.optDouble(index, 0.0).toFloat())
                     }
                 }
-                MediaAttachment.VoiceNote(uri, base64, mimeType, durationMs, waveform)
+                MediaAttachment.VoiceNote(uri, base64, mimeType, durationMs, waveform, displayName)
             }
-            "audio" -> MediaAttachment.Audio(uri, base64, mimeType, durationMs)
+            "audio" -> MediaAttachment.Audio(uri, base64, mimeType, durationMs, displayName)
+            "document" -> MediaAttachment.Document(uri, base64, mimeType, displayName)
             else -> null
         }
     }
