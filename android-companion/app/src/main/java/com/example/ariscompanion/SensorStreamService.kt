@@ -35,7 +35,6 @@ class SensorStreamService : Service() {
 
     companion object {
         const val CHANNEL_ID = "ArisCompanionChannel"
-        const val SERVER_URL = "http://10.0.2.2:3000/api"
         const val USER_ID = 1 // Replace with dynamic auth later
     }
 
@@ -128,7 +127,11 @@ class SensorStreamService : Service() {
                     
                     // Run voice verification in a coroutine before sending
                     serviceScope.launch {
-                        val isOwnerVoice = VoicePrintManager.verifyVoice(base64, USER_ID, SERVER_URL)
+                        val isOwnerVoice = VoicePrintManager.verifyVoice(
+                            base64,
+                            USER_ID,
+                            ServerConfig.savedBaseUrl(this@SensorStreamService)
+                        )
                         if (isOwnerVoice) {
                             Log.d("SensorStreamService", "Voice verified. Sending chunk.")
                             sendToBackend(base64)
@@ -148,7 +151,8 @@ class SensorStreamService : Service() {
 
     private fun sendToBackend(base64Audio: String) {
         try {
-            val url = URL("$SERVER_URL/companion/audio-chunk")
+            val serverUrl = ServerConfig.savedBaseUrl(this)
+            val url = URL("$serverUrl/api/aris/companion/audio-chunk")
             val conn = url.openConnection() as HttpURLConnection
             conn.requestMethod = "POST"
             conn.setRequestProperty("Content-Type", "application/json")

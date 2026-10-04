@@ -11,6 +11,7 @@ import android.net.Uri
 import android.os.Build
 import android.util.Base64
 import android.util.Log
+import com.example.ariscompanion.ServerConfig
 import com.example.ariscompanion.VisionState
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
@@ -32,9 +33,8 @@ import org.json.JSONArray
 import org.json.JSONObject
 
 private const val TAG = "ChatViewModel"
-private const val PREFS_NAME = "aris_chat_prefs"
 private const val PREF_AUTH_TOKEN = "auth_token"
-private const val PREF_SERVER_URL = "server_url"
+private const val PREF_SERVER_URL = ServerConfig.SERVER_URL_PREFERENCE
 private const val PREF_EMAIL = "email"
 private const val PREF_MESSAGES = "chat_messages"
 private const val SESSION_ID = "aris-android-chat"
@@ -44,12 +44,12 @@ private const val WAVEFORM_SAMPLES = 40
 
 class ChatViewModel(private val appContext: Context) : ViewModel() {
 
-    private val prefs: SharedPreferences = appContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+    private val prefs: SharedPreferences = appContext.getSharedPreferences(ServerConfig.PREFERENCES_NAME, Context.MODE_PRIVATE)
 
     private val _uiState = MutableStateFlow(
         ChatUiState(
             messages = loadPersistedMessages(),
-            serverUrl = prefs.getString(PREF_SERVER_URL, "https://impose-persuaded-unjustly.ngrok-free.dev") ?: "https://impose-persuaded-unjustly.ngrok-free.dev",
+            serverUrl = ServerConfig.savedBaseUrl(appContext),
             email = prefs.getString(PREF_EMAIL, "") ?: "",
             isAuthenticated = prefs.getString(PREF_AUTH_TOKEN, null) != null,
         )
