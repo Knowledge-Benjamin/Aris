@@ -88,6 +88,22 @@ async function setup() {
   `).catch(() => undefined);
 
   await pool.query(`
+    CREATE TABLE IF NOT EXISTS news_research_records (
+      id SERIAL PRIMARY KEY,
+      user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+      session_id TEXT,
+      query TEXT NOT NULL,
+      articles JSONB NOT NULL DEFAULT '[]',
+      created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+    );
+  `).catch(() => undefined);
+
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS news_research_records_user_created_idx
+    ON news_research_records (user_id, created_at DESC);
+  `).catch(() => undefined);
+
+  await pool.query(`
     CREATE TABLE IF NOT EXISTS user_profiles (
       id SERIAL PRIMARY KEY,
       user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
