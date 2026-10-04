@@ -1,5 +1,11 @@
 node_modules/
 dist/
 .env
-.env.local
+.env.*
+!.env.example
+(2).env
+(2).gitignore
 .meeting-profile/
+.research-browser-profile/
+**/build/
+*.log
