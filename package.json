@@ -12,6 +12,7 @@
     "db:setup": "ts-node server/src/db/setup.ts"
   },
   "dependencies": {
+    "@ngrok/ngrok": "^1.7.0",
     "@types/pdfkit": "^0.17.6",
     "axios": "^1.7.0",
     "dotenv": "^16.3.1",
