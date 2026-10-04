@@ -123,6 +123,13 @@ export const goalsStore = {
     await pool.query(`UPDATE daily_tasks SET status = $1, updated_at = NOW() WHERE id = $2`, [status, taskId]);
   },
 
+  async updateTaskDescription(taskId: number, description: string): Promise<void> {
+    await pool.query(
+      `UPDATE daily_tasks SET description = $1, updated_at = NOW() WHERE id = $2`,
+      [description, taskId]
+    );
+  },
+
   async getYesterdayTasks(userId: number): Promise<DailyTask[]> {
     const res = await pool.query(`
       SELECT * FROM daily_tasks 
