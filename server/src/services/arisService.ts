@@ -685,7 +685,7 @@ export class ArisService {
   }
 
   private isCurrentLocationRequest(message: string): boolean {
-    return /\b(?:where\s+am\s+i|what(?:'s| is)?\s+my\s+(?:current\s+)?location|my\s+current\s+location)\b/i.test(message);
+    return /\b(?:where\s+am\s+i(?:\s+located)?|where\s+am\s+i\s+right\s+now|do\s+you\s+know\s+(?:my\s+)?(?:current\s+)?location|do\s+you\s+know\s+where\s+i\s+am|can\s+you\s+(?:tell|find)\s+(?:me\s+)?(?:my\s+)?(?:current\s+)?location|what(?:'s| is)?\s+my\s+(?:current\s+)?location|my\s+current\s+location)\b/i.test(message);
   }
 
   private formatCurrentDateTime(timeZone?: string): string {
@@ -5361,6 +5361,5 @@ ${this.truncateText(item.content, 1200)}`);
     return `${text.slice(0, maxLength).trim()}...`;
   }
 }
-
 
 
