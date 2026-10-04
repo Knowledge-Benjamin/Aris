@@ -3860,6 +3860,7 @@ export class ArisService {
     const calendarKeywords = /\b(calendar|appointment|meeting|schedule|event|events|availability|today|tomorrow|next week|next month|this week|next month)\b/i;
     const newsKeywords = /\b(news|headlines|current events|world events|breaking news|today's news|today news|news brief|news podcast|podcast episode)\b/i;
     const trafficKeywords = /\b(traffic|trafic|commute|congestion|route|ETA|estimated arrival|travel time|delay|jam|accident|roadwork|road work|gridlock|rush hour|leave now|leave at|when should I leave|how long will it take)\b/i;
+    const nearbyIntent = /\b(near me|nearby|near here|closest|nearest|around me|close to me|in my area)\b/i;
     const searchKeywords = /\b(search|look up|find|research|what is|who is|where is|latest|current|news|today's|today|tomorrow)\b/i;
     const retryKeywords = /\b(try again|retry|again|repeat|re-run|rerun|run again)\b/i;
     const anaphoraRef = /\b(this|that|it|same|previous|recent|last|first|second|third|fourth|fifth|the one|the other|those|these)\b/i;
@@ -3925,6 +3926,16 @@ export class ArisService {
 
     if (calendarKeywords.test(normalized)) {
       return { tool: "google_calendar_events", payload: { maxResults: 10 } };
+    }
+
+    if (nearbyIntent.test(normalized) && !trafficKeywords.test(normalized) && !/\b(weather|forecast|rain|temperature|air quality)\b/i.test(normalized)) {
+      const query = normalized
+        .replace(/\b(?:near me|nearby|near here|closest|nearest|around me|close to me|in my area)\b/gi, " ")
+        .replace(/\b(?:find|show|list|locate|what are|where are|is there|are there|the|a|an|good|best)\b/gi, " ")
+        .replace(/[?.!,]/g, " ")
+        .replace(/\s+/g, " ")
+        .trim() || "services";
+      return { tool: "tomtom_nearby", payload: { query, radiusMeters: 5000, limit: 10 } };
     }
 
     if (trafficKeywords.test(normalized)) {
@@ -4108,6 +4119,9 @@ export class ArisService {
     if (this.hasFuzzyMatch(allWords, ["whatsapp", "wa", "chat"])) categories.add("whatsapp");
     if (this.hasFuzzyMatch(allWords, ["traffic", "route", "commute", "drive", "directions", "eta"])) categories.add("traffic");
     if (this.hasFuzzyMatch(allWords, ["weather", "forecast", "air", "quality", "marine", "ocean", "rain", "temperature", "temp", "cold", "hot"])) categories.add("weather");
+    if (/\b(near me|nearby|near here|closest|nearest|around me|close to me|in my area|location|coordinates)\b/i.test(msgOnly)) {
+      categories.add("location");
+    }
     if (
       this.hasFuzzyMatch(allWords, ["join", "meet", "zoom", "meeting", "notetaker", "notes"]) &&
       (textToAnalyze.includes("meet.google.com") || textToAnalyze.includes("zoom.us") || textToAnalyze.includes("join") )
@@ -4120,6 +4134,11 @@ export class ArisService {
     }
 
     return categories;
+  }
+
+  private isCurrentLocationReference(query: string): boolean {
+    return /\b(?:near me|around me|nearby|near here|close to me|in my area|my location|current location|here|right now|currently)\b/i.test(query) ||
+      /^(?:traffic|traffic now|how(?:'s| is) traffic|what(?:'s| is) traffic|check traffic)$/i.test(query.trim());
   }
 
   private async executeToolChain(
