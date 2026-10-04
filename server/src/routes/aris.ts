@@ -1,5 +1,5 @@
 import { Router } from "express";
-import { arisChat, arisChatStream, arisVoice, arisWelcome, companionAudio } from "../controllers/arisController";
+import { arisChat, arisChatStream, arisVoice, arisWelcome, companionAudio, updateCompanionLocation } from "../controllers/arisController";
 import { enqueueCommand, pollCommands, evaluateScreen } from "../controllers/autonomyController";
 import { storeSecret, retrieveSecret } from "../controllers/vaultController";
 import { enrollVoice, verifyVoice } from "../controllers/voiceController";
@@ -9,6 +9,7 @@ const router = Router();
 
 router.post("/chat", authenticate, arisChat);
 router.post("/chat/stream", authenticate, arisChatStream);
+router.post("/location", authenticate, updateCompanionLocation);
 router.post("/voice", authenticate, arisVoice);
 router.post("/welcome", authenticate, arisWelcome);
 router.post("/companion/audio-chunk", companionAudio);

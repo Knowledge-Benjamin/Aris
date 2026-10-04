@@ -12,6 +12,7 @@ import android.os.Build
 import android.util.Base64
 import android.util.Log
 import com.example.ariscompanion.ServerConfig
+import com.example.ariscompanion.PhoneLocationProvider
 import com.example.ariscompanion.VisionState
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
@@ -133,6 +134,15 @@ class ChatViewModel(private val appContext: Context) : ViewModel() {
     private val client: ArisApiClient?
         get() = authToken?.let { ArisApiClient(_uiState.value.serverUrl, it) }
 
+    private suspend fun syncPhoneLocation() {
+        val token = authToken ?: return
+        try {
+            PhoneLocationProvider.uploadCurrentLocation(appContext, _uiState.value.serverUrl, token)
+        } catch (e: Exception) {
+            Log.w(TAG, "Phone location could not be shared; the server will use its network-location fallback", e)
+        }
+    }
+
     // Voice recording state
     private var audioRecord: AudioRecord? = null
     private var recordingJob: Job? = null
@@ -237,6 +247,7 @@ class ChatViewModel(private val appContext: Context) : ViewModel() {
                 }
 
                 var finalResult: ArisChatResult? = null
+                syncPhoneLocation()
                 client?.chatStream(
                     text,
                     SESSION_ID,
@@ -498,6 +509,7 @@ class ChatViewModel(private val appContext: Context) : ViewModel() {
                 val arisId = UUID.randomUUID().toString()
                 appendMessage(ChatMessage(id = arisId, sender = Sender.ARIS, text = "", status = MessageStatus.SENDING))
                 var finalResult: ArisChatResult? = null
+                syncPhoneLocation()
                 client?.chatStream("approved", SESSION_ID, approvedActionPayload) { event ->
                     when (event.type) {
                         "progress" -> _uiState.update { it.copy(progressMessage = event.message) }

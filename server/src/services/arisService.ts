@@ -686,7 +686,7 @@ export class ArisService {
   }
 
   private isCurrentLocationRequest(message: string): boolean {
-    return /\b(?:where\s+am\s+i(?:\s+located)?|where\s+am\s+i\s+right\s+now|do\s+you\s+know\s+(?:my\s+)?(?:current\s+)?location|do\s+you\s+know\s+where\s+i\s+am|can\s+you\s+(?:tell|find)\s+(?:me\s+)?(?:my\s+)?(?:current\s+)?(?:location|coordinates)|what(?:'s| is)?\s+my\s+(?:current\s+)?(?:location|coordinates)|my\s+current\s+(?:location|coordinates)|(?:exact|precise)\s+(?:gps\s+)?coordinates)\b/i.test(message);
+    return /\b(?:where\s+am\s+i(?:\s+located)?|where\s+am\s+i\s+right\s+now|do\s+you\s+know\s+(?:my\s+)?(?:current\s+)?location|do\s+you\s+know\s+where\s+i\s+am|can\s+you\s+(?:tell|find|give)\s+(?:me\s+)?(?:my\s+)?(?:current\s+)?(?:location|coordinates)|what(?:'s| is| are)?\s+my\s+(?:current\s+)?(?:location|coordinates)|my\s+current\s+(?:location|coordinates)|(?:exact|precise)\s+(?:gps\s+)?coordinates)\b/i.test(message);
   }
 
   private formatCurrentDateTime(timeZone?: string): string {
@@ -2446,7 +2446,11 @@ export class ArisService {
           location = { lat: currentLocation.lat, lon: currentLocation.lon };
         }
 
-        const data = await this.tomtomService.getTrafficFlow(location);
+        const data = typeof requestedLocation === "string" &&
+          payload.query === requestedLocation &&
+          !this.isCurrentLocationReference(requestedLocation)
+          ? await this.tomtomService.getTrafficFromQuery(requestedLocation)
+          : await this.tomtomService.getTrafficFlow(location);
         const result = { success: true, tool: toolName, data };
         this.recordLastToolInvocation(userId, sessionId, invocation);
         return result;
@@ -2563,8 +2567,13 @@ export class ArisService {
           resultData = await this.weatherService.geocode(payload.name, payload.count);
         } else {
           const currentLocation = await this.locationService.getCurrentLocation(false, userId);
-          const lat = payload.lat ?? currentLocation?.lat;
-          const lon = payload.lon ?? currentLocation?.lon;
+          const hasLatitude = payload.lat !== undefined;
+          const hasLongitude = payload.lon !== undefined;
+          if (hasLatitude !== hasLongitude) {
+            return { success: false, tool: toolName, error: "Weather coordinates must include both latitude and longitude." };
+          }
+          const lat = hasLatitude ? payload.lat : currentLocation?.lat;
+          const lon = hasLongitude ? payload.lon : currentLocation?.lon;
           if (typeof lat !== "number" || typeof lon !== "number") {
             return { success: false, tool: toolName, error: "No coordinates are available for this weather request." };
           }
@@ -4137,8 +4146,13 @@ export class ArisService {
   }
 
   private isCurrentLocationReference(query: string): boolean {
-    return /\b(?:near me|around me|nearby|near here|close to me|in my area|my location|current location|here|right now|currently)\b/i.test(query) ||
-      /^(?:traffic|traffic now|how(?:'s| is) traffic|what(?:'s| is) traffic|check traffic)$/i.test(query.trim());
+    if (/\b(?:near me|around me|nearby|near here|close to me|in my area|my location|current location|here)\b/i.test(query)) {
+      return true;
+    }
+    if (/\b(?:in|near|around|at|from|to|on)\s+(?!me\b|here\b|my area\b|my location\b)[a-z0-9]/i.test(query)) {
+      return false;
+    }
+    return /\b(?:traffic|incidents?|accidents?|roadworks?|closures?|crashes?|hazards?|breakdowns?)\b/i.test(query);
   }
 
   private async executeToolChain(

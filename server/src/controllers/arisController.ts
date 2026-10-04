@@ -9,6 +9,7 @@ import { AuthenticatedRequest } from "../middleware/authMiddleware";
 
 import { ContextStore } from "../db/contextStore";
 import { CompanionService } from "../services/companionService";
+import { sharedLocationService } from "../services/locationService";
 
 const pool = getDatabasePool();
 const memoryStore = new MemoryStore(pool);
@@ -17,6 +18,34 @@ const gemmaService = new GemmaService();
 const arisService = new ArisService(memoryStore, contextStore, gemmaService);
 const voiceService = new VoiceService();
 const companionService = new CompanionService(gemmaService);
+
+export async function updateCompanionLocation(req: Request, res: Response) {
+  const userId = (req as AuthenticatedRequest).authUserId;
+  if (!userId) {
+    return res.status(401).json({ error: "Unauthorized user." });
+  }
+
+  try {
+    const { lat, lon, accuracyMeters, capturedAtEpochMs, timezone } = req.body || {};
+    if (typeof lat !== "number" || typeof lon !== "number" || typeof capturedAtEpochMs !== "number" ||
+        (accuracyMeters !== undefined && typeof accuracyMeters !== "number") ||
+        (timezone !== undefined && typeof timezone !== "string")) {
+      return res.status(400).json({ error: "lat, lon, capturedAtEpochMs, and optional accuracyMeters/timezone have invalid types." });
+    }
+
+    sharedLocationService.setDeviceLocation(userId, {
+      lat,
+      lon,
+      accuracyMeters,
+      capturedAtEpochMs,
+      timezone,
+    });
+    return res.status(204).end();
+  } catch (err) {
+    const message = err instanceof Error ? err.message : "Invalid location data.";
+    return res.status(400).json({ error: message });
+  }
+}
 
 export async function arisChat(req: Request, res: Response) {
   try {

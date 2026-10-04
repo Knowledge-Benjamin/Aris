@@ -42,16 +42,25 @@ fun MainScreen(
     val isListening by AudioState.isListening.collectAsState()
     val amplitude by AudioState.currentAmplitude.collectAsState()
     val isVisionActive by VisionState.isCapturing.collectAsState()
-    val hasLocationPermission = remember {
-        mutableStateOf(com.example.ariscompanion.PhoneLocationProvider.hasLocationPermission(context))
+    val locationPermissionLabel = remember {
+        mutableStateOf(
+            when {
+                ContextCompat.checkSelfPermission(context, android.Manifest.permission.ACCESS_FINE_LOCATION) ==
+                    android.content.pm.PackageManager.PERMISSION_GRANTED -> "PHONE GPS ENABLED"
+                PhoneLocationProvider.hasLocationPermission(context) -> "APPROX LOCATION ON"
+                else -> null
+            }
+        )
     }
 
     val locationPermissionLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.RequestMultiplePermissions()
     ) { permissions ->
-        hasLocationPermission.value =
-            permissions[android.Manifest.permission.ACCESS_FINE_LOCATION] == true ||
-                permissions[android.Manifest.permission.ACCESS_COARSE_LOCATION] == true
+        locationPermissionLabel.value = when {
+            permissions[android.Manifest.permission.ACCESS_FINE_LOCATION] == true -> "PHONE GPS ENABLED"
+            permissions[android.Manifest.permission.ACCESS_COARSE_LOCATION] == true -> "APPROX LOCATION ON"
+            else -> null
+        }
     }
 
     // Screen Capture Launcher
@@ -209,14 +218,14 @@ fun MainScreen(
                     }
                 },
                 colors = ButtonDefaults.buttonColors(
-                    containerColor = if (hasLocationPermission.value) Color(0xFF1E1E2A) else Color(0xFF245C72),
+                    containerColor = if (locationPermissionLabel.value != null) Color(0xFF1E1E2A) else Color(0xFF245C72),
                     contentColor = Color.White
                 ),
                 shape = RoundedCornerShape(24.dp),
                 modifier = Modifier.height(56.dp).width(240.dp)
             ) {
                 Text(
-                    if (hasLocationPermission.value) "PHONE LOCATION ENABLED" else "ENABLE PHONE LOCATION",
+                    locationPermissionLabel.value ?: "ENABLE PHONE LOCATION",
                     fontWeight = FontWeight.SemiBold,
                     letterSpacing = 0.5.sp
                 )

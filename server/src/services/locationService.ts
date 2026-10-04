@@ -71,6 +71,12 @@ export class LocationService {
       }
     }
 
+    for (const [storedUserId, location] of this.deviceLocations) {
+      if (now - (location.capturedAtEpochMs ?? 0) > this.DEVICE_LOCATION_TTL_MS) {
+        this.deviceLocations.delete(storedUserId);
+      }
+    }
+
     this.deviceLocations.set(userId, {
       status: "success",
       source: "android",
