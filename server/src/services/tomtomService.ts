@@ -21,6 +21,14 @@ export interface TomTomLocation {
   address: string;
 }
 
+export interface TomTomNearbyPlace {
+  name: string;
+  address: string;
+  distanceMeters?: number;
+  categories: string[];
+  position: LatLon;
+}
+
 export interface TomTomTrafficRouteSummary {
   origin: TomTomLocation;
   destination: TomTomLocation;
@@ -138,6 +146,61 @@ export class TomTomService {
       error("[tomtomService] geocode failed", { query, message: err?.message, response: err?.response?.data });
       throw new Error(`TomTom geocode failed for ${query}: ${err?.message || "unknown error"}`);
     }
+  }
+
+  public async reverseGeocode(location: LatLon): Promise<TomTomLocation | null> {
+    const url = `${this.baseUrl}/search/2/reverseGeocode/${location.lat},${location.lon}.json`;
+    const response = await this.requestWithRetry<any>(url, {
+      key: this.apiKey,
+      radius: 1000,
+    });
+    const result = response.data?.addresses?.[0];
+    if (!result?.position) return null;
+
+    const address = result.address?.freeformAddress || result.address?.municipality || "Unknown place";
+    return {
+      lat: result.position.lat,
+      lon: result.position.lon,
+      displayName: address,
+      address,
+    };
+  }
+
+  public async getNearbyPlaces(
+    query: string,
+    location: LatLon,
+    options?: { radiusMeters?: number; limit?: number }
+  ): Promise<{ query: string; center: LatLon; radiusMeters: number; places: TomTomNearbyPlace[] }> {
+    const normalizedQuery = query.trim();
+    if (!normalizedQuery || normalizedQuery.length > 100) {
+      throw new Error("Nearby-place search requires a query of at most 100 characters.");
+    }
+    const radiusMeters = Math.max(100, Math.min(Math.round(options?.radiusMeters ?? 5000), 50_000));
+    const limit = Math.max(1, Math.min(Math.round(options?.limit ?? 10), 20));
+    const url = `${this.baseUrl}/search/2/poiSearch/${encodeURIComponent(normalizedQuery)}.json`;
+    const response = await this.requestWithRetry<any>(url, {
+      key: this.apiKey,
+      lat: location.lat,
+      lon: location.lon,
+      radius: radiusMeters,
+      limit,
+    });
+    const places = Array.isArray(response.data?.results)
+      ? response.data.results.map((result: any) => ({
+          name: result?.poi?.name || result?.address?.freeformAddress || "Unnamed place",
+          address: result?.address?.freeformAddress || "",
+          distanceMeters: Number.isFinite(result?.dist) ? result.dist : undefined,
+          categories: Array.isArray(result?.poi?.categories) ? result.poi.categories : [],
+          position: {
+            lat: result?.position?.lat,
+            lon: result?.position?.lon,
+          },
+        })).filter((place: TomTomNearbyPlace) =>
+          Number.isFinite(place.position.lat) && Number.isFinite(place.position.lon)
+        )
+      : [];
+
+    return { query: normalizedQuery, center: location, radiusMeters, places };
   }
 
   public async getTrafficRoute(
