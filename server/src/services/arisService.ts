@@ -352,12 +352,31 @@ export class ArisService {
           if (searchIndex !== -1) categories.splice(searchIndex, 1);
         }
         const intent = parsed.intent as RequestRouteIntent;
-        if (intent === "current_time" || intent === "current_date") categories.push("time");
-        if (intent === "current_location") categories.push("location");
+        const categoryForIntent: Partial<Record<RequestRouteIntent, string>> = {
+          current_time: "time",
+          current_date: "time",
+          current_location: "location",
+          weather: "weather",
+          traffic: "traffic",
+          news: "news",
+          web_research: "search",
+          calendar: "calendar",
+          gmail: "gmail",
+          whatsapp: "whatsapp",
+          contact: "contact",
+          meeting: "meeting",
+          briefing: "briefing",
+        };
+        const intentCategory = categoryForIntent[intent];
+        if (intentCategory && (intentCategory !== "search" || searchToolEnabled)) {
+          categories.push(intentCategory);
+        }
+        const reusePriorAnswer = parsed.reusePriorAnswer === true;
+        info(`[arisService] routed intent=${intent} categories=${Array.from(new Set(categories)).join(",") || "none"} reusePriorAnswer=${reusePriorAnswer}`);
         return {
           intent,
           categories: Array.from(new Set(categories)),
-          reusePriorAnswer: parsed.reusePriorAnswer === true,
+          reusePriorAnswer,
         };
       }
       error("[arisService] request router returned an invalid classification; using conservative local routing");
@@ -626,6 +645,7 @@ export class ArisService {
 
   async handleChat(input: ChatInput, onProgress?: (msg: string) => void): Promise<ArisResponse> {
     const sessionId = input.sessionId || "default";
+    await this.contextStore.warmCache(this.getContextKey(input.userId, sessionId));
     const approvalMessage = /^(approve|approved|yes|yes please|send it|do it|go ahead)$/i.test(input.message.trim());
     const storedApproval = !input.approvedAction && approvalMessage
       ? this.getLastToolInvocation(input.userId, sessionId)
@@ -639,8 +659,6 @@ export class ArisService {
       info(`[arisService] recovered pending approval tool=${storedApproval.tool} from typed confirmation`);
     }
     info(`[arisService] handleChat start sessionId=${sessionId} query="${input.message}" searchToolEnabled=${searchToolEnabled}`);
-
-    await this.contextStore.warmCache(this.getContextKey(input.userId, sessionId));
 
     // Auto-sync contacts on first use (when table is empty for this user)
     if (input.userId) {
@@ -713,7 +731,7 @@ export class ArisService {
     if (!isShortConversational) {
       try {
         memoryContext = await this.memoryStore.getRelevantMemories(input.userId, sessionId, effectiveMessage, 12);
-        if (requestRoute.categories.includes("search") || requestRoute.categories.includes("news")) {
+        if (requestRoute.categories.includes("search")) {
           memoryContext = [
             ...memoryContext,
             ...await this.getNewsResearchContext(input.userId, sessionId, effectiveMessage),
@@ -4206,7 +4224,16 @@ export class ArisService {
       activeCategories.delete("search");
     }
 
-    if (!approvedAction && requestRoute.reusePriorAnswer) {
+    const requiresFreshData = [
+      "current_time", "current_date", "current_location", "weather", "traffic",
+      "news", "calendar", "gmail", "whatsapp",
+    ].includes(requestRoute.intent);
+    if (
+      !approvedAction
+      && requestRoute.reusePriorAnswer
+      && !requiresFreshData
+      && !this.isExplicitWebResearchRequest(userMessage)
+    ) {
       const previousReply = this.getLastAssistantReply(conversationHistory);
       if (previousReply) {
         info("[arisService] reusing prior assistant answer for a semantically matching, non-current request");
@@ -5333,6 +5360,8 @@ export class ArisService {
       `If the user asked for destructive or sending actions, stop for approval instead of executing them automatically.`,
       `Do not include markdown, code fences, or any extra text outside the expected formats.`,
       `Use the user's conversation history and memories to resolve pronouns and implicit requests.`,
+      `Interpret the latest user message on its own first. Do not rewrite a standalone request using an unrelated prior tool result; only carry forward context when the conversation clearly makes the request a follow-up.`,
+      `Before calling a tool, compare the request with recent user/Aris turns. If a previous Aris answer already fully answers the same non-current question, reuse that answer instead of repeating the lookup. Always refresh inherently dynamic data such as current time, location, weather, traffic, inbox, calendar, or live news when the user asks for its current state.`,
       `Resolve minor spelling, spacing, transliteration, and punctuation differences against remembered names, contact names, subjects, event titles, and tool results. Prefer the closest unambiguous match; ask a clarification only when two or more matches are genuinely plausible.`,
       `When a follow-up omits its subject, carry forward the most recent relevant entity and tool result. Do not reset context merely because the latest message is short.`,
       ...toolInstructions,

@@ -22,7 +22,7 @@ export interface UserProfileEntry {
 
 export class MemoryStore {
   private embeddingClient = new EmbeddingClient();
-  private readonly minimumMemorySimilarity = 0.65;
+  private readonly minimumMemorySimilarity = 0.55;
 
   constructor(private pool: Pool) {}
 
