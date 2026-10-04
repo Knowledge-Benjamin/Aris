@@ -184,21 +184,22 @@ class ChatViewModel(private val appContext: Context) : ViewModel() {
     // ── Login ────────────────────────────────────────────────────────────────
 
     private fun doLogin(serverUrl: String, email: String, password: String) {
+        val normalizedServerUrl = ServerConfig.normalizeBaseUrl(serverUrl)
         _uiState.update { it.copy(isLoggingIn = true, loginError = null) }
         viewModelScope.launch {
             try {
-                val result = ArisApiClient.login(serverUrl, email, password)
+                val result = ArisApiClient.login(normalizedServerUrl, email, password)
                 authToken = result.token
                 prefs.edit()
                     .putString(PREF_AUTH_TOKEN, result.token)
-                    .putString(PREF_SERVER_URL, serverUrl)
+                    .putString(PREF_SERVER_URL, normalizedServerUrl)
                     .putString(PREF_EMAIL, email)
                     .apply()
                 _uiState.update {
                     it.copy(
                         isLoggingIn = false,
                         isAuthenticated = true,
-                        serverUrl = serverUrl,
+                        serverUrl = normalizedServerUrl,
                         email = email,
                         loginError = null,
                     )

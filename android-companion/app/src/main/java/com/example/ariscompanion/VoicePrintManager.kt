@@ -48,7 +48,7 @@ object VoicePrintManager {
         serverUrl: String
     ): Boolean = withContext(Dispatchers.IO) {
         try {
-            val url = URL("${serverUrl.trimEnd('/')}/api/aris/voice/enroll")
+            val url = URL("${ServerConfig.normalizeBaseUrl(serverUrl)}/api/aris/voice/enroll")
             val conn = url.openConnection() as HttpURLConnection
             conn.requestMethod = "POST"
             conn.setRequestProperty("Content-Type", "application/json")
@@ -82,7 +82,7 @@ object VoicePrintManager {
         serverUrl: String
     ): Boolean = withContext(Dispatchers.IO) {
         try {
-            val url = URL("${serverUrl.trimEnd('/')}/api/aris/voice/verify")
+            val url = URL("${ServerConfig.normalizeBaseUrl(serverUrl)}/api/aris/voice/verify")
             val conn = url.openConnection() as HttpURLConnection
             conn.requestMethod = "POST"
             conn.setRequestProperty("Content-Type", "application/json")
