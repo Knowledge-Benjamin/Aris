@@ -28,6 +28,7 @@ import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
 import androidx.navigation3.runtime.NavKey
 import com.example.ariscompanion.AudioState
+import com.example.ariscompanion.PhoneLocationProvider
 import com.example.ariscompanion.SensorStreamService
 import com.example.ariscompanion.ScreenCaptureService
 import com.example.ariscompanion.VisionState
@@ -41,6 +42,17 @@ fun MainScreen(
     val isListening by AudioState.isListening.collectAsState()
     val amplitude by AudioState.currentAmplitude.collectAsState()
     val isVisionActive by VisionState.isCapturing.collectAsState()
+    val hasLocationPermission = remember {
+        mutableStateOf(com.example.ariscompanion.PhoneLocationProvider.hasLocationPermission(context))
+    }
+
+    val locationPermissionLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.RequestMultiplePermissions()
+    ) { permissions ->
+        hasLocationPermission.value =
+            permissions[android.Manifest.permission.ACCESS_FINE_LOCATION] == true ||
+                permissions[android.Manifest.permission.ACCESS_COARSE_LOCATION] == true
+    }
 
     // Screen Capture Launcher
     val projectionManager = remember {
@@ -183,6 +195,39 @@ fun MainScreen(
                 Text(if (isListening) "DISABLE AUDIO" else "ENABLE AUDIO", fontWeight = FontWeight.SemiBold, letterSpacing = 1.sp)
             }
             
+            Spacer(modifier = Modifier.height(16.dp))
+
+            Button(
+                onClick = {
+                    if (!PhoneLocationProvider.hasLocationPermission(context)) {
+                        locationPermissionLauncher.launch(
+                            arrayOf(
+                                android.Manifest.permission.ACCESS_COARSE_LOCATION,
+                                android.Manifest.permission.ACCESS_FINE_LOCATION,
+                            )
+                        )
+                    }
+                },
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = if (hasLocationPermission.value) Color(0xFF1E1E2A) else Color(0xFF245C72),
+                    contentColor = Color.White
+                ),
+                shape = RoundedCornerShape(24.dp),
+                modifier = Modifier.height(56.dp).width(240.dp)
+            ) {
+                Text(
+                    if (hasLocationPermission.value) "PHONE LOCATION ENABLED" else "ENABLE PHONE LOCATION",
+                    fontWeight = FontWeight.SemiBold,
+                    letterSpacing = 0.5.sp
+                )
+            }
+            Text(
+                text = "Shared with Aris during chat for local results",
+                color = Color.Gray,
+                fontSize = 11.sp,
+                modifier = Modifier.padding(top = 6.dp)
+            )
+
             Spacer(modifier = Modifier.height(16.dp))
 
             // Vision Toggle
