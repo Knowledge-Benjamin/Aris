@@ -39,7 +39,14 @@ const arisLimiter = rateLimit({
   legacyHeaders: false, // Disable the `X-RateLimit-*` headers
 });
 
-app.get("/health", (_, res) => res.json({ status: "ok", service: "aris" }));
+app.get("/health", (_, res) => res.json({
+  status: "ok",
+  service: "aris",
+  publicUrl: app.locals.publicBaseUrl ?? null,
+}));
+app.get("/api/server/config", (_, res) => {
+  res.json({ baseUrl: app.locals.publicBaseUrl ?? null });
+});
 app.use("/api/auth", authRouter);
 app.use("/api/aris", arisLimiter, arisRouter);
 app.use("/api/search", searchRouter);

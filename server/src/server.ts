@@ -1,12 +1,89 @@
 import dotenv from "dotenv";
-import { app } from "./app";
-import { startBackgroundJobs } from "./backgroundJobs";
+import * as ngrok from "@ngrok/ngrok";
+import { Server } from "http";
 
 dotenv.config();
 
-const PORT = process.env.SERVER_PORT ? Number(process.env.SERVER_PORT) : 4000;
+function readPort(): number {
+  const value = process.env.SERVER_PORT?.trim();
+  const port = value ? Number(value) : 4000;
+  if (!Number.isInteger(port) || port < 1 || port > 65535) {
+    throw new Error("SERVER_PORT must be an integer between 1 and 65535.");
+  }
+  return port;
+}
 
-app.listen(PORT, () => {
-  console.log(`Aris server listening on http://localhost:${PORT}`);
+function isPlaceholder(value: string): boolean {
+  return /^(replace[-_ ]|your[-_ ])/i.test(value);
+}
+
+async function listen(port: number): Promise<Server> {
+  const { app } = await import("./app");
+  return new Promise((resolve, reject) => {
+    const server = app.listen(port);
+    server.once("error", reject);
+    server.once("listening", () => {
+      server.off("error", reject);
+      resolve(server);
+    });
+  });
+}
+
+async function startServer(): Promise<void> {
+  const port = readPort();
+  const { app } = await import("./app");
+  const { startBackgroundJobs } = await import("./backgroundJobs");
+  const server = await listen(port);
+  const localUrl = `http://localhost:${port}`;
+  app.locals.publicBaseUrl = localUrl;
+
+  console.log(`Aris server listening on ${localUrl}`);
   startBackgroundJobs();
+
+  const authToken = process.env.NGROK_AUTHTOKEN?.trim();
+  const domain = process.env.NGROK_DOMAIN?.trim();
+
+  if (!authToken || isPlaceholder(authToken)) {
+    console.info("[ngrok] Tunnel disabled; set NGROK_AUTHTOKEN and NGROK_DOMAIN to enable it.");
+  } else {
+    try {
+      const listener = await ngrok.forward({
+        addr: `localhost:${port}`,
+        authtoken: authToken,
+        ...(domain && !isPlaceholder(domain) ? { domain } : {}),
+      });
+      app.locals.publicBaseUrl = listener.url();
+      console.log(`[ngrok] Public server URL: ${listener.url()}`);
+    } catch (error) {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+      throw new Error("Failed to start the configured ngrok tunnel.", { cause: error });
+    }
+  }
+
+  let shuttingDown = false;
+  const shutdown = (signal: NodeJS.Signals) => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    console.info(`Received ${signal}; closing the server and ngrok tunnel.`);
+    void (async () => {
+      try {
+        await ngrok.kill();
+      } catch (error) {
+        console.error("[ngrok] Failed to close tunnel cleanly.", error);
+      }
+      server.close((error) => {
+        if (error) {
+          console.error("Failed to close HTTP server cleanly.", error);
+          process.exitCode = 1;
+        }
+      });
+    })();
+  };
+  process.once("SIGINT", shutdown);
+  process.once("SIGTERM", shutdown);
+}
+
+startServer().catch((error) => {
+  console.error("Aris server failed to start:", error);
+  process.exitCode = 1;
 });
