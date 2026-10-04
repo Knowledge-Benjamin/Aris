@@ -13,27 +13,18 @@ function readPort(): number {
   return port;
 }
 
-function isPlaceholder(value: string): boolean {
-  return /^(replace[-_ ]|your[-_ ])/i.test(value);
-}
-
-async function listen(port: number): Promise<Server> {
-  const { app } = await import("./app");
-  return new Promise((resolve, reject) => {
-    const server = app.listen(port);
-    server.once("error", reject);
-    server.once("listening", () => {
-      server.off("error", reject);
-      resolve(server);
-    });
-  });
-}
-
 async function startServer(): Promise<void> {
   const port = readPort();
   const { app } = await import("./app");
   const { startBackgroundJobs } = await import("./backgroundJobs");
-  const server = await listen(port);
+  const server = await new Promise<Server>((resolve, reject) => {
+    const listeningServer = app.listen(port);
+    listeningServer.once("error", reject);
+    listeningServer.once("listening", () => {
+      listeningServer.off("error", reject);
+      resolve(listeningServer);
+    });
+  });
   const localUrl = `http://localhost:${port}`;
   app.locals.publicBaseUrl = localUrl;
 
@@ -42,8 +33,9 @@ async function startServer(): Promise<void> {
 
   const authToken = process.env.NGROK_AUTHTOKEN?.trim();
   const domain = process.env.NGROK_DOMAIN?.trim();
+  let tunnelStarted = false;
 
-  if (!authToken || isPlaceholder(authToken)) {
+  if (!authToken || /^(replace[-_ ]|your[-_ ])/i.test(authToken)) {
     console.info("[ngrok] Tunnel disabled; set NGROK_AUTHTOKEN and NGROK_DOMAIN to enable it.");
   } else {
     try {
@@ -53,10 +45,12 @@ async function startServer(): Promise<void> {
         ...(domain && !isPlaceholder(domain) ? { domain } : {}),
       });
       app.locals.publicBaseUrl = listener.url();
+      tunnelStarted = true;
       console.log(`[ngrok] Public server URL: ${listener.url()}`);
     } catch (error) {
       await new Promise<void>((resolve) => server.close(() => resolve()));
-      throw new Error("Failed to start the configured ngrok tunnel.", { cause: error });
+      console.error("[ngrok] Failed to start the configured tunnel.", error);
+      throw new Error("Failed to start the configured ngrok tunnel.");
     }
   }
 
@@ -66,10 +60,12 @@ async function startServer(): Promise<void> {
     shuttingDown = true;
     console.info(`Received ${signal}; closing the server and ngrok tunnel.`);
     void (async () => {
-      try {
-        await ngrok.kill();
-      } catch (error) {
-        console.error("[ngrok] Failed to close tunnel cleanly.", error);
+      if (tunnelStarted) {
+        try {
+          await ngrok.kill();
+        } catch (error) {
+          console.error("[ngrok] Failed to close tunnel cleanly.", error);
+        }
       }
       server.close((error) => {
         if (error) {
