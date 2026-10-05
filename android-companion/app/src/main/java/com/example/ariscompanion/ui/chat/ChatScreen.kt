@@ -121,15 +121,39 @@ fun ChatScreen(
         if (state.messages.isNotEmpty()) listState.animateScrollToItem(state.messages.lastIndex)
     }
 
-    val chatBackground = Color(0xFF07131B)
-    val arisBubble = Color(0xFF172832)
-    val userBubble = Color(0xFF075E54)
-    val accent = Color(0xFF65E6D0)
+    val chatBackground = Color(0xFF07070B)
+    val arisBubble = Color(0xFF17162A)
+    val userBubble = Color(0xFF07384A)
+    val accent = Color(0xFF00F0FF)
     val inputEnabled = state.inputText.isNotBlank() || state.stagedAttachment != null
 
-    Column(
-        modifier = modifier.fillMaxSize().background(chatBackground),
-    ) {
+    Box(modifier = modifier.fillMaxSize().background(chatBackground)) {
+        Canvas(Modifier.fillMaxSize()) {
+            drawRect(
+                brush = Brush.linearGradient(
+                    listOf(Color(0xFF090A18), Color(0xFF15102B), Color(0xFF061B29)),
+                    start = Offset(0f, 0f),
+                    end = Offset(size.width, size.height),
+                )
+            )
+            drawCircle(
+                Color(0xFF4E2B9B).copy(alpha = 0.18f),
+                size.minDimension * 0.42f,
+                Offset(size.width * 0.18f, size.height * 0.22f),
+            )
+            drawCircle(
+                Color(0xFF00D8E8).copy(alpha = 0.11f),
+                size.minDimension * 0.34f,
+                Offset(size.width * 0.86f, size.height * 0.66f),
+            )
+            drawLine(
+                Color.White.copy(alpha = 0.035f),
+                Offset(0f, size.height * 0.7f),
+                Offset(size.width, size.height * 0.45f),
+                1f,
+            )
+        }
+        Column(modifier = Modifier.fillMaxSize()) {
         if (!state.isAuthenticated) {
             LoginForm(
                 serverUrl = serverUrl,
@@ -145,7 +169,7 @@ fun ChatScreen(
             )
         } else {
             Row(
-                modifier = Modifier.fillMaxWidth().background(Color(0xFF10212A)).padding(horizontal = 8.dp, vertical = 8.dp),
+                modifier = Modifier.fillMaxWidth().background(Color(0xE610111F)).padding(horizontal = 8.dp, vertical = 8.dp),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
                 TextButton(onClick = onBack, contentPadding = PaddingValues(horizontal = 8.dp)) {
@@ -154,7 +178,7 @@ fun ChatScreen(
                 Surface(
                     modifier = Modifier.size(42.dp),
                     shape = CircleShape,
-                    color = Color(0xFF0A4850),
+                    color = Color(0xFF16253A),
                 ) {
                     Box(contentAlignment = Alignment.Center) {
                         Text("A", color = accent, fontSize = 21.sp, fontWeight = FontWeight.Bold)
@@ -164,7 +188,7 @@ fun ChatScreen(
                     Text("Aris", color = Color(0xFFF3F7F8), fontSize = 17.sp, fontWeight = FontWeight.SemiBold)
                     Text(
                         "Your private assistant",
-                        color = Color(0xFF9EB1B9),
+                        color = Color(0xFF9DAAC2),
                         fontSize = 12.sp,
                     )
                 }
@@ -204,7 +228,7 @@ fun ChatScreen(
             }
 
             Column(
-                modifier = Modifier.fillMaxWidth().background(Color(0xFF0D1D25)).padding(horizontal = 9.dp, vertical = 7.dp),
+                modifier = Modifier.fillMaxWidth().background(Color(0xE90B0D1A)).padding(horizontal = 9.dp, vertical = 7.dp),
             ) {
                 state.replyingTo?.let { reply ->
                     ReplyPreview(
@@ -218,7 +242,7 @@ fun ChatScreen(
                     ReplyPreview(
                         title = attachment.fileName,
                         content = "${attachment.mimeType} · ready to send",
-                        accent = Color(0xFF80D6C5),
+                        accent = Color(0xFF00D8E8),
                         onDismiss = { viewModel.onEvent(ChatUiEvent.ClearStagedAttachment) },
                     )
                 }
@@ -241,7 +265,7 @@ fun ChatScreen(
                         Surface(
                             modifier = Modifier.weight(1f),
                             shape = RoundedCornerShape(25.dp),
-                            color = Color(0xFF1A2C35),
+                            color = Color(0xFF17182A),
                         ) {
                             BasicTextField(
                                 value = state.inputText,
@@ -252,7 +276,7 @@ fun ChatScreen(
                                 decorationBox = { innerTextField ->
                                     Box {
                                         if (state.inputText.isEmpty()) {
-                                            Text("Message Aris", color = Color(0xFF91A6AE), fontSize = 15.sp)
+                                            Text("Message Aris", color = Color(0xFF929BB1), fontSize = 15.sp)
                                         }
                                         innerTextField()
                                     }
@@ -282,6 +306,7 @@ fun ChatScreen(
                             ) {
                                 Text("●", color = Color(0xFF062B2A), fontSize = 17.sp)
                             }
+                        }
                         }
                     }
                 }
@@ -455,19 +480,16 @@ private fun MessageBubble(
                             )
                         }
                     }
-                    if (message.status == MessageStatus.ERROR) {
-                        Text("Tap to review this message", color = Color(0xFFFFC5BD), fontSize = 10.sp)
-                    }
                 }
             }
             Text(
-                text = "↩",
+                text = "Reply",
                 color = Color(0xFF91A7AE),
-                fontSize = 18.sp,
+                fontSize = 10.sp,
                 modifier = Modifier
-                    .padding(horizontal = 3.dp, vertical = 5.dp)
+                    .padding(horizontal = 2.dp, vertical = 5.dp)
                     .clickable(onClick = onReply)
-                    .padding(4.dp),
+                    .padding(horizontal = 4.dp, vertical = 6.dp),
             )
         }
     }
