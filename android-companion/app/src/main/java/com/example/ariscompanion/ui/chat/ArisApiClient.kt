@@ -23,6 +23,10 @@ class ArisApiClient(serverUrl: String, private val token: String) {
         }
     }
 
+    suspend fun acknowledgeOutboxMessage(messageId: Long) = withContext(Dispatchers.IO) {
+        request("POST", "/api/aris/outbox/$messageId/ack")
+    }
+
     suspend fun chatStream(
         message: String,
         sessionId: String,
@@ -121,22 +125,54 @@ class ArisApiClient(serverUrl: String, private val token: String) {
         replyContext: String? = null,
     ): VoiceChatResult =
         withContext(Dispatchers.IO) {
-            val result = request(
-                method = "POST",
-                path = "/api/aris/voice",
-                body = JSONObject()
+            val connection = openConnection("POST", "/api/aris/voice").apply {
+                setRequestProperty("Content-Type", "application/json")
+                setRequestProperty("Accept", "application/x-ndjson")
+                doOutput = true
+            }
+            try {
+                val body = JSONObject()
                     .put("audioBase64", audioBase64)
                     .put("mimeType", mimeType)
                     .put("sessionId", sessionId)
-                    .apply { replyContext?.let { put("replyContext", it) } },
-            )
-            VoiceChatResult(
-                arisReply = result.optString("arisReply"),
-                memoryUpdates = result.optJSONArray("memoryUpdates").toStringList(),
-                voiceBase64 = result.optString("voiceBase64").ifEmpty { null },
-                voiceMimeType = result.optString("voiceMimeType").ifEmpty { null },
-                voiceError = result.optString("voiceError").ifEmpty { null },
-            )
+                    .apply { replyContext?.let { put("replyContext", it) } }
+                connection.outputStream.use { it.write(body.toString().toByteArray(Charsets.UTF_8)) }
+                val statusCode = connection.responseCode
+                val stream = if (statusCode in 200..299) connection.inputStream else connection.errorStream
+                if (statusCode !in 200..299) {
+                    val errorText = stream?.bufferedReader()?.use(BufferedReader::readText).orEmpty()
+                    throw httpError(statusCode, errorText)
+                }
+                var result: JSONObject? = null
+                stream?.bufferedReader()?.useLines { lines ->
+                    lines.forEach { rawLine ->
+                        val line = rawLine.trim()
+                        if (line.isEmpty()) return@forEach
+                        val event = JSONObject(line)
+                        when (event.optString("type")) {
+                            "complete" -> result = event.optJSONObject("data")
+                            "error" -> throw IOException(
+                                event.optString("error").ifEmpty { "Aris couldn't complete that voice request." }
+                            )
+                        }
+                    }
+                }
+                val completedResult = result
+                    ?: throw IOException("The voice response ended before Aris returned an answer.")
+                val arisReply = completedResult.optString("arisReply")
+                if (arisReply.isBlank()) {
+                    throw IOException("Aris returned an empty voice response.")
+                }
+                VoiceChatResult(
+                    arisReply = arisReply,
+                    memoryUpdates = completedResult.optJSONArray("memoryUpdates").toStringList(),
+                    voiceBase64 = completedResult.optString("voiceBase64").ifEmpty { null },
+                    voiceMimeType = completedResult.optString("voiceMimeType").ifEmpty { null },
+                    voiceError = completedResult.optString("voiceError").ifEmpty { null },
+                )
+            } finally {
+                connection.disconnect()
+            }
         }
 
     private fun request(method: String, path: String, body: JSONObject? = null): JSONObject {

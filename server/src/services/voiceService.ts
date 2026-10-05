@@ -39,6 +39,7 @@ export class VoiceService {
       info(`[voice] synthesizing speech with voice=${ttsVoiceName} audioEncoding=${encoding}`);
       const response = await axios.post(ttsUrl, requestBody, {
         headers: { "Content-Type": "application/json" },
+        timeout: 30000,
       });
 
       const audioContent = response.data?.audioContent;

@@ -587,11 +587,7 @@ export interface ArisAdviceResponse {
 export class GemmaService {
   async requestArisAdvice(prompt: string, mediaParts?: Array<{ inlineData: { mimeType: string; data: string } }>): Promise<ArisAdviceResponse> {
     if (!apiKey || !apiUrl) {
-      return {
-        reply: "[Aris advisor unavailable: missing Gemma API config.]",
-        memoryEntries: [],
-        isFinalAnswer: false,
-      };
+      throw new Error("Aris response service is unavailable because its API configuration is missing.");
     }
 
     const url = buildGemmaUrl();
@@ -666,11 +662,7 @@ export class GemmaService {
           message: fallbackError.message,
           responseBody: fallbackError.response?.data,
         });
-        return {
-          reply: "I'm experiencing a bit of a technical hiccup connecting to my brain right now! It seems the upstream servers are taking a little nap. Could we try that again in a few minutes?",
-          memoryEntries: [],
-          isFinalAnswer: false,
-        };
+        throw new Error("Aris response service could not complete the request.");
       }
     }
 

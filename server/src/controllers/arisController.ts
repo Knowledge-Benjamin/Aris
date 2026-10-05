@@ -18,6 +18,7 @@ const gemmaService = new GemmaService();
 const arisService = new ArisService(memoryStore, contextStore, gemmaService);
 const voiceService = new VoiceService();
 const companionService = new CompanionService(gemmaService);
+const CHAT_FAILURE_MESSAGE = "I couldn't complete that just now. Please try again in a moment.";
 
 export async function updateCompanionLocation(req: Request, res: Response) {
   const userId = (req as AuthenticatedRequest).authUserId;
@@ -69,7 +70,7 @@ export async function arisChat(req: Request, res: Response) {
     res.json(response);
   } catch (error) {
     console.error("arisChat error", error);
-    res.status(500).json({ error: "Aris internal error" });
+    res.status(500).json({ error: CHAT_FAILURE_MESSAGE });
   }
 }
 
@@ -126,15 +127,16 @@ export async function arisChatStream(req: Request, res: Response) {
   } catch (error) {
     console.error("arisChatStream error", error);
     if (!res.headersSent) {
-      res.status(500).json({ error: "Aris internal error" });
+      res.status(500).json({ error: CHAT_FAILURE_MESSAGE });
     } else {
-      res.write(`${JSON.stringify({ error: "Aris internal error" })}\n`);
+      res.write(`${JSON.stringify({ type: "error", error: CHAT_FAILURE_MESSAGE })}\n`);
       res.end();
     }
   }
 }
 
 export async function arisVoice(req: Request, res: Response) {
+  let heartbeat: NodeJS.Timeout | undefined;
   try {
     const { audioBase64, mimeType, sessionId, replyContext } = req.body;
     const authReq = req as AuthenticatedRequest;
@@ -157,6 +159,21 @@ export async function arisVoice(req: Request, res: Response) {
     }
 
     info(`[aris] arisVoice multimodal request userId=${userId} sessionId=${sessionId} mimeType=${mimeType} audioBase64Length=${audioBase64.length}`);
+    res.setHeader("Content-Type", "application/x-ndjson");
+    res.setHeader("Cache-Control", "no-cache");
+    res.setHeader("Connection", "keep-alive");
+    req.socket.setTimeout(0);
+    req.socket.setKeepAlive(true);
+    res.flushHeaders();
+
+    const writeEvent = (event: Record<string, unknown>) => {
+      if (!res.destroyed && !res.writableEnded) {
+        res.write(`${JSON.stringify(event)}\n`);
+      }
+    };
+    writeEvent({ type: "progress", message: "Aris is listening to your voice note." });
+    heartbeat = setInterval(() => writeEvent({ type: "heartbeat" }), 15000);
+
     const response = await arisService.handleChat({
       message: "Listen to the attached voice note and respond directly to the spoken request. Treat the speech as the user's message; do not return a transcript unless asked.",
       sessionId,
@@ -164,25 +181,41 @@ export async function arisVoice(req: Request, res: Response) {
       mediaData: { mimeType, dataBase64: audioBase64, fileName: `voice-note-${Date.now()}` },
       replyContext: typeof replyContext === "string" ? replyContext : undefined,
     });
-    const voice = await voiceService.synthesizeSpeech(response.arisReply);
-    const extension = voice.mimeType === "audio/wav" ? "wav" : voice.mimeType === "audio/ogg" ? "ogg" : "mp3";
-    const archivedVoice = await arisService.archiveGeneratedMedia(
-      userId,
-      sessionId,
-      `aris-voice-reply-${Date.now()}.${extension}`,
-      voice.mimeType,
-      Buffer.from(voice.audioBase64, "base64"),
-      "aris_voice_reply",
-      response.arisReply,
-    );
+    let voice: Awaited<ReturnType<typeof voiceService.synthesizeSpeech>> | undefined;
+    let voiceError: string | undefined;
+    try {
+      voice = await voiceService.synthesizeSpeech(response.arisReply);
+      const extension = voice.mimeType === "audio/wav" ? "wav" : voice.mimeType === "audio/ogg" ? "ogg" : "mp3";
+      void arisService.archiveGeneratedMedia(
+        userId,
+        sessionId,
+        `aris-voice-reply-${Date.now()}.${extension}`,
+        voice.mimeType,
+        Buffer.from(voice.audioBase64, "base64"),
+        "aris_voice_reply",
+        response.arisReply,
+      ).then((archivedVoice) => {
+        info(`[aris] archived voice reply sessionId=${sessionId} mediaId=${archivedVoice.id}`);
+      }).catch((archiveError) => {
+        error("arisVoice reply archive failed; returning generated audio inline", archiveError);
+      });
+    } catch (synthesisError) {
+      error("arisVoice synthesis failed; returning the text response", synthesisError);
+      voiceError = "I couldn’t create the audio reply this time, so I’m replying in text.";
+    }
 
-    res.json({
-      arisReply: response.arisReply,
-      memoryUpdates: response.memoryUpdates,
-      voiceBase64: voice.audioBase64,
-      voiceMimeType: voice.mimeType,
-      voiceMediaLibraryId: archivedVoice.id,
+    info(`[aris] voice response ready sessionId=${sessionId} textLength=${response.arisReply.length} audio=${Boolean(voice)}`);
+    writeEvent({
+      type: "complete",
+      data: {
+        arisReply: response.arisReply,
+        memoryUpdates: response.memoryUpdates,
+        voiceBase64: voice?.audioBase64,
+        voiceMimeType: voice?.mimeType,
+        voiceError,
+      },
     });
+    res.end();
   } catch (err: any) {
     error("arisVoice error", {
       message: err.message,
@@ -191,7 +224,14 @@ export async function arisVoice(req: Request, res: Response) {
       sessionId: req.body?.sessionId,
     });
     console.error("arisVoice error", err);
-    res.status(500).json({ error: "Aris voice processing failed." });
+    if (!res.headersSent) {
+      res.status(500).json({ error: CHAT_FAILURE_MESSAGE });
+    } else if (!res.destroyed && !res.writableEnded) {
+      res.write(`${JSON.stringify({ type: "error", error: CHAT_FAILURE_MESSAGE })}\n`);
+      res.end();
+    }
+  } finally {
+    if (heartbeat) clearInterval(heartbeat);
   }
 }
 

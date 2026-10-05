@@ -139,6 +139,22 @@ async function setup() {
     ON media_library (user_id, created_at DESC);
   `);
 
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS aris_morning_brief_runs (
+      id BIGSERIAL PRIMARY KEY,
+      user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      brief_text TEXT NOT NULL,
+      audio_text TEXT NOT NULL,
+      audio_assets JSONB NOT NULL DEFAULT '[]',
+      podcast_episodes JSONB NOT NULL DEFAULT '[]',
+      created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()
+    );
+  `);
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS aris_morning_brief_runs_user_created_idx
+    ON aris_morning_brief_runs (user_id, created_at DESC);
+  `);
+
   console.log("Creating session_context table...");
   await pool.query(`
     CREATE TABLE IF NOT EXISTS session_context (

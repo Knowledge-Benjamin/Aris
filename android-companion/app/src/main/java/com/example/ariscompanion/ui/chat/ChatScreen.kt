@@ -15,6 +15,12 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.core.content.FileProvider
 import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.core.LinearEasing
+import androidx.compose.animation.core.RepeatMode
+import androidx.compose.animation.core.animateFloat
+import androidx.compose.animation.core.infiniteRepeatable
+import androidx.compose.animation.core.rememberInfiniteTransition
+import androidx.compose.animation.core.tween
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.slideInVertically
 import androidx.compose.foundation.Image
@@ -56,9 +62,11 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.snapshotFlow
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -66,6 +74,7 @@ import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.painterResource
@@ -86,7 +95,10 @@ import com.example.ariscompanion.ServerConfig
 import com.example.ariscompanion.R
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.flow.collect
+import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withFrameNanos
 import java.io.File
 import java.io.IOException
 import java.text.SimpleDateFormat
@@ -104,7 +116,14 @@ fun ChatScreen(
     )
     val state by viewModel.uiState.collectAsState()
     val scope = rememberCoroutineScope()
-    val listState = rememberLazyListState()
+    val listState = rememberLazyListState(
+        initialFirstVisibleItemIndex = (state.messages.size - CHAT_PAGE_SIZE).coerceAtLeast(0),
+    )
+    var visibleStartIndex by remember {
+        mutableIntStateOf((state.messages.size - CHAT_PAGE_SIZE).coerceAtLeast(0))
+    }
+    var previousMessageCount by remember { mutableIntStateOf(state.messages.size) }
+    var hasInitializedScroll by remember { mutableStateOf(false) }
     var serverUrl by remember(state.serverUrl) { mutableStateOf(state.serverUrl.ifBlank { ServerConfig.DEFAULT_BASE_URL }) }
     var email by remember(state.email) { mutableStateOf(state.email) }
     var password by remember { mutableStateOf("") }
@@ -128,8 +147,33 @@ fun ChatScreen(
         else pickerError = "Microphone permission is required to record a voice note."
     }
 
-    LaunchedEffect(state.messages.size, state.progressMessage) {
-        if (state.messages.isNotEmpty()) listState.animateScrollToItem(state.messages.lastIndex)
+    LaunchedEffect(listState) {
+        snapshotFlow { listState.firstVisibleItemIndex to visibleStartIndex }
+            .distinctUntilChanged()
+            .collect { (firstVisibleIndex, startIndex) ->
+                if (firstVisibleIndex <= 1 && startIndex > 0) {
+                    val pageCount = minOf(CHAT_PAGE_SIZE, startIndex)
+                    val oldOffset = listState.firstVisibleItemScrollOffset
+                    visibleStartIndex = startIndex - pageCount
+                    withFrameNanos { }
+                    listState.scrollToItem(firstVisibleIndex + pageCount, oldOffset)
+                }
+            }
+    }
+
+    LaunchedEffect(state.messages.size) {
+        val messageCount = state.messages.size
+        val visibleCountBeforeUpdate = (previousMessageCount - visibleStartIndex).coerceAtLeast(0)
+        val wasNearBottom = !hasInitializedScroll ||
+            (messageCount > previousMessageCount &&
+                (listState.layoutInfo.visibleItemsInfo.lastOrNull()?.index ?: -1) >= visibleCountBeforeUpdate - 3)
+        if (messageCount > 0 && wasNearBottom) {
+            visibleStartIndex = (messageCount - CHAT_PAGE_SIZE).coerceAtLeast(0)
+            withFrameNanos { }
+            listState.animateScrollToItem((messageCount - visibleStartIndex - 1).coerceAtLeast(0))
+            hasInitializedScroll = true
+        }
+        previousMessageCount = messageCount
     }
 
     val chatBackground = Color(0xFF07070B)
@@ -197,11 +241,7 @@ fun ChatScreen(
                 }
                 Column(modifier = Modifier.weight(1f).padding(start = 11.dp)) {
                     Text("Aris", color = Color(0xFFF3F7F8), fontSize = 17.sp, fontWeight = FontWeight.SemiBold)
-                    Text(
-                        "Your private assistant",
-                        color = Color(0xFF9DAAC2),
-                        fontSize = 12.sp,
-                    )
+                    ChatHeaderStatus(state.progressMessage)
                 }
                 Text("⋮", color = Color(0xFFB8C9CF), fontSize = 24.sp, modifier = Modifier.padding(horizontal = 8.dp))
             }
@@ -212,7 +252,9 @@ fun ChatScreen(
                 contentPadding = PaddingValues(horizontal = 10.dp, vertical = 14.dp),
                 verticalArrangement = Arrangement.spacedBy(5.dp),
             ) {
-                itemsIndexed(state.messages, key = { _, message -> message.id }) { index, message ->
+                val visibleMessages = state.messages.drop(visibleStartIndex.coerceAtMost(state.messages.size))
+                itemsIndexed(visibleMessages, key = { _, message -> message.id }) { localIndex, message ->
+                    val index = visibleStartIndex + localIndex
                     val previous = state.messages.getOrNull(index - 1)
                     if (previous == null || !isSameLocalDay(previous.timestampMs, message.timestampMs)) {
                         DateDivider(message.timestampMs)
@@ -223,18 +265,6 @@ fun ChatScreen(
                         onReply = { viewModel.onEvent(ChatUiEvent.ReplyToMessage(message.id)) },
                         onEvent = viewModel::onEvent,
                     )
-                }
-                if (!state.progressMessage.isNullOrBlank()) {
-                    item(key = "progress") {
-                        Row(
-                            modifier = Modifier.padding(start = 7.dp, top = 2.dp, bottom = 5.dp),
-                            verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.spacedBy(8.dp),
-                        ) {
-                            Text("●", color = accent, fontSize = 9.sp)
-                            Text(state.progressMessage.orEmpty(), color = Color(0xFFAFBDC2), fontSize = 13.sp)
-                        }
-                    }
                 }
             }
 
@@ -478,12 +508,14 @@ private fun MessageBubble(
                             AttachmentPreview(attachment, message.id, index, state, onEvent)
                         }
                         if (message.voiceBase64 != null) {
-                            TextButton(
-                                onClick = { onEvent(ChatUiEvent.PlayVoice(message.id)) },
-                                contentPadding = PaddingValues(horizontal = 4.dp, vertical = 0.dp),
-                            ) {
-                                Text(if (state.playbackKey == message.id) "Ⅱ  Stop voice" else "▶  Play voice", color = Color(0xFF00D8E8))
-                            }
+                            AudioPlaybackControls(
+                                messageId = message.id,
+                                index = -1,
+                                fileName = "Voice note",
+                                state = state,
+                                onToggle = { onEvent(ChatUiEvent.PlayVoice(message.id)) },
+                                onEvent = onEvent,
+                            )
                         }
                         message.pendingAction?.let {
                             Surface(color = Color.Black.copy(alpha = 0.18f), shape = RoundedCornerShape(10.dp)) {
@@ -546,6 +578,72 @@ private fun ReplyAction(onReply: () -> Unit) {
             .clickable(onClick = onReply)
             .padding(horizontal = 4.dp, vertical = 6.dp),
     )
+}
+
+@Composable
+private fun ChatHeaderStatus(progressMessage: String?) {
+    val isActive = !progressMessage.isNullOrBlank()
+    val transition = rememberInfiniteTransition()
+    val sweepProgress by transition.animateFloat(
+        initialValue = 0f,
+        targetValue = 1f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(durationMillis = 1500, easing = LinearEasing),
+            repeatMode = RepeatMode.Restart,
+        ),
+    )
+    val pulseAlpha by transition.animateFloat(
+        initialValue = 0.35f,
+        targetValue = 1f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(durationMillis = 900, easing = LinearEasing),
+            repeatMode = RepeatMode.Reverse,
+        ),
+    )
+
+    Column(modifier = Modifier.fillMaxWidth()) {
+        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+            Box(
+                modifier = Modifier
+                    .size(6.dp)
+                    .alpha(if (isActive) pulseAlpha else 0.55f)
+                    .background(if (isActive) Color(0xFF55E8F2) else Color(0xFF9DAAC2), CircleShape),
+            )
+            Text(
+                text = progressMessage?.takeIf(String::isNotBlank) ?: "Ready when you are",
+                color = if (isActive) Color(0xFFB9E8EC) else Color(0xFF9DAAC2),
+                fontSize = 12.sp,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+        }
+        Canvas(modifier = Modifier.fillMaxWidth().height(2.dp).padding(top = 1.dp)) {
+            drawLine(
+                color = Color(0xFF55E8F2).copy(alpha = 0.12f),
+                start = Offset.Zero,
+                end = Offset(size.width, 0f),
+                strokeWidth = size.height,
+            )
+            if (isActive) {
+                val startX = (sweepProgress * 1.5f - 0.35f) * size.width
+                drawLine(
+                    brush = Brush.horizontalGradient(
+                        colors = listOf(
+                            Color.Transparent,
+                            Color(0xFF55E8F2).copy(alpha = 0.9f),
+                            Color(0xFF9A70FF).copy(alpha = 0.55f),
+                            Color.Transparent,
+                        ),
+                        startX = startX,
+                        endX = startX + size.width * 0.55f,
+                    ),
+                    start = Offset(startX, size.height / 2f),
+                    end = Offset(startX + size.width * 0.55f, size.height / 2f),
+                    strokeWidth = size.height,
+                )
+            }
+        }
+    }
 }
 
 @Composable
@@ -954,18 +1052,44 @@ private fun AudioAttachmentButton(
     onEvent: (ChatUiEvent) -> Unit,
 ) {
     val playbackKey = if (index < 0) messageId else "${messageId}_att_$index"
-    val isPlaying = state.playbackKey == playbackKey
+    AudioPlaybackControls(
+        messageId = messageId,
+        index = index,
+        fileName = attachment.fileName,
+        state = state,
+        onToggle = { onEvent(ChatUiEvent.PlayAttachment(messageId, index)) },
+        onEvent = onEvent,
+        playbackKey = playbackKey,
+    )
+}
+
+@Composable
+private fun AudioPlaybackControls(
+    messageId: String,
+    index: Int,
+    fileName: String,
+    state: ChatUiState,
+    onToggle: () -> Unit,
+    onEvent: (ChatUiEvent) -> Unit,
+    playbackKey: String = if (index < 0) messageId else "${messageId}_att_$index",
+) {
+    val isSelected = state.playbackKey == playbackKey
+    val isPlaying = isSelected && state.isPlaybackActive
     Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
         Row(verticalAlignment = Alignment.CenterVertically) {
-            TextButton(onClick = { onEvent(ChatUiEvent.PlayAttachment(messageId, index)) }) {
+            TextButton(onClick = onToggle, contentPadding = PaddingValues(horizontal = 4.dp, vertical = 0.dp)) {
                 Text(
-                    if (isPlaying) "Ⅱ  Stop audio" else "▶  Play audio",
+                    when {
+                        isPlaying -> "Ⅱ  Pause"
+                        isSelected -> "▶  Resume"
+                        else -> "▶  Play"
+                    },
                     color = Color(0xFF00D8E8),
                 )
             }
-            Text(attachment.fileName, color = Color(0xFFC5D1D5), fontSize = 12.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+            Text(fileName, color = Color(0xFFC5D1D5), fontSize = 12.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
         }
-        if (isPlaying && state.playbackDurationMs > 0L) {
+        if (isSelected && state.playbackDurationMs > 0L) {
             Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(5.dp)) {
                 Text(formatRecordingDuration(state.playbackPositionMs), color = Color(0xFF9DAAC2), fontSize = 10.sp)
                 Slider(
@@ -1046,3 +1170,4 @@ private class ChatViewModelFactory(private val context: Context) : ViewModelProv
 }
 
 private const val MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024
+private const val CHAT_PAGE_SIZE = 40

@@ -79,6 +79,7 @@ data class ChatMessage(
     val quotedText: String? = null,
     val quotedSender: Sender? = null,
     val inReplyToMessageId: String? = null,
+    val outboxId: Long? = null,
 )
 
 fun ChatMessage.replySummary(): String {

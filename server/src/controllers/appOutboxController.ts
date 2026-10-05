@@ -4,9 +4,8 @@ import { whatsappOutboxStore } from "../db/whatsappOutboxStore";
 /**
  * GET /api/aris/outbox
  *
- * Returns all pending app-bound outbox messages for the authenticated user
- * (i.e. rows where to_jid = 'app'), then marks them as sent so they are not
- * returned on the next poll.
+ * Returns pending app-bound outbox messages. The client acknowledges each one
+ * only after its media has been downloaded and the message persisted locally.
  *
  * The Android app calls this endpoint on connect and after each chat session
  * to receive proactive messages, morning briefs, alerts, and podcast episodes
@@ -31,18 +30,9 @@ export async function pollAppOutbox(req: Request, res: Response) {
       return res.status(401).json({ error: "Not authenticated." });
     }
 
-    // Fetch all pending app-bound messages for this user
-    const all = await whatsappOutboxStore.getAllForUser(userId);
-    const appPending = all.filter(
-      (m) => m.toJid === "app" && m.status === "pending"
-    );
+    const appPending = await whatsappOutboxStore.getPendingForApp(userId);
 
     console.log(`[appOutbox] user=${userId} pending=${appPending.length}`);
-
-    // Mark each as sent immediately so repeated polls don't re-deliver
-    for (const msg of appPending) {
-      await whatsappOutboxStore.markSent(msg.id);
-    }
 
     const messages = appPending.map((m) => ({
       id: m.id,
@@ -59,5 +49,24 @@ export async function pollAppOutbox(req: Request, res: Response) {
   } catch (err: any) {
     console.error("[appOutbox] poll failed", err);
     return res.status(500).json({ error: "Failed to fetch app outbox." });
+  }
+}
+
+export async function acknowledgeAppOutboxMessage(req: Request, res: Response) {
+  try {
+    const userId: number | undefined = (req as any).authUserId;
+    const messageId = Number(req.params.messageId);
+    if (!userId) return res.status(401).json({ error: "Not authenticated." });
+    if (!Number.isSafeInteger(messageId) || messageId < 1) {
+      return res.status(400).json({ error: "A valid outbox message ID is required." });
+    }
+    const acknowledged = await whatsappOutboxStore.markAppSent(userId, messageId);
+    if (!acknowledged) {
+      return res.status(404).json({ error: "Pending app outbox message was not found." });
+    }
+    return res.status(204).end();
+  } catch (err) {
+    console.error("[appOutbox] acknowledge failed", err);
+    return res.status(500).json({ error: "Failed to acknowledge app outbox message." });
   }
 }

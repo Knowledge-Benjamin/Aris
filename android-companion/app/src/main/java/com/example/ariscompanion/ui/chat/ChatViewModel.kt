@@ -129,6 +129,15 @@ class ChatViewModel(private val appContext: Context) : ViewModel() {
 
     private suspend fun handleOutboxMessages(msgs: List<JSONObject>) {
         for (msg in msgs) {
+            val outboxId = msg.optLong("id", -1L)
+            if (outboxId <= 0L) {
+                Log.e(TAG, "Skipping outbox message with invalid id")
+                continue
+            }
+            if (_uiState.value.messages.any { it.outboxId == outboxId }) {
+                client?.acknowledgeOutboxMessage(outboxId)
+                continue
+            }
             val type = msg.optString("messageType", "")
             val content = msg.optString("body", msg.optString("content", ""))
             val mediaDriveRef = msg.optString("mediaDriveRef", "")
@@ -166,15 +175,21 @@ class ChatViewModel(private val appContext: Context) : ViewModel() {
             }
 
             _uiState.update { state ->
-                state.copy(messages = state.messages + ChatMessage(
-                    id = java.util.UUID.randomUUID().toString(),
-                    sender = Sender.ARIS,
-                    text = content,
-                    attachment = attachment,
-                    quotedText = quotedText?.ifEmpty { null },
-                    quotedSender = Sender.USER,
-                )).also { persistMessages(it.messages) }
+                if (state.messages.any { it.outboxId == outboxId }) {
+                    state
+                } else {
+                    state.copy(messages = state.messages + ChatMessage(
+                        id = "outbox-$outboxId",
+                        sender = Sender.ARIS,
+                        text = content,
+                        attachment = attachment,
+                        quotedText = quotedText?.ifEmpty { null },
+                        quotedSender = Sender.USER,
+                        outboxId = outboxId,
+                    )).also { persistMessages(it.messages) }
+                }
             }
+            client?.acknowledgeOutboxMessage(outboxId)
         }
     }
 
@@ -191,6 +206,7 @@ class ChatViewModel(private val appContext: Context) : ViewModel() {
     // Audio playback
     private var mediaPlayer: MediaPlayer? = null
     private var playingMessageId: String? = null
+    private var playbackPrepared = false
     private var playbackJob: Job? = null
 
     // ── Public event handler ─────────────────────────────────────────────────
@@ -722,48 +738,12 @@ class ChatViewModel(private val appContext: Context) : ViewModel() {
     private fun playVoice(messageId: String) {
         val msg = _uiState.value.messages.firstOrNull { it.id == messageId } ?: return
         val voiceBase64 = msg.voiceBase64 ?: return
-
-        // Stop any current playback
-        if (playingMessageId == messageId) {
-            mediaPlayer?.stop()
-            mediaPlayer?.release()
-            mediaPlayer = null
-            playingMessageId = null
-            return
-        }
-        mediaPlayer?.stop()
-        mediaPlayer?.release()
-        mediaPlayer = null
-
-        viewModelScope.launch(Dispatchers.IO) {
-            try {
-                val bytes = Base64.decode(voiceBase64, Base64.DEFAULT)
-                val file = File(appContext.cacheDir, "aris_voice_$messageId.wav")
-                FileOutputStream(file).use { it.write(bytes) }
-
-                withContext(Dispatchers.Main) {
-                    playingMessageId = messageId
-                    mediaPlayer = MediaPlayer().apply {
-                        setAudioAttributes(
-                            AudioAttributes.Builder()
-                                .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
-                                .setUsage(AudioAttributes.USAGE_MEDIA)
-                                .build()
-                        )
-                        setDataSource(file.absolutePath)
-                        prepare()
-                        start()
-                        beginPlaybackTracking(messageId)
-                        setOnCompletionListener {
-                            stopPlayback()
-                        }
-                    }
-                }
-            } catch (e: Exception) {
-                Log.e(TAG, "Voice playback failed", e)
-                playingMessageId = null
-            }
-        }
+        toggleAudioPlayback(
+            messageId = messageId,
+            playbackKey = messageId,
+            base64 = voiceBase64,
+            mimeType = msg.voiceMimeType ?: "audio/wav",
+        )
     }
 
     private fun playArisAttachment(messageId: String, attachmentIndex: Int) {
@@ -782,25 +762,53 @@ class ChatViewModel(private val appContext: Context) : ViewModel() {
             else -> return
         }
 
-        val playKey = "${messageId}_att_$attachmentIndex"
-        if (playingMessageId == playKey) {
-            stopPlayback()
+        toggleAudioPlayback(
+            messageId = messageId,
+            playbackKey = "${messageId}_att_$attachmentIndex",
+            base64 = base64,
+            mimeType = mime,
+        )
+    }
+
+    private fun toggleAudioPlayback(
+        messageId: String,
+        playbackKey: String,
+        base64: String,
+        mimeType: String,
+    ) {
+        if (playingMessageId == playbackKey && mediaPlayer != null) {
+            if (!playbackPrepared) return
+            if (mediaPlayer?.isPlaying == true) {
+                mediaPlayer?.pause()
+                playbackJob?.cancel()
+                _uiState.update { it.copy(isPlaybackActive = false) }
+            } else {
+                mediaPlayer?.start()
+                _uiState.update { it.copy(isPlaybackActive = true) }
+                beginPlaybackTracking(playbackKey)
+            }
             return
         }
-        stopPlayback()
 
+        stopPlayback()
         viewModelScope.launch(Dispatchers.IO) {
             try {
-                val ext = when {
-                    mime.contains("ogg") -> "ogg"
-                    mime.contains("mp3") || mime.contains("mpeg") -> "mp3"
+                val extension = when {
+                    mimeType.contains("ogg") -> "ogg"
+                    mimeType.contains("mp3") || mimeType.contains("mpeg") -> "mp3"
+                    mimeType.contains("m4a") || mimeType.contains("mp4") -> "m4a"
                     else -> "wav"
                 }
-                val bytes = Base64.decode(base64, Base64.DEFAULT)
-                val file = File(appContext.cacheDir, "aris_att_${messageId}_$attachmentIndex.$ext")
-                FileOutputStream(file).use { it.write(bytes) }
+                val safePlaybackKey = playbackKey.replace(Regex("[^A-Za-z0-9_-]"), "_")
+                val file = File(appContext.cacheDir, "aris_audio_${safePlaybackKey}_$extension")
+                if (!file.exists()) {
+                    FileOutputStream(file).use { output ->
+                        output.write(Base64.decode(base64, Base64.DEFAULT))
+                    }
+                }
                 withContext(Dispatchers.Main) {
-                    playingMessageId = playKey
+                    playingMessageId = playbackKey
+                    playbackPrepared = false
                     mediaPlayer = MediaPlayer().apply {
                         setAudioAttributes(
                             AudioAttributes.Builder()
@@ -809,17 +817,24 @@ class ChatViewModel(private val appContext: Context) : ViewModel() {
                                 .build()
                         )
                         setDataSource(file.absolutePath)
-                        prepare()
-                        start()
-                        beginPlaybackTracking(playKey)
-                        setOnCompletionListener {
-                            stopPlayback()
+                        setOnPreparedListener { player ->
+                            playbackPrepared = true
+                            player.start()
+                            beginPlaybackTracking(playbackKey)
                         }
+                        setOnCompletionListener { stopPlayback() }
+                        setOnErrorListener { _, what, extra ->
+                            Log.e(TAG, "Audio playback failed what=$what extra=$extra")
+                            stopPlayback()
+                            true
+                        }
+                        prepareAsync()
                     }
                 }
             } catch (e: Exception) {
-                Log.e(TAG, "Attachment playback failed", e)
+                Log.e(TAG, "Audio playback failed", e)
                 playingMessageId = null
+                _uiState.update { it.copy(isPlaybackActive = false, playbackKey = null) }
             }
         }
     }
@@ -830,7 +845,7 @@ class ChatViewModel(private val appContext: Context) : ViewModel() {
         _uiState.update {
             it.copy(
                 playbackKey = key,
-                playbackPositionMs = 0L,
+                playbackPositionMs = player.currentPosition.toLong().coerceAtLeast(0L),
                 playbackDurationMs = player.duration.toLong().coerceAtLeast(0L),
                 isPlaybackActive = true,
             )
@@ -852,14 +867,16 @@ class ChatViewModel(private val appContext: Context) : ViewModel() {
         mediaPlayer?.release()
         mediaPlayer = null
         playingMessageId = null
+        playbackPrepared = false
         _uiState.update { it.copy(playbackKey = null, playbackPositionMs = 0L, playbackDurationMs = 0L, isPlaybackActive = false) }
     }
 
     private fun seekAudio(messageId: String, attachmentIndex: Int, positionMs: Long) {
         val key = if (attachmentIndex < 0) messageId else "${messageId}_att_$attachmentIndex"
         if (playingMessageId == key) {
-            mediaPlayer?.seekTo(positionMs.toInt().coerceIn(0, mediaPlayer?.duration ?: 0))
-            _uiState.update { it.copy(playbackPositionMs = positionMs) }
+            val boundedPosition = positionMs.toInt().coerceIn(0, mediaPlayer?.duration ?: 0)
+            mediaPlayer?.seekTo(boundedPosition)
+            _uiState.update { it.copy(playbackPositionMs = boundedPosition.toLong()) }
         }
     }
 
@@ -903,6 +920,7 @@ class ChatViewModel(private val appContext: Context) : ViewModel() {
                 message.quotedText?.let { put("quotedText", it) }
                 message.quotedSender?.let { put("quotedSender", it.name) }
                 message.inReplyToMessageId?.let { put("inReplyToMessageId", it) }
+                message.outboxId?.let { put("outboxId", it) }
                 message.attachment?.let { put("attachment", persistAttachment(message.id, "main", it)) }
                 if (!message.voiceBase64.isNullOrEmpty()) {
                     val voiceFileName = "chat_media_${message.id}_voice"
@@ -1011,6 +1029,7 @@ class ChatViewModel(private val appContext: Context) : ViewModel() {
                         quotedSender = item.optString("quotedSender").takeIf { it.isNotEmpty() }
                             ?.let { runCatching { Sender.valueOf(it) }.getOrNull() },
                         inReplyToMessageId = item.optString("inReplyToMessageId").ifEmpty { null },
+                        outboxId = item.optLong("outboxId", -1L).takeIf { it > 0L },
                         voiceBase64 = item.optString("voiceFileName").takeIf { it.isNotEmpty() }?.let { fileName ->
                             File(appContext.filesDir, fileName).takeIf { it.exists() }?.let { file ->
                                 Base64.encodeToString(file.readBytes(), Base64.NO_WRAP)

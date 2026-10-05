@@ -22,6 +22,7 @@ import { SkillService } from "./skillService";
 import { NewsResearchStore, NewsResearchArticle } from "../db/newsResearchStore";
 import { MediaLibraryStore, MediaLibraryRecord } from "../db/mediaLibraryStore";
 import { MediaLibraryService } from "./mediaLibraryService";
+import { MorningBriefStore } from "../db/morningBriefStore";
 
 const searchToolEnabled = process.env.SEARCH_TOOL_ENABLED?.trim().toLowerCase() !== "false" &&
   process.env.SEARCH_TOOL_ENABLED?.trim() !== "0";
@@ -125,6 +126,7 @@ export class ArisService {
   private newsCache = new Map<string, { day: string; data: unknown }>();
   private newsResearchStore = new NewsResearchStore(getDatabasePool());
   private mediaLibraryService: MediaLibraryService;
+  private morningBriefStore: MorningBriefStore;
 
   private summarizeToolData(data: any): string {
     if (data?.audioBase64) {
@@ -300,6 +302,7 @@ export class ArisService {
     private contextStore: ContextStore,
     private gemmaService: GemmaService
   ) {
+    this.morningBriefStore = new MorningBriefStore(getDatabasePool());
     this.mediaLibraryService = new MediaLibraryService(
       this.googleService,
       this.googleAccountStore,
@@ -854,15 +857,26 @@ export class ArisService {
     const storedApproval = !input.approvedAction && approvalMessage
       ? this.getLastToolInvocation(input.userId, sessionId)
       : undefined;
-    const approvedAction = input.approvedAction
+    const approvalCandidate = input.approvedAction
       ? this.normalizeToolInvocation(input.approvedAction)
       : storedApproval
         ? this.normalizeToolInvocation(storedApproval)
         : undefined;
-    if (storedApproval && this.needsHumanApproval(storedApproval, sessionId)) {
+    const approvedMorningBriefRequest = approvalCandidate?.tool === "skill_run"
+      ? String(approvalCandidate.payload?.input?.message || "")
+      : "";
+    const resumesNativeMorningBrief = Boolean(
+      approvedMorningBriefRequest && this.isMorningBriefRequest(approvedMorningBriefRequest.toLowerCase())
+    );
+    const approvedAction = resumesNativeMorningBrief ? undefined : approvalCandidate;
+    const effectiveMessage = resumesNativeMorningBrief ? approvedMorningBriefRequest.trim() : input.message.trim();
+    if (storedApproval && !resumesNativeMorningBrief && this.needsHumanApproval(storedApproval, sessionId)) {
       info(`[arisService] recovered pending approval tool=${storedApproval.tool} from typed confirmation`);
     }
-    info(`[arisService] handleChat start sessionId=${sessionId} query="${input.message}" searchToolEnabled=${searchToolEnabled}`);
+    if (resumesNativeMorningBrief) {
+      info("[arisService] resuming an approved legacy morning-brief skill through the native media workflow");
+    }
+    info(`[arisService] handleChat start sessionId=${sessionId} query="${effectiveMessage}" searchToolEnabled=${searchToolEnabled}`);
 
     // Auto-sync contacts on first use (when table is empty for this user)
     if (input.userId) {
@@ -914,7 +928,58 @@ export class ArisService {
       role: "user",
       content: this.formatMessageWithAttachment(input.message, storedAttachment),
     });
-    const effectiveMessage = input.message.trim();
+    if (
+      input.userId
+      && !approvedAction
+      && this.isMorningBriefRequest(effectiveMessage.toLowerCase())
+      && !this.isMorningBriefRefreshRequest(effectiveMessage)
+    ) {
+      try {
+        const recentBrief = await this.morningBriefStore.findRecent(input.userId);
+        if (recentBrief) {
+          const textResult = await this.executeToolCall(input.userId, {
+            tool: "app_send_message",
+            payload: { message: recentBrief.briefText },
+          }, sessionId, input.replyToWhatsappMessage);
+          if (!textResult.success) throw new Error(textResult.error || "Failed to queue the saved brief text.");
+
+          for (const audio of recentBrief.audioAssets) {
+            const audioResult = await this.executeToolCall(input.userId, {
+              tool: "app_send_audio",
+              payload: { driveRef: audio.storageUri, mimeType: audio.mimeType },
+            }, sessionId, input.replyToWhatsappMessage);
+            if (!audioResult.success) throw new Error(audioResult.error || "Failed to queue saved brief audio.");
+          }
+
+          if (recentBrief.podcastEpisodes.length) {
+            const podcastResult = await this.executeToolCall(input.userId, {
+              tool: "app_send_audio_batch",
+              payload: { episodes: recentBrief.podcastEpisodes },
+            }, sessionId, input.replyToWhatsappMessage);
+            if (!podcastResult.success) throw new Error(podcastResult.error || "Failed to queue saved podcast episodes.");
+          }
+
+          const reply = "I've resent your recent morning brief, including its original audio and podcast episodes.";
+          await this.memoryStore.saveConversationMessage({
+            userId: input.userId,
+            sessionId,
+            role: "aris",
+            content: reply,
+          });
+          return { arisReply: reply, memoryUpdates: [], status: "finished" };
+        }
+      } catch (cacheError) {
+        error("[arisService] morning brief cache reuse failed", cacheError);
+        const reply = "I found your recent morning brief but couldn't resend the complete package. Please try again shortly.";
+        await this.memoryStore.saveConversationMessage({
+          userId: input.userId,
+          sessionId,
+          role: "aris",
+          content: reply,
+        });
+        return { arisReply: reply, memoryUpdates: [], status: "error" };
+      }
+    }
     const messageWithAttachment = this.formatMessageWithAttachment(effectiveMessage, storedAttachment);
     const messageWithReplyContext = [
       messageWithAttachment,
@@ -2053,8 +2118,16 @@ export class ArisService {
     }
 
     const requestsWhatsappAudio = /\bwhatsapp\b|\bvoice\s+note\b/i.test(userMessage);
-    const destination = invocation.payload?.destination ||
-      (requestsWhatsappAudio || sessionId === "whatsapp-direct" ? "whatsapp" : undefined);
+    const requestedDestination = String(invocation.payload?.destination || "").toLowerCase();
+    const isAndroidAppSession = sessionId.startsWith("aris-android");
+    const appDeliveryRequested = isAndroidAppSession
+      || this.isMorningBriefRequest(userMessage)
+      || this.isNewsPodcastRequest(userMessage);
+    const destination = requestedDestination === "email"
+      ? requestedDestination
+      : appDeliveryRequested
+        ? "app"
+        : requestedDestination || (requestsWhatsappAudio || sessionId === "whatsapp-direct" ? "whatsapp" : undefined);
 
     return {
       ...invocation,
@@ -2323,6 +2396,7 @@ export class ArisService {
       fileName: record.fileName,
       mimeType: record.mimeType,
       driveUrl: record.driveUrl,
+      storageUri: `drive:${record.driveFileId}`,
       downloadUrl: `/api/aris/media/${record.id}/download`,
       summary: record.summary,
     };
@@ -2804,25 +2878,77 @@ export class ArisService {
         }, sessionId, replyToWhatsappMessage);
         if (!audioResult.success) return { success: false, tool: toolName, error: audioResult.error };
 
+        const audioData = audioResult.data as any;
+        const audioAttachments = [
+          ...(audioData?.mediaLibraryAttachment ? [audioData.mediaLibraryAttachment] : []),
+          ...(Array.isArray(audioData?.mediaLibraryAttachments) ? audioData.mediaLibraryAttachments : []),
+        ].filter((asset: any) => typeof asset?.storageUri === "string" && asset.storageUri.startsWith("drive:"));
+        if (!audioAttachments.length) {
+          return { success: false, tool: toolName, error: "Generated brief audio was not archived with a reusable Google Drive reference." };
+        }
+        const queuedAudioAssets: Array<{
+          storageUri: string;
+          mimeType: string;
+          title: string;
+          mediaLibraryId?: number;
+        }> = [];
+        for (const asset of audioAttachments) {
+          const queuedAudio = await this.executeToolCall(userId, {
+            tool: "app_send_audio",
+            payload: { driveRef: asset.storageUri, mimeType: asset.mimeType },
+          }, sessionId, replyToWhatsappMessage);
+          if (!queuedAudio.success) return { success: false, tool: toolName, error: queuedAudio.error };
+          queuedAudioAssets.push({
+            storageUri: asset.storageUri,
+            mimeType: asset.mimeType || "audio/mpeg",
+            title: asset.fileName || "Morning brief audio",
+            ...(typeof asset.libraryId === "number" ? { mediaLibraryId: asset.libraryId } : {}),
+          });
+        }
+
         const podcastEpisodes = Array.isArray(invocation.payload?.podcastEpisodes)
           ? invocation.payload.podcastEpisodes
           : [];
+        const validPodcastEpisodes = podcastEpisodes.filter((episode: any) =>
+          typeof episode?.storageUri === "string" && episode.storageUri.startsWith("drive:")
+        );
+        if (validPodcastEpisodes.length !== podcastEpisodes.length || validPodcastEpisodes.length === 0) {
+          return { success: false, tool: toolName, error: "The morning brief must include archived podcast episodes with Google Drive references." };
+        }
         let podcastResult: ToolExecutionResult | undefined;
-        if (podcastEpisodes.length) {
+        if (validPodcastEpisodes.length) {
           podcastResult = await this.executeToolCall(userId, {
             tool: "app_send_audio_batch",
-            payload: { episodes: podcastEpisodes },
+            payload: { episodes: validPodcastEpisodes },
           }, sessionId, replyToWhatsappMessage);
           if (!podcastResult.success) return { success: false, tool: toolName, error: podcastResult.error };
+        }
+
+        let cacheSaved = true;
+        try {
+          await this.morningBriefStore.save({
+            userId,
+            briefText: message,
+            audioText,
+            audioAssets: queuedAudioAssets,
+            podcastEpisodes: validPodcastEpisodes,
+          });
+        } catch (storeError) {
+          cacheSaved = false;
+          error("[arisService] failed to save delivered morning brief package", storeError);
         }
 
         return {
           success: true,
           tool: toolName,
           data: {
-            summary: "Complete morning brief queued: text, matching audio, and podcast episodes.",
+            summary: cacheSaved
+              ? "Complete morning brief queued and saved for reuse: text, matching audio, and podcast episodes."
+              : "Complete morning brief queued, but the reusable package could not be saved.",
+            cacheSaved,
             text: textResult.data,
             audio: audioResult.data,
+            audioOutboxIds: queuedAudioAssets.map((asset: any) => asset.storageUri),
             podcasts: podcastResult?.data,
           },
         };
@@ -3199,9 +3325,7 @@ export class ArisService {
     if (toolName === "audio_generate") {
       try {
         const requestedDestination = String(invocation.payload?.destination || "").toLowerCase();
-        const destination = sessionId === "whatsapp-direct" && requestedDestination !== "email"
-          ? "whatsapp"
-          : requestedDestination || "download";
+        const destination = requestedDestination || (sessionId === "whatsapp-direct" ? "whatsapp" : "download");
         const rawText = String(invocation.payload.text);
         const text = this.cleanSpeechText(rawText);
         info(`[arisService] audio_generate cleaned speech rawChars=${rawText.length} speechChars=${text.length}`);
@@ -3210,38 +3334,58 @@ export class ArisService {
         }
         const isAppSession = sessionId?.startsWith("aris-android") || sessionId === "aris-android-chat";
         const encoding = (destination === "whatsapp") ? "OGG_OPUS" : "MP3";
-        const speechChunks = destination === "whatsapp"
+        const speechChunks = destination === "whatsapp" || destination === "app"
           ? this.splitTextForSynthesis(text)
           : [text];
-        if (destination !== "whatsapp" && text.length > 11000) {
+        if (destination === "email" && text.length > 11000) {
           return {
             success: false,
             tool: toolName,
-            error: "This audio destination requires a single file. Use WhatsApp delivery for long text so Aris can send ordered voice-note parts.",
+            error: "Email audio is limited to 11,000 characters. Shorten the script or request delivery in the Aris app.",
           };
         }
 
-        // "app" or "download" destination: synthesize and return inline base64
-        // On android sessions, default to "app" so the audio shows directly in chat
+        // Android chat receives the attachment inline; other app-targeted requests use the app outbox.
         if (destination === "app" || destination === "download" || (isAppSession && destination !== "whatsapp" && destination !== "email")) {
-          const voice = await this.voiceService.synthesizeSpeech(speechChunks[0], encoding);
           if (!userId) throw new Error("Sign in before saving generated audio to your Aris Media Library.");
-          const mimeType = voice.mimeType.split(";")[0].toLowerCase();
-          const media = await this.archiveGeneratedMedia(
-            userId,
-            sessionId,
-            `aris-audio-${Date.now()}${this.getExtensionForMimeType(mimeType)}`,
-            mimeType,
-            Buffer.from(voice.audioBase64, "base64"),
-            "aris_generated_audio",
-            text,
-          );
+          const mediaAttachments: ReturnType<typeof this.toMediaLibraryAttachment>[] = [];
+          const queuedOutboxIds: number[] = [];
+          for (let index = 0; index < speechChunks.length; index += 1) {
+            const voice = await this.voiceService.synthesizeSpeech(speechChunks[index], encoding);
+            const mimeType = voice.mimeType.split(";")[0].toLowerCase();
+            const media = await this.archiveGeneratedMedia(
+              userId,
+              sessionId,
+              `aris-audio-${Date.now()}-${index + 1}${this.getExtensionForMimeType(mimeType)}`,
+              mimeType,
+              Buffer.from(voice.audioBase64, "base64"),
+              "aris_generated_audio",
+              speechChunks[index],
+            );
+            if (destination === "app" && !isAppSession) {
+              const { whatsappOutboxStore } = await import("../db/whatsappOutboxStore");
+              const queued = await whatsappOutboxStore.enqueue(
+                "app",
+                "audio",
+                undefined,
+                `drive:${media.driveFileId}`,
+                mimeType,
+                userId,
+                replyToWhatsappMessage
+              );
+              queuedOutboxIds.push(queued.id);
+            } else {
+              mediaAttachments.push(this.toMediaLibraryAttachment(media));
+            }
+          }
           return {
             success: true,
             tool: toolName,
             data: {
-              mediaLibraryAttachment: this.toMediaLibraryAttachment(media),
-              mimeType,
+              ...(mediaAttachments.length === 1 ? { mediaLibraryAttachment: mediaAttachments[0] } : {}),
+              ...(mediaAttachments.length > 1 ? { mediaLibraryAttachments: mediaAttachments } : {}),
+              ...(queuedOutboxIds.length ? { summary: `Audio queued in ${queuedOutboxIds.length} part(s) for delivery to your Aris app.`, outboxIds: queuedOutboxIds } : {}),
+              mimeType: mediaAttachments[0]?.mimeType || "audio/mpeg",
               audioEncoding: encoding,
               sourceText: text,
               sourceType: "aris_generated_audio",
@@ -4436,6 +4580,10 @@ export class ArisService {
       && /\b(brief|briefing|update|overview|summary)\b/i.test(normalizedMessage);
   }
 
+  private isMorningBriefRefreshRequest(message: string): boolean {
+    return /\b(new|fresh|updated?|refresh|regenerate|start over)\b/i.test(message);
+  }
+
   private inferToolInvocation(userMessage: string, userId: number | undefined, sessionId: string | undefined, conversationHistory: string[]): { tool: string; payload: any } | undefined {
     const normalized = userMessage.trim().toLowerCase();
     if (!normalized) {
@@ -4610,7 +4758,7 @@ export class ArisService {
         ? `Use native tools already listed in the manifest for this request. Do not use web search or browser search.`
         : `NEWS ROUTING: Use {"tool":"fetch_news"} for current news, today's news, headlines, or a news brief. Use {"tool":"search","query":"..."} only for general web research.`,
       `ARTICLE DETAIL ROUTING: When fetch_news returns several article links and the user asks for full details, make one batch call with all relevant links: {"tool":"browser_read","urls":["https://example.com/article-1","https://example.com/article-2"]}. A single tool call may contain a urls array; do not read only the first article and do not emit separate calls for every URL. If browser_read cannot read the links, try one batched url_read call instead.`,
-      `NEWS PODCAST: Use {"tool":"fetch_news_podcast","batch":true} when the user asks for podcasts. This selects four current RSS episodes, always including NPR, stores them in Google Drive, and returns ordered Drive references. After the successful observation use app_send_audio_batch with those Drive episode references to queue them for Aris app delivery; never send only one episode. After delivery ask which shows the user enjoyed and save that preference for the custom podcast list.`,
+      `NEWS PODCAST: Use {"tool":"fetch_news_podcast","batch":true} when the user asks for podcasts. This selects four current RSS episodes, always including NPR, stores them in Google Drive, and returns ordered Drive references. Deliver podcast audio only to the Aris app using app_send_audio_batch; never route podcast audio to WhatsApp or another channel, and never send only one episode. After delivery ask which shows the user enjoyed and save that preference for the custom podcast list.`,
       ...(activeCategories.has("media_library") ? [
         `ARIS MEDIA LIBRARY: User uploads and Aris-generated media are privately stored in the authenticated user's Google Drive under "Aris Media Library" and indexed with searchable descriptions. Use media_library_search for semantic lookups, media_library_list for recent items, and media_library_download to retrieve a specific mediaId or query. Set analyze=true and provide question when the user asks about file contents; this downloads and analyzes the original. Downloading without analyze attaches the original file to the response. Never claim a file is available unless a library tool returned it.`,
         `For user-uploaded media, reuse its archive reference and summary in the conversation context. Do not search the public web for a user's personal photo, video, audio, or document. If no matching item is found, say so rather than guessing.`,
@@ -4618,7 +4766,7 @@ export class ArisService {
         `Example: {"tool":"media_library_download","mediaId":42,"analyze":true,"question":"What is the invoice total and due date?"}`,
         `Example: {"tool":"media_library_download","query":"the photo of my blue bicycle"}`,
       ] : []),
-      `MORNING BRIEF DELIVERY: A morning brief must include the complete text brief and a matching audio brief. Send the full text with app_send_message and the spoken version with audio_generate destination "app". If podcast episodes are present, also queue them with app_send_audio_batch. Do not finish with only a conversational summary when delivery was requested.`,
+      `MORNING BRIEF DELIVERY: A morning brief must include the complete text brief, a matching audio brief, and the selected podcast episodes. Deliver all three only to the Aris app: send the text with app_send_message, the spoken version with audio_generate destination "app", and each original podcast with app_send_audio_batch. Never route any part of a morning brief to WhatsApp.`,
       `Only these exact tools are callable: ${canonicalToolManifest}`,
       `Never invent a tool name, translate a tool name, or use an alias.`,
       `If the previous tool result already satisfies the user's request, do not invoke any further tools.`,
@@ -4785,21 +4933,6 @@ export class ArisService {
       this.applyRequestSpecificDefaults(invocation, userMessage, sessionId)
     );
     const availableSkills = userId ? await this.skillService.list(userId).catch(() => []) : [];
-    if (!approvedAction && this.isMorningBriefRequest(userMessage.toLowerCase())) {
-      const morningSkill = availableSkills.find((skill) =>
-        skill.status === "active" && skill.triggers.some((trigger) => /morning brief|daily brief/i.test(trigger))
-      );
-      if (morningSkill) {
-        initialInvocations = [{
-          tool: "skill_run",
-          payload: {
-            name: morningSkill.name,
-            input: { message: userMessage },
-            requiresApproval: (morningSkill.metadata?.sideEffectTools || []).length > 0,
-          },
-        }];
-      }
-    }
     if (!approvedAction && initialInvocations.length === 0) {
       const normalizedMessage = userMessage.toLowerCase();
       const triggeredSkill = availableSkills.find((skill) =>
@@ -4922,10 +5055,31 @@ export class ArisService {
         this.recordToolObservation(userId, sessionId, invocation, initialResults[index])
       ));
 
-      const isAndroidAppSession = sessionId?.startsWith("aris-android") || sessionId === "aris-android-chat";
-      const isWhatsappDelivery = /\bwhatsapp\b/i.test(userMessage);
-      if (this.isMorningBriefRequest(userMessage.toLowerCase()) && (isWhatsappDelivery || isAndroidAppSession)) {
+      if (this.isMorningBriefRequest(userMessage.toLowerCase())) {
         await this.maybeAutoCreateSkill(userId, userMessage, toolResults);
+        const podcastResult = initialResults.find((result, index) =>
+          initialInvocations[index]?.tool === "fetch_news_podcast"
+        );
+        if (!podcastResult?.success) {
+          return {
+            status: "error",
+            reply: "I gathered the brief, but couldn't prepare the podcast episodes needed to complete it in the Aris app. Please check your Google Drive connection and try again.",
+            memoryEntries: [],
+          };
+        }
+        const podcastEpisodes = Array.isArray((podcastResult.data as any)?.episodes)
+          ? (podcastResult.data as any).episodes.filter((episode: any) => String(episode.storageUri || "").startsWith("drive:"))
+          : [];
+        if (podcastEpisodes.length === 0) {
+          return {
+            status: "error",
+            reply: "I gathered the brief, but no podcast episodes were available to include in the Aris app delivery.",
+            memoryEntries: [],
+          };
+        }
+        const podcastContext = podcastEpisodes.map((episode: any) =>
+          `- ${episode.title || "Untitled episode"}${episode.feedName ? ` (${episode.feedName})` : ""}${episode.publishedAt ? `, published ${episode.publishedAt}` : ""}${episode.analysis ? `: ${String(episode.analysis).slice(0, 500)}` : ""}`
+        );
         const sourceLines = toolResults.map((entry) => {
           const source = JSON.stringify(entry.result.data ?? {});
           return `SOURCE ${entry.invocation.tool}: ${source}`;
@@ -4933,11 +5087,14 @@ export class ArisService {
         const briefPrompt = [
           "Compose the complete morning brief from the supplied tool results.",
           "Return only valid JSON with exactly these string fields: message and audioText.",
-          "message is the complete readable WhatsApp text brief.",
+          "message is the complete readable brief for the user's Aris app.",
           "audioText is the same complete brief rewritten naturally for speech.",
+          "Include a concise 'Podcasts for today' section in message naming every attached episode and giving a factual one-sentence summary when provided. audioText should introduce the included podcast episodes briefly; their original audio files are delivered separately.",
           "Do not mention tools, prompts, reasoning, missing context, or uncertainty.",
           "Do not shorten, summarize away, or impose a word or duration limit.",
           `User request: ${userMessage}`,
+          "PODCAST EPISODES ATTACHED SEPARATELY:",
+          ...podcastContext,
           ...sourceLines,
         ].join("\n");
         let briefResponse = await this.gemmaService.requestArisAdvice(briefPrompt);
@@ -4946,7 +5103,9 @@ export class ArisService {
           const retryPrompt = [
             "Create a complete morning brief from these compact source notes.",
             "Return ONLY valid JSON: {\"message\":\"...\",\"audioText\":\"...\"}.",
-            "Use the same facts in both fields. Keep it useful and concise.",
+            "Use the same facts in both fields. Include a concise Podcasts for today section naming every attached episode; the original audio files will be delivered separately.",
+            "PODCAST EPISODES ATTACHED SEPARATELY:",
+            ...podcastContext,
             ...sourceLines,
           ].join("\n");
           briefResponse = await this.gemmaService.requestArisAdvice(retryPrompt);
@@ -4959,24 +5118,10 @@ export class ArisService {
             memoryEntries: [],
           };
         }
-        const podcastEpisodes = initialResults
-          .flatMap((result, index) => initialInvocations[index]?.tool === "fetch_news_podcast" && result.success
-            ? Array.isArray((result.data as any)?.episodes) ? (result.data as any).episodes : []
-            : [])
-          .filter((episode: any) => String(episode.storageUri || "").startsWith("drive:"));
         const pendingAction = {
           tool: "morning_brief_send",
           payload: { message: brief.message, audioText: brief.audioText, podcastEpisodes },
         };
-
-        if (isWhatsappDelivery) {
-          return {
-            status: "awaiting_approval",
-            reply: "I prepared the complete morning brief with both text and audio, plus the available podcast episodes. Reply APPROVE and I will deliver it to your Aris app.",
-            memoryEntries: [],
-            pendingAction,
-          };
-        }
 
         const delivery = await this.executeToolCall(userId, pendingAction, sessionId, replyToWhatsappMessage);
         toolResults.push({ invocation: pendingAction, result: delivery });
@@ -4990,7 +5135,9 @@ export class ArisService {
         await this.finalizeSuccessfulToolChain(userId, userMessage, toolResults);
         return {
           status: "finished",
-          reply: "I've sent your complete morning brief to the Aris app, including the generated audio and available podcast episodes.",
+          reply: delivery.data?.cacheSaved === false
+            ? "I've sent your complete morning brief to the Aris app, including audio and podcasts, but couldn't save it for quick reuse next time."
+            : "I've sent your complete morning brief to the Aris app, including the generated audio and podcast episodes.",
           memoryEntries: [],
           mediaAttachments: this.extractMediaAttachments(toolResults),
         };
@@ -4999,8 +5146,7 @@ export class ArisService {
       const podcastResult = initialResults.find((result, index) =>
         initialInvocations[index]?.tool === "fetch_news_podcast" && result.success
       );
-      const isAndroidPodcastDelivery = isAndroidAppSession && !this.isMorningBriefRequest(userMessage.toLowerCase());
-      if (podcastResult && (isAndroidPodcastDelivery || /\bwhatsapp\b/i.test(userMessage)) && !this.isMorningBriefRequest(userMessage.toLowerCase())) {
+      if (podcastResult && !this.isMorningBriefRequest(userMessage.toLowerCase())) {
         const catalogEpisodes = Array.isArray((podcastResult.data as any)?.episodes)
           ? (podcastResult.data as any).episodes.filter((episode: any) => String(episode.storageUri || "").startsWith("drive:"))
           : [];
@@ -5008,51 +5154,48 @@ export class ArisService {
           const delivery = {
             tool: "app_send_audio_batch",
             payload: { episodes: catalogEpisodes },
-          };
-          if (isAndroidPodcastDelivery) {
-            const result = await this.executeToolCall(userId, delivery, sessionId, replyToWhatsappMessage);
-            toolResults.push({ invocation: delivery, result });
-            if (!result.success) {
-              return {
-                status: "error",
-                reply: `I found the podcasts, but delivery failed: ${result.error || "unknown error"}`,
-                memoryEntries: [],
-              };
-            }
-            await this.finalizeSuccessfulToolChain(userId, userMessage, toolResults);
+          }
+          const result = await this.executeToolCall(userId, delivery, sessionId, replyToWhatsappMessage);
+          toolResults.push({ invocation: delivery, result });
+          if (!result.success) {
             return {
-              status: "finished",
-              reply: `I've queued ${catalogEpisodes.length} podcast episodes in the Aris app. They should appear in your chat shortly.`,
+              status: "error",
+              reply: `I found the podcasts, but delivery to the Aris app failed: ${result.error || "unknown error"}`,
               memoryEntries: [],
             };
           }
+          await this.finalizeSuccessfulToolChain(userId, userMessage, toolResults);
           return {
-            status: "awaiting_approval",
-            reply: `I selected ${catalogEpisodes.length} current podcast episodes, including NPR. Reply APPROVE and I will send them in order. After listening, tell me which ones you enjoyed so I can build your custom podcast list.`,
+            status: "finished",
+            reply: `I've queued ${catalogEpisodes.length} podcast episodes in the Aris app. They should appear in your chat shortly. After listening, tell me which ones you enjoyed so I can build your custom podcast list.`,
             memoryEntries: [],
-            pendingAction: delivery,
           };
         }
         const storageUri = String((podcastResult.data as any)?.storageUri || "");
         if (storageUri.startsWith("drive:")) {
-          return {
-            status: "awaiting_approval",
-            reply: "I downloaded and listened to the latest news podcast. Reply APPROVE and I will send the original episode to your WhatsApp.",
-            memoryEntries: [],
-            pendingAction: {
-              tool: "app_send_audio",
-              payload: {
-                driveRef: storageUri,
-                mimeType: String((podcastResult.data as any)?.mimeType || "audio/mpeg").split(";")[0],
-              },
+          const delivery = await this.executeToolCall(userId, {
+            tool: "app_send_audio",
+            payload: {
+              driveRef: storageUri,
+              mimeType: String((podcastResult.data as any)?.mimeType || "audio/mpeg").split(";")[0],
             },
+          }, sessionId, replyToWhatsappMessage);
+          toolResults.push({ invocation: { tool: "app_send_audio", payload: { driveRef: storageUri } }, result: delivery });
+          if (!delivery.success) {
+            return {
+              status: "error",
+              reply: `I found the podcast, but delivery to the Aris app failed: ${delivery.error || "unknown error"}`,
+              memoryEntries: [],
+            };
           };
+          await this.finalizeSuccessfulToolChain(userId, userMessage, toolResults);
+          return { status: "finished", reply: "I've queued the podcast episode in the Aris app. It should appear in your chat shortly.", memoryEntries: [] };
         }
         const transcript = String((podcastResult.data as any)?.transcript || "").trim();
         if (transcript) {
           const summaryPrompt = [
-            "Create a detailed, natural spoken news podcast brief for a WhatsApp voice note.",
-            "Use only the supplied podcast transcript. Do not mention tools, internal reasoning, or inability to send WhatsApp.",
+            "Create a detailed, natural spoken news podcast brief for the user's Aris app.",
+            "Use only the supplied podcast transcript. Do not mention tools or internal reasoning.",
             "Return only the spoken script, around 90 to 150 seconds long.",
             `User request: ${userMessage}`,
             `Podcast title: ${(podcastResult.data as any)?.title || "News podcast"}`,
@@ -5061,15 +5204,21 @@ export class ArisService {
           const scriptResponse = await this.gemmaService.requestArisAdvice(summaryPrompt);
           const script = scriptResponse.reply.trim();
           if (script.length >= 40) {
-            return {
-              status: "awaiting_approval",
-              reply: "I downloaded and listened to the latest news podcast. I prepared a WhatsApp voice summary; reply APPROVE and I will send it.",
-              memoryEntries: [],
-              pendingAction: {
-                tool: "audio_generate",
-                payload: { destination: "whatsapp", text: script },
-              },
+            const invocation = {
+              tool: "audio_generate",
+              payload: { destination: "app", text: script, requestText: userMessage },
             };
+            const delivery = await this.executeToolCall(userId, invocation, sessionId, replyToWhatsappMessage);
+            toolResults.push({ invocation, result: delivery });
+            if (!delivery.success) {
+              return {
+                status: "error",
+                reply: `I prepared the podcast summary, but delivery to the Aris app failed: ${delivery.error || "unknown error"}`,
+                memoryEntries: [],
+              };
+            }
+            await this.finalizeSuccessfulToolChain(userId, userMessage, toolResults);
+            return { status: "finished", reply: "I've queued the podcast summary in the Aris app.", memoryEntries: [], mediaAttachments: this.extractMediaAttachments(toolResults) };
           }
         }
       }
@@ -5459,6 +5608,10 @@ export class ArisService {
         attachments.push(data.mediaLibraryAttachment);
         continue;
       }
+      if (Array.isArray(data?.mediaLibraryAttachments)) {
+        attachments.push(...data.mediaLibraryAttachments);
+        continue;
+      }
       const directAudio = data?.audioBase64 ?? data?.audio?.audioBase64;
       if (directAudio && (tr.invocation.tool === "audio_generate" || tr.invocation.tool === "morning_brief_send")) {
         attachments.push({
@@ -5495,9 +5648,7 @@ export class ArisService {
     if (normalizedTool === "audio_generate") {
       const requestedDestination = String(invocation.payload?.destination || "").toLowerCase();
       const isAppSession = sessionId?.startsWith("aris-android");
-      const destination = sessionId === "whatsapp-direct" && requestedDestination !== "email"
-        ? "whatsapp"
-        : requestedDestination || (isAppSession ? "app" : "download");
+      const destination = requestedDestination || (sessionId === "whatsapp-direct" ? "whatsapp" : (isAppSession ? "app" : "download"));
       // "app" and "download" destinations return inline audio — no approval needed
       // Email always needs approval; WhatsApp only when it's an actual WhatsApp session
       if (destination === "app" || destination === "download") return false;

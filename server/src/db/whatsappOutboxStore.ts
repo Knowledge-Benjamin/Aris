@@ -45,6 +45,27 @@ export const whatsappOutboxStore = {
     return res.rows.map(mapRow);
   },
 
+  async getPendingForApp(userId: number, limit = 50): Promise<OutboxMessage[]> {
+    const res = await pool.query(
+      `SELECT * FROM whatsapp_outbox
+       WHERE user_id = $1 AND to_jid = 'app' AND status = 'pending'
+       ORDER BY created_at ASC
+       LIMIT $2`,
+      [userId, Math.max(1, Math.min(limit, 100))]
+    );
+    return res.rows.map(mapRow);
+  },
+
+  async markAppSent(userId: number, id: number): Promise<boolean> {
+    const res = await pool.query(
+      `UPDATE whatsapp_outbox
+       SET status = 'sent', sent_at = NOW()
+       WHERE id = $1 AND user_id = $2 AND to_jid = 'app' AND status = 'pending'`,
+      [id, userId]
+    );
+    return (res.rowCount ?? 0) > 0;
+  },
+
   async clearPending(userId: number): Promise<number> {
     const res = await pool.query(
       `DELETE FROM whatsapp_outbox WHERE user_id = $1 AND status = 'pending'`,
