@@ -19,8 +19,10 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
@@ -44,6 +46,23 @@ private const val SESSION_ID = "aris-android-chat"
 // Amplitudes to capture for waveform visualisation
 private const val WAVEFORM_SAMPLES = 40
 
+object ChatSession {
+    private val logoutEvents = MutableSharedFlow<Unit>(extraBufferCapacity = 1)
+
+    fun logout(context: Context) {
+        context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .edit()
+            .remove(PREF_AUTH_TOKEN)
+            .remove(PREF_MESSAGES)
+            .apply()
+        logoutEvents.tryEmit(Unit)
+    }
+
+    suspend fun observeLogout(onLogout: () -> Unit) {
+        logoutEvents.collect { onLogout() }
+    }
+}
+
 class ChatViewModel(private val appContext: Context) : ViewModel() {
 
     private val prefs: SharedPreferences = appContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
@@ -64,6 +83,27 @@ class ChatViewModel(private val appContext: Context) : ViewModel() {
     init {
         if (authToken != null) {
             startOutboxPolling()
+        }
+        viewModelScope.launch {
+            ChatSession.observeLogout {
+                authToken = null
+                outboxPollJob?.cancel()
+                cancelVoiceRecording()
+                stopPlayback()
+                persistMessages(emptyList())
+                _uiState.update {
+                    it.copy(
+                        messages = emptyList(),
+                        isAuthenticated = false,
+                        isLoggingIn = false,
+                        loginError = null,
+                        inputText = "",
+                        stagedAttachment = null,
+                        progressMessage = null,
+                        replyingTo = null,
+                    )
+                }
+            }
         }
     }
 
