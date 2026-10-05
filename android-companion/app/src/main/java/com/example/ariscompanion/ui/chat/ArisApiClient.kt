@@ -131,7 +131,6 @@ class ArisApiClient(serverUrl: String, private val token: String) {
                     .apply { replyContext?.let { put("replyContext", it) } },
             )
             VoiceChatResult(
-                transcript = result.optString("transcript"),
                 arisReply = result.optString("arisReply"),
                 memoryUpdates = result.optJSONArray("memoryUpdates").toStringList(),
                 voiceBase64 = result.optString("voiceBase64").ifEmpty { null },
