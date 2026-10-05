@@ -30,80 +30,64 @@ $watcher.NotifyFilter = [IO.NotifyFilters]'FileName, DirectoryName, LastWrite, S
 $watcher.InternalBufferSize = 65536
 $watcher.EnableRaisingEvents = $true
 
+function Sync-PendingChanges {
+    $status = @(& git -C $repoRoot status --porcelain --untracked-files=all)
+    if ($LASTEXITCODE -ne 0) {
+        Write-Warning 'git status failed; pending changes will be checked again.'
+        return
+    }
+    if ($status.Count -eq 0) {
+        return
+    }
+
+    & git -C $repoRoot add --all
+    if ($LASTEXITCODE -ne 0) {
+        Write-Warning 'git add --all failed; pending changes will be checked again.'
+        return
+    }
+
+    $paths = @(& git -C $repoRoot diff --cached --name-only)
+    if ($LASTEXITCODE -ne 0) {
+        Write-Warning 'Could not inspect staged changes; pending changes will be checked again.'
+        return
+    }
+    if ($paths.Count -eq 0) {
+        return
+    }
+
+    $message = "committed the following files:`n" + (($paths | Sort-Object -Unique | ForEach-Object { "- $_" }) -join "`n")
+    & git -C $repoRoot commit -m $message
+    if ($LASTEXITCODE -ne 0) {
+        Write-Warning 'Commit failed; staged changes will be retried after the next check.'
+        return
+    }
+
+    & git -C $repoRoot push origin $defaultBranch
+    if ($LASTEXITCODE -eq 0) {
+        Write-Host "Pushed changes for: $($paths -join ', ')"
+    }
+    else {
+        Write-Warning "Push failed. The commit is local on '$defaultBranch' and will be included in a later successful push."
+    }
+}
+
 Write-Host "Watching $repoRoot; commits will be pushed to origin/$defaultBranch. Press Ctrl+C to stop."
 
 try {
+    Sync-PendingChanges
+
     while ($true) {
-        $change = $watcher.WaitForChanged([IO.WatcherChangeTypes]::All, [int]::MaxValue)
-        if ($change.TimedOut) {
-            continue
-        }
-
-        $pendingPaths = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
-        [void]$pendingPaths.Add($change.Name)
-        if ($change.ChangeType -eq [IO.WatcherChangeTypes]::Renamed -and $change.OldName) {
-            [void]$pendingPaths.Add($change.OldName)
-        }
-
-        while ($true) {
-            $change = $watcher.WaitForChanged([IO.WatcherChangeTypes]::All, $DebounceMilliseconds)
-            if ($change.TimedOut) {
-                break
-            }
-            [void]$pendingPaths.Add($change.Name)
-            if ($change.ChangeType -eq [IO.WatcherChangeTypes]::Renamed -and $change.OldName) {
-                [void]$pendingPaths.Add($change.OldName)
+        $change = $watcher.WaitForChanged([IO.WatcherChangeTypes]::All, 5000)
+        if (-not $change.TimedOut) {
+            while ($true) {
+                $change = $watcher.WaitForChanged([IO.WatcherChangeTypes]::All, $DebounceMilliseconds)
+                if ($change.TimedOut) {
+                    break
+                }
             }
         }
 
-        $paths = @(
-            foreach ($eventPath in $pendingPaths) {
-                $relativePath = $eventPath.Replace('\', '/')
-                $leaf = [IO.Path]::GetFileName($relativePath)
-                if ($relativePath -match '(^|/)\.git(/|$)' -or
-                    $relativePath -match '(^|/)(node_modules|dist|build|\.gradle|\.research-browser-profile|\.meeting-profile)(/|$)' -or
-                    $leaf -match '^\.env($|\.)' -or $leaf -match '\.env$') {
-                    continue
-                }
-
-                $null = & git -C $repoRoot check-ignore --quiet -- $relativePath 2>$null
-                if ($LASTEXITCODE -eq 0) {
-                    continue
-                }
-
-                $fullPath = Join-Path $repoRoot $eventPath
-                if (Test-Path -LiteralPath $fullPath -PathType Container) {
-                    continue
-                }
-                $relativePath
-            }
-        )
-
-        if ($paths.Count -eq 0) {
-            continue
-        }
-
-        $gitPathspecs = @($paths | ForEach-Object { ":(literal)$_" })
-        & git -C $repoRoot add --all -- $gitPathspecs
-        if ($LASTEXITCODE -ne 0) {
-            Write-Warning 'git add failed; no commit was created for this batch.'
-            continue
-        }
-
-        $message = "committed the following files:`n" + (($paths | Sort-Object -Unique | ForEach-Object { "- $_" }) -join "`n")
-        & git -C $repoRoot commit --only -m $message -- $gitPathspecs
-        if ($LASTEXITCODE -ne 0) {
-            Write-Host 'No commit was created for this batch.'
-            continue
-        }
-
-        & git -C $repoRoot push origin $defaultBranch
-        if ($LASTEXITCODE -eq 0) {
-            Write-Host "Pushed changes for: $($paths -join ', ')"
-        }
-        else {
-            Write-Warning "Push failed. The commit is local on '$defaultBranch' and will be included in a later successful push."
-        }
+        Sync-PendingChanges
     }
 }
 finally {
