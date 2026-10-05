@@ -15,7 +15,6 @@ import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.*
-import androidx.compose.foundation.clickable
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.shape.CircleShape
@@ -24,14 +23,16 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.alpha
-import androidx.compose.ui.draw.blur
-import androidx.compose.ui.draw.scale
 import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.StrokeCap
+import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.graphics.drawscope.rotate
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -49,6 +50,9 @@ import com.example.ariscompanion.NotificationState
 import com.example.ariscompanion.AccessibilityState
 import com.example.ariscompanion.ui.chat.ChatSession
 import androidx.core.app.NotificationManagerCompat
+import kotlin.math.PI
+import kotlin.math.cos
+import kotlin.math.sin
 
 @Composable
 fun MainScreen(
@@ -102,29 +106,44 @@ fun MainScreen(
         }
     }
 
-    // Smooth amplitude for visual fidelity
-    val animatedAmplitude by animateFloatAsState(
-        targetValue = if (isListening) (amplitude / 32767f).coerceIn(0f, 1f) else 0f,
-        animationSpec = spring(dampingRatio = Spring.DampingRatioMediumBouncy, stiffness = Spring.StiffnessLow),
-        label = "amplitude"
-    )
-
-    // Base pulsing animation
     val infiniteTransition = rememberInfiniteTransition(label = "pulse")
-    val pulseScale by infiniteTransition.animateFloat(
-        initialValue = 0.95f,
-        targetValue = 1.05f,
+    val cycle by infiniteTransition.animateFloat(
+        initialValue = 0f,
+        targetValue = 1f,
+        animationSpec = infiniteRepeatable(tween(7000, easing = LinearEasing)),
+        label = "avatarCycle",
+    )
+    val typingProgress by infiniteTransition.animateInt(
+        initialValue = 0,
+        targetValue = 4,
         animationSpec = infiniteRepeatable(
-            animation = tween(1500, easing = LinearOutSlowInEasing),
-            repeatMode = RepeatMode.Reverse
+            animation = keyframes {
+                durationMillis = 4600
+                0 at 0
+                4 at 1400
+                4 at 3200
+                0 at 4600
+            },
+            repeatMode = RepeatMode.Restart,
         ),
-        label = "pulseScale"
+        label = "terminalTyping",
+    )
+    val cursorAlpha by infiniteTransition.animateFloat(
+        initialValue = 0.2f,
+        targetValue = 1f,
+        animationSpec = infiniteRepeatable(tween(520), RepeatMode.Reverse),
+        label = "terminalCursor",
+    )
+    val pulseScale by infiniteTransition.animateFloat(
+        initialValue = 0.97f,
+        targetValue = 1.03f,
+        animationSpec = infiniteRepeatable(tween(1900, easing = LinearOutSlowInEasing), RepeatMode.Reverse),
+        label = "pulseScale",
     )
 
     val bgColor = Color(0xFF07070B)
     val accentNeon = Color(0xFF00F0FF)
-    val accentPurple = Color(0xFF8A2BE2)
-    val accentGreen = Color(0xFF00FF88)
+    val accentGreen = Color(0xFF73F7C2)
 
     Box(modifier = modifier.fillMaxSize().background(bgColor)) {
         Canvas(Modifier.fillMaxSize()) {
@@ -140,83 +159,81 @@ fun MainScreen(
             drawLine(Color.White.copy(alpha = 0.035f), Offset(0f, size.height * 0.7f), Offset(size.width, size.height * 0.45f), 1f, StrokeCap.Round)
         }
         Column(
-            modifier = Modifier.fillMaxSize().padding(horizontal = 4.dp, vertical = 8.dp),
+            modifier = Modifier.fillMaxSize().padding(horizontal = 24.dp, vertical = 12.dp),
             verticalArrangement = Arrangement.SpaceBetween,
             horizontalAlignment = Alignment.CenterHorizontally
         ) {
-        Column(
-            horizontalAlignment = Alignment.CenterHorizontally,
-            modifier = Modifier
-                .fillMaxWidth()
-                .background(Color.White.copy(alpha = 0.055f), RoundedCornerShape(28.dp))
-                .border(1.dp, Color.White.copy(alpha = 0.09f), RoundedCornerShape(28.dp))
-                .padding(top = 20.dp, bottom = 18.dp)
-        ) {
-            Box(modifier = Modifier.fillMaxWidth()) {
-                Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.fillMaxWidth()) {
-                    Text(
-                        text = "ARIS",
-                        color = Color.White,
-                        fontSize = 26.sp,
-                        fontWeight = FontWeight.Bold,
-                        letterSpacing = 8.sp
-                    )
-                    Text(
-                        text = "YOUR DIGITAL COMPANION",
-                        color = accentNeon.copy(alpha = 0.7f),
-                        fontSize = 12.sp,
-                        letterSpacing = 4.sp,
-                        modifier = Modifier.padding(top = 8.dp)
-                    )
-                }
+            Box(modifier = Modifier.fillMaxWidth().height(52.dp)) {
+                Text(
+                    text = "A R I S   /   D I G I T A L   C O R E",
+                    color = Color(0xFF91A7BD).copy(alpha = 0.62f),
+                    fontFamily = FontFamily.Monospace,
+                    fontSize = 9.sp,
+                    letterSpacing = 1.1.sp,
+                    modifier = Modifier.align(Alignment.CenterStart),
+                )
                 IconButton(
                     onClick = { showSystemSettings = true },
-                    modifier = Modifier.align(Alignment.TopEnd).padding(end = 8.dp).size(40.dp),
+                    modifier = Modifier.align(Alignment.CenterEnd).size(44.dp),
                 ) {
                     Text("⚙", color = Color.White.copy(alpha = 0.9f), fontSize = 24.sp)
                 }
             }
-        }
-            
-        ArisCharacter(
-            isListening = isListening,
-            isVisionActive = isVisionActive,
-            amplitude = amplitude,
-            pulseScale = pulseScale,
-            isOnline = isOnline,
-            notificationCount = notificationCount,
-            modifier = Modifier.padding(4.dp),
-        )
 
-        Column(
-            horizontalAlignment = Alignment.CenterHorizontally,
-            modifier = Modifier
-                .fillMaxWidth()
-                .background(Color(0xCC0B0D1A), RoundedCornerShape(30.dp))
-                .border(1.dp, Color.White.copy(alpha = 0.1f), RoundedCornerShape(30.dp))
-                .padding(horizontal = 18.dp, vertical = 18.dp)
-        ) {
-            Text(
-                text = when {
-                    !isOnline -> "OFFLINE MODE"
-                    isVisionActive -> "VISION ENABLED"
-                    isListening -> "ANALYZING AUDIO"
-                    notificationCount > 0 -> "$notificationCount NOTIFICATION${if (notificationCount == 1) "" else "S"} WAITING"
-                    else -> "SYSTEM DORMANT"
-                },
-                color = when {
-                    !isOnline -> Color(0xFFFFB86B)
-                    isVisionActive -> accentGreen
-                    isListening -> accentNeon
-                    notificationCount > 0 -> Color(0xFFFF668E)
-                    else -> Color.Gray
-                },
-                fontSize = 12.sp,
-                letterSpacing = 2.sp,
-                modifier = Modifier.padding(bottom = 24.dp)
-            )
+            Column(
+                modifier = Modifier.weight(1f).fillMaxWidth(),
+                horizontalAlignment = Alignment.CenterHorizontally,
+                verticalArrangement = Arrangement.Center,
+            ) {
+                ArisCharacter(
+                    isListening = isListening,
+                    isVisionActive = isVisionActive,
+                    amplitude = amplitude,
+                    pulseScale = pulseScale,
+                    isOnline = isOnline,
+                    notificationCount = notificationCount,
+                    cycle = cycle,
+                    modifier = Modifier.size(300.dp),
+                )
+                Spacer(Modifier.height(8.dp))
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text(
+                        text = "ARIS".take(typingProgress),
+                        color = Color(0xFFE5FBFF),
+                        fontFamily = FontFamily.Monospace,
+                        fontWeight = FontWeight.Black,
+                        fontSize = 36.sp,
+                        letterSpacing = 12.sp,
+                    )
+                    Box(
+                        Modifier
+                            .padding(start = 3.dp, top = 8.dp)
+                            .width(3.dp)
+                            .height(25.dp)
+                            .background(accentNeon.copy(alpha = cursorAlpha), RoundedCornerShape(2.dp)),
+                    )
+                }
+                Text(
+                    text = when {
+                        !isOnline -> "LINK OFFLINE  //  RECONNECTING"
+                        isListening -> "AUDIO INPUT  //  ACTIVE"
+                        isVisionActive -> "VISION LINK  //  ACTIVE"
+                        notificationCount > 0 -> "SIGNAL QUEUED  //  $notificationCount"
+                        else -> "NEURAL COMPANION  //  ONLINE"
+                    },
+                    color = when {
+                        !isOnline -> Color(0xFFFFB86B)
+                        isListening -> accentNeon
+                        isVisionActive -> accentGreen
+                        else -> Color(0xFF8296AA)
+                    }.copy(alpha = 0.86f),
+                    fontFamily = FontFamily.Monospace,
+                    fontSize = 10.sp,
+                    letterSpacing = 1.4.sp,
+                    modifier = Modifier.padding(top = 10.dp),
+                )
+            }
 
-            // Chat — navigate to the dedicated Aris chat screen
             Button(
                 onClick = { onItemClick(com.example.ariscompanion.Chat) },
                 colors = ButtonDefaults.buttonColors(
@@ -224,11 +241,10 @@ fun MainScreen(
                     contentColor = Color(0xFF00F0FF)
                 ),
                 shape = RoundedCornerShape(18.dp),
-                modifier = Modifier.fillMaxWidth().height(52.dp)
+                modifier = Modifier.fillMaxWidth().height(58.dp).padding(bottom = 6.dp)
             ) {
-                Text("CHAT WITH ARIS", fontWeight = FontWeight.SemiBold, letterSpacing = 1.sp)
+                Text("CHAT WITH ARIS", fontWeight = FontWeight.SemiBold, letterSpacing = 2.sp)
             }
-        }
         }
     }
 
