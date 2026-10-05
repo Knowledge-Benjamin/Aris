@@ -52,6 +52,7 @@ import com.example.ariscompanion.ui.chat.ChatSession
 import androidx.core.app.NotificationManagerCompat
 import kotlin.math.PI
 import kotlin.math.cos
+import kotlin.math.ln
 import kotlin.math.sin
 
 @Composable
@@ -196,22 +197,34 @@ fun MainScreen(
                     modifier = Modifier.size(300.dp),
                 )
                 Spacer(Modifier.height(8.dp))
-                Row(verticalAlignment = Alignment.CenterVertically) {
+                if (isListening) {
+                    val listeningPulse = (0.76f + 0.24f * sin(cycle * 2f * PI * 2f).toFloat())
                     Text(
-                        text = "ARIS".take(typingProgress.toInt().coerceIn(0, 4)),
-                        color = Color(0xFFE5FBFF),
+                        text = "LISTENING",
+                        color = accentNeon.copy(alpha = listeningPulse),
                         fontFamily = FontFamily.Monospace,
-                        fontWeight = FontWeight.Black,
-                        fontSize = 36.sp,
-                        letterSpacing = 12.sp,
+                        fontWeight = FontWeight.Bold,
+                        fontSize = 23.sp,
+                        letterSpacing = 4.sp,
                     )
-                    Box(
-                        Modifier
-                            .padding(start = 3.dp, top = 8.dp)
-                            .width(3.dp)
-                            .height(25.dp)
-                            .background(accentNeon.copy(alpha = cursorAlpha), RoundedCornerShape(2.dp)),
-                    )
+                } else {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Text(
+                            text = "ARIS".take(typingProgress.toInt().coerceIn(0, 4)),
+                            color = Color(0xFFE5FBFF),
+                            fontFamily = FontFamily.Monospace,
+                            fontWeight = FontWeight.Black,
+                            fontSize = 36.sp,
+                            letterSpacing = 12.sp,
+                        )
+                        Box(
+                            Modifier
+                                .padding(start = 3.dp, top = 8.dp)
+                                .width(3.dp)
+                                .height(25.dp)
+                                .background(accentNeon.copy(alpha = cursorAlpha), RoundedCornerShape(2.dp)),
+                        )
+                    }
                 }
                 Text(
                     text = when {
@@ -407,6 +420,16 @@ private fun ArisCharacter(
     cycle: Float,
     modifier: Modifier = Modifier,
 ) {
+    val measuredEnergy = if (isListening) {
+        (ln(amplitude.coerceAtLeast(0f) + 1f) / ln(12001f)).coerceIn(0f, 1f)
+    } else {
+        0f
+    }
+    val audioEnergy by animateFloatAsState(
+        targetValue = measuredEnergy,
+        animationSpec = tween(durationMillis = 110, easing = LinearEasing),
+        label = "microphoneEnergy",
+    )
     val characterColor = when {
         !isOnline -> Color(0xFFFFB86B)
         isListening -> Color(0xFF00F0FF)
@@ -414,7 +437,6 @@ private fun ArisCharacter(
         notificationCount > 0 -> Color(0xFFFF668E)
         else -> Color(0xFF62DBF5)
     }
-    val audioEnergy = if (isListening) (amplitude / 32767f).coerceIn(0f, 1f) else 0f
 
     Box(
         modifier = modifier,
@@ -422,28 +444,30 @@ private fun ArisCharacter(
     ) {
         Canvas(Modifier.fillMaxSize()) {
             val radius = size.minDimension * 0.29f
-            val breathing = 1f + (pulseScale - 1f) * 1.5f + audioEnergy * 0.08f
+            val beat = (0.5f + 0.5f * sin(cycle * 2f * PI * 2f)).toFloat()
+            val listeningGlow = if (isListening) 0.45f + beat * 0.35f + audioEnergy * 0.45f else 0f
+            val breathing = 1f + (pulseScale - 1f) * 1.5f + audioEnergy * 0.12f + if (isListening) beat * 0.025f else 0f
             drawCircle(
                 brush = Brush.radialGradient(
-                    listOf(characterColor.copy(alpha = 0.18f), Color.Transparent),
+                    listOf(characterColor.copy(alpha = 0.18f + listeningGlow * 0.18f), Color.Transparent),
                     center,
                     radius * 2.15f,
                 ),
                 radius = radius * 2.15f,
             )
             drawCircle(
-                color = characterColor.copy(alpha = 0.12f + audioEnergy * 0.14f),
+                color = characterColor.copy(alpha = 0.12f + audioEnergy * 0.16f + if (isListening) beat * 0.08f else 0f),
                 radius = radius * 1.26f * breathing,
             )
 
             rotate(degrees = cycle * 360f, pivot = center) {
                 drawCircle(
-                    color = characterColor.copy(alpha = 0.34f),
+                    color = characterColor.copy(alpha = if (isListening) 0.46f + listeningGlow * 0.32f else 0.34f),
                     radius = radius * 1.52f,
                     style = Stroke(width = 1.2.dp.toPx(), pathEffect = androidx.compose.ui.graphics.PathEffect.dashPathEffect(floatArrayOf(3.dp.toPx(), 8.dp.toPx()))),
                 )
                 drawArc(
-                    color = characterColor.copy(alpha = 0.85f),
+                    color = characterColor.copy(alpha = if (isListening) 0.72f + listeningGlow * 0.28f else 0.85f),
                     startAngle = -112f,
                     sweepAngle = 72f,
                     useCenter = false,
@@ -509,6 +533,48 @@ private fun ArisCharacter(
                 drawCircle(characterColor.copy(alpha = 0.95f), 2.dp.toPx(), Offset(center.x + side * radius * 0.13f, center.y + radius * 0.04f))
             }
 
+            if (isListening) {
+                for (index in 0 until 4) {
+                    val phase = (cycle * 3.2f + index * 0.25f) % 1f
+                    val startAngle = cycle * 2f * PI + index * PI / 2f - PI / 2f
+                    val start = Offset(
+                        center.x + cos(startAngle).toFloat() * radius * 1.2f,
+                        center.y + sin(startAngle).toFloat() * radius * 1.2f,
+                    )
+                    val targetX = center.x + (index - 1.5f) * radius * 0.34f
+                    val end = Offset(targetX, center.y)
+                    val control = Offset((start.x + end.x) / 2f, (start.y + end.y) / 2f - radius * 0.3f)
+                    val inverse = 1f - phase
+                    val spark = Offset(
+                        inverse * inverse * start.x + 2f * inverse * phase * control.x + phase * phase * end.x,
+                        inverse * inverse * start.y + 2f * inverse * phase * control.y + phase * phase * end.y,
+                    )
+                    val trailPhase = (phase - 0.09f).coerceAtLeast(0f)
+                    val trailInverse = 1f - trailPhase
+                    val trail = Offset(
+                        trailInverse * trailInverse * start.x + 2f * trailInverse * trailPhase * control.x + trailPhase * trailPhase * end.x,
+                        trailInverse * trailInverse * start.y + 2f * trailInverse * trailPhase * control.y + trailPhase * trailPhase * end.y,
+                    )
+                    drawLine(
+                        characterColor.copy(alpha = 0.22f + audioEnergy * 0.28f),
+                        trail,
+                        spark,
+                        strokeWidth = 2.dp.toPx(),
+                        cap = StrokeCap.Round,
+                    )
+                    drawCircle(
+                        characterColor.copy(alpha = 0.22f),
+                        radius = (5f + audioEnergy * 4f).dp.toPx(),
+                        center = spark,
+                    )
+                    drawCircle(
+                        Color.White.copy(alpha = 0.75f + audioEnergy * 0.25f),
+                        radius = 1.8.dp.toPx(),
+                        center = spark,
+                    )
+                }
+            }
+
             val waveform = Path()
             val points = 33
             for (index in 0 until points) {
@@ -516,12 +582,22 @@ private fun ArisCharacter(
                 val envelope = (1f - kotlin.math.abs(index - (points - 1) / 2f) / ((points - 1) / 2f)).coerceAtLeast(0.12f)
                 val oscillation = sin(index * 1.67f + cycle * 2f * PI).toFloat()
                 val secondary = cos(index * 0.73f - cycle * 4f * PI).toFloat() * 0.28f
-                val height = (radius * 0.08f + radius * (0.13f + audioEnergy * 0.4f) * envelope * kotlin.math.abs(oscillation + secondary)).coerceAtMost(radius * 0.47f)
+                val idleHeight = 0.13f
+                val activeHeight = 0.16f + audioEnergy * 0.72f
+                val height = (radius * 0.045f + radius * (if (isListening) activeHeight else idleHeight) * envelope * kotlin.math.abs(oscillation + secondary)).coerceAtMost(radius * 0.47f)
                 val y = center.y + if (index % 2 == 0) -height else height
                 if (index == 0) waveform.moveTo(x, y) else waveform.lineTo(x, y)
             }
-            drawPath(waveform, characterColor.copy(alpha = 0.22f), style = Stroke(width = 7.dp.toPx(), cap = StrokeCap.Round, join = androidx.compose.ui.graphics.StrokeJoin.Round))
-            drawPath(waveform, Color(0xFFE4FFFF), style = Stroke(width = 1.7.dp.toPx(), cap = StrokeCap.Round, join = androidx.compose.ui.graphics.StrokeJoin.Round))
+            drawPath(
+                waveform,
+                characterColor.copy(alpha = if (isListening) 0.22f + audioEnergy * 0.4f else 0.22f),
+                style = Stroke(width = (if (isListening) 7f + audioEnergy * 5f else 7f).dp.toPx(), cap = StrokeCap.Round, join = androidx.compose.ui.graphics.StrokeJoin.Round),
+            )
+            drawPath(
+                waveform,
+                Color(0xFFE4FFFF).copy(alpha = if (isListening) 0.82f + audioEnergy * 0.18f else 1f),
+                style = Stroke(width = 1.7.dp.toPx(), cap = StrokeCap.Round, join = androidx.compose.ui.graphics.StrokeJoin.Round),
+            )
 
             val scanY = center.y - radius + (cycle * radius * 2f)
             drawLine(
