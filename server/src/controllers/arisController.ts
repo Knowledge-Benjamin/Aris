@@ -148,28 +148,28 @@ export async function arisVoice(req: Request, res: Response) {
       return res.status(400).json({ error: "mimeType is required" });
     }
 
+    if (!mimeType.toLowerCase().startsWith("audio/")) {
+      return res.status(400).json({ error: "An audio attachment is required." });
+    }
+
     if (!userId) {
       return res.status(401).json({ error: "Unauthorized user." });
     }
 
-    info(`[aris] arisVoice request userId=${userId} sessionId=${sessionId} mimeType=${mimeType} audioBase64Length=${audioBase64.length}`);
-    const transcript = await voiceService.transcribeAudio(audioBase64, mimeType);
-    if (!transcript) {
-      return res.status(400).json({ error: "Unable to transcribe audio." });
-    }
-
+    info(`[aris] arisVoice multimodal request userId=${userId} sessionId=${sessionId} mimeType=${mimeType} audioBase64Length=${audioBase64.length}`);
     const response = await arisService.handleChat({
-      message: transcript,
+      message: "Listen to the attached voice note and respond directly to the spoken request. Treat the speech as the user's message; do not return a transcript unless asked.",
       sessionId,
       userId,
       mediaData: { mimeType, dataBase64: audioBase64, fileName: `voice-note-${Date.now()}` },
-      replyContext,
+      replyContext: typeof replyContext === "string" ? replyContext : undefined,
     });
     const voice = await voiceService.synthesizeSpeech(response.arisReply);
+    const extension = voice.mimeType === "audio/wav" ? "wav" : voice.mimeType === "audio/ogg" ? "ogg" : "mp3";
     const archivedVoice = await arisService.archiveGeneratedMedia(
       userId,
       sessionId,
-      `aris-voice-reply-${Date.now()}.wav`,
+      `aris-voice-reply-${Date.now()}.${extension}`,
       voice.mimeType,
       Buffer.from(voice.audioBase64, "base64"),
       "aris_voice_reply",
@@ -177,7 +177,6 @@ export async function arisVoice(req: Request, res: Response) {
     );
 
     res.json({
-      transcript,
       arisReply: response.arisReply,
       memoryUpdates: response.memoryUpdates,
       voiceBase64: voice.audioBase64,

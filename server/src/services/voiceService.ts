@@ -1,7 +1,6 @@
 import axios from "axios";
 import { info, error } from "../utils/logger";
 
-const voiceApiKey = process.env.VOICE_API_KEY || process.env.GEMMA_API_KEY;
 const ttsUrl = process.env.VOICE_TTS_URL || "https://bravadoben-cc-proxy.hf.space/v1/text:synthesize";
 const ttsVoiceName = process.env.VOICE_TTS_VOICE || "af_heart";
 const ttsAudioEncoding = process.env.VOICE_TTS_AUDIO_ENCODING || "MP3";

@@ -156,7 +156,6 @@ data class ArisChatResult(
 )
 
 data class VoiceChatResult(
-    val transcript: String,
     val arisReply: String,
     val memoryUpdates: List<String> = emptyList(),
     val voiceBase64: String? = null,
