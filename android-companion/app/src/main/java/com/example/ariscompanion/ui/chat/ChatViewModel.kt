@@ -468,7 +468,6 @@ class ChatViewModel(private val appContext: Context) : ViewModel() {
 
         viewModelScope.launch {
             try {
-                updateMessageStatus(msgId, MessageStatus.SENT)
                 val arisId = UUID.randomUUID().toString()
                 appendMessage(ChatMessage(id = arisId, sender = Sender.ARIS, text = "", status = MessageStatus.SENDING))
                 _uiState.update { it.copy(progressMessage = "🎧 Transcribing voice note…") }
@@ -533,7 +532,9 @@ class ChatViewModel(private val appContext: Context) : ViewModel() {
                         }
                     }
                 }
-                finalResult?.let { result ->
+                val result = finalResult ?: throw IOException("The server did not confirm the message.")
+                updateMessageStatus(msgId, MessageStatus.SENT)
+                run {
                     updateMessage(arisId) {
                         it.copy(text = result.arisReply, status = MessageStatus.SENT, memoryUpdates = result.memoryUpdates)
                     }
