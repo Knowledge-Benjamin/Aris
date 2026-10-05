@@ -266,7 +266,6 @@ class ChatViewModel(private val appContext: Context) : ViewModel() {
 
         viewModelScope.launch {
             try {
-                updateMessageStatus(msgId, MessageStatus.SENT)
                 val arisId = UUID.randomUUID().toString()
                 val placeholder = ChatMessage(id = arisId, sender = Sender.ARIS, text = "", status = MessageStatus.SENDING)
                 appendMessage(placeholder)
@@ -301,7 +300,9 @@ class ChatViewModel(private val appContext: Context) : ViewModel() {
                     }
                 }
 
-                finalResult?.let { result ->
+                val result = finalResult ?: throw IOException("The server did not confirm the message.")
+                updateMessageStatus(msgId, MessageStatus.SENT)
+                run {
                     val pending = result.pendingAction?.let { pa ->
                         PendingAction(
                             tool = pa["tool"].toString(),
@@ -476,6 +477,7 @@ class ChatViewModel(private val appContext: Context) : ViewModel() {
                 val result = client?.sendVoice(attachment.base64, attachment.mimeType, SESSION_ID)
                     ?: throw Exception("Not connected")
 
+                updateMessageStatus(msgId, MessageStatus.SENT)
                 _uiState.update { it.copy(progressMessage = null) }
                 updateMessage(arisId) {
                     it.copy(
@@ -504,7 +506,6 @@ class ChatViewModel(private val appContext: Context) : ViewModel() {
 
         viewModelScope.launch {
             try {
-                updateMessageStatus(msgId, MessageStatus.SENT)
                 val arisId = UUID.randomUUID().toString()
                 appendMessage(ChatMessage(id = arisId, sender = Sender.ARIS, text = "", status = MessageStatus.SENDING))
                 _uiState.update { it.copy(progressMessage = "📎 Processing attachment…") }
