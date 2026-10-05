@@ -9,6 +9,8 @@ import android.net.Uri
 import android.provider.OpenableColumns
 import android.util.Base64
 import android.widget.Toast
+import android.widget.MediaController
+import android.widget.VideoView
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.core.content.FileProvider
@@ -40,6 +42,7 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.ui.viewinterop.AndroidView
 import androidx.compose.material3.Button
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.IconButton
@@ -855,7 +858,7 @@ private fun AttachmentPreview(
             if (bitmap != null) Image(bitmap, contentDescription = "Attached image", modifier = Modifier.fillMaxWidth().height(220.dp))
             else Text("Image attachment")
         }
-        is MediaAttachment.Video -> Text("Video attachment (${attachment.mimeType})")
+        is MediaAttachment.Video -> VideoAttachmentPlayer(attachment, messageId, index)
         is MediaAttachment.Audio -> AudioAttachmentButton(messageId, index, attachment, state, onEvent)
         is MediaAttachment.VoiceNote -> AudioAttachmentButton(messageId, index, attachment, state, onEvent)
         is MediaAttachment.Document -> {
@@ -864,6 +867,71 @@ private fun AttachmentPreview(
                 Text("Open ${attachment.fileName}")
             }
         }
+    }
+}
+
+@Composable
+private fun VideoAttachmentPlayer(
+    attachment: MediaAttachment.Video,
+    messageId: String,
+    index: Int,
+) {
+    val context = LocalContext.current
+    var videoUri by remember(attachment.uri, attachment.base64, messageId, index) {
+        mutableStateOf(attachment.uri.takeIf { it.toString().isNotBlank() })
+    }
+    var loadError by remember(attachment.uri, attachment.base64, messageId, index) {
+        mutableStateOf<String?>(null)
+    }
+
+    LaunchedEffect(attachment.uri, attachment.base64, messageId, index) {
+        if (videoUri == null) {
+            try {
+                videoUri = withContext(Dispatchers.IO) {
+                    val extension = attachment.mimeType.substringAfter('/', "mp4")
+                        .substringBefore(';')
+                        .takeIf { it.matches(Regex("[A-Za-z0-9]+")) } ?: "mp4"
+                    val file = File(context.cacheDir, "chat_video_${messageId}_$index.$extension")
+                    if (!file.exists()) {
+                        file.writeBytes(Base64.decode(attachment.base64, Base64.DEFAULT))
+                    }
+                    Uri.fromFile(file)
+                }
+            } catch (error: IOException) {
+                loadError = error.message ?: "Could not prepare this video for playback."
+            } catch (error: IllegalArgumentException) {
+                loadError = error.message ?: "This video attachment is invalid."
+            }
+        }
+    }
+
+    val resolvedUri = videoUri
+    when {
+        resolvedUri != null -> {
+            AndroidView(
+                modifier = Modifier.fillMaxWidth().height(220.dp),
+                factory = { viewContext ->
+                    VideoView(viewContext).apply {
+                        tag = resolvedUri.toString()
+                        setVideoURI(resolvedUri)
+                        setMediaController(MediaController(viewContext).also { it.setAnchorView(this) })
+                        setOnErrorListener { _, _, _ ->
+                            Toast.makeText(viewContext, "This video could not be played.", Toast.LENGTH_SHORT).show()
+                            true
+                        }
+                    }
+                },
+                update = { videoView ->
+                    if (videoView.tag != resolvedUri.toString()) {
+                        videoView.tag = resolvedUri.toString()
+                        videoView.setVideoURI(resolvedUri)
+                    }
+                },
+                onRelease = VideoView::stopPlayback,
+            )
+        }
+        loadError != null -> Text(loadError.orEmpty(), color = MaterialTheme.colorScheme.error, fontSize = 12.sp)
+        else -> Text("Preparing ${attachment.fileName}…", color = Color(0xFF9DAAC2), fontSize = 12.sp)
     }
 }
 
