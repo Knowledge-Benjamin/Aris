@@ -80,12 +80,14 @@ class ArisApiClient(serverUrl: String, private val token: String) {
         mimeType: String,
         fileName: String,
         sessionId: String,
+        replyContext: String? = null,
         onEvent: (ChatStreamEvent) -> Unit,
     ) {
         chatStream(
             message = caption.ifBlank { "Please analyze this attachment." },
             sessionId = sessionId,
             mediaData = mapOf("mimeType" to mimeType, "dataBase64" to base64, "fileName" to fileName),
+            replyContext = replyContext,
             onEvent = onEvent,
         )
     }
@@ -112,7 +114,12 @@ class ArisApiClient(serverUrl: String, private val token: String) {
         }
     }
 
-    suspend fun sendVoice(audioBase64: String, mimeType: String, sessionId: String): VoiceChatResult =
+    suspend fun sendVoice(
+        audioBase64: String,
+        mimeType: String,
+        sessionId: String,
+        replyContext: String? = null,
+    ): VoiceChatResult =
         withContext(Dispatchers.IO) {
             val result = request(
                 method = "POST",
@@ -120,7 +127,8 @@ class ArisApiClient(serverUrl: String, private val token: String) {
                 body = JSONObject()
                     .put("audioBase64", audioBase64)
                     .put("mimeType", mimeType)
-                    .put("sessionId", sessionId),
+                    .put("sessionId", sessionId)
+                    .apply { replyContext?.let { put("replyContext", it) } },
             )
             VoiceChatResult(
                 transcript = result.optString("transcript"),

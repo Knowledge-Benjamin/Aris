@@ -260,7 +260,14 @@ class ChatViewModel(private val appContext: Context) : ViewModel() {
     private fun sendTextMessage(text: String) {
         val msgId = UUID.randomUUID().toString()
         val replyingTo = _uiState.value.replyingTo
-        val userMsg = ChatMessage(id = msgId, sender = Sender.USER, text = text, status = MessageStatus.SENDING)
+        val userMsg = ChatMessage(
+            id = msgId,
+            sender = Sender.USER,
+            text = text,
+            status = MessageStatus.SENDING,
+            quotedText = replyingTo?.replySummary(),
+            quotedSender = replyingTo?.sender,
+        )
         appendMessage(userMsg)
         _uiState.update { it.copy(replyingTo = null) }
 
@@ -284,7 +291,7 @@ class ChatViewModel(private val appContext: Context) : ViewModel() {
                     text,
                     SESSION_ID,
                     mediaData = visionFrame,
-                    replyContext = replyingTo?.text,
+                    replyContext = replyingTo?.replyContext(),
                 ) { event ->
                     when (event.type) {
                         "progress" -> _uiState.update { it.copy(progressMessage = event.message) }
@@ -459,13 +466,17 @@ class ChatViewModel(private val appContext: Context) : ViewModel() {
 
     private fun sendVoiceNoteMessage(attachment: MediaAttachment.VoiceNote) {
         val msgId = UUID.randomUUID().toString()
+        val replyingTo = _uiState.value.replyingTo
         val userMsg = ChatMessage(
             id = msgId,
             sender = Sender.USER,
             attachment = attachment,
-            status = MessageStatus.SENDING
+            status = MessageStatus.SENDING,
+            quotedText = replyingTo?.replySummary(),
+            quotedSender = replyingTo?.sender,
         )
         appendMessage(userMsg)
+        _uiState.update { it.copy(replyingTo = null) }
 
         viewModelScope.launch {
             try {
@@ -474,7 +485,12 @@ class ChatViewModel(private val appContext: Context) : ViewModel() {
                 _uiState.update { it.copy(progressMessage = "🎧 Transcribing voice note…") }
 
                 syncPhoneLocation()
-                val result = client?.sendVoice(attachment.base64, attachment.mimeType, SESSION_ID)
+                val result = client?.sendVoice(
+                    attachment.base64,
+                    attachment.mimeType,
+                    SESSION_ID,
+                    replyingTo?.replyContext(),
+                )
                     ?: throw Exception("Not connected")
 
                 updateMessageStatus(msgId, MessageStatus.SENT)
@@ -501,8 +517,18 @@ class ChatViewModel(private val appContext: Context) : ViewModel() {
 
     private fun sendMediaMessage(attachment: MediaAttachment, caption: String) {
         val msgId = UUID.randomUUID().toString()
-        val userMsg = ChatMessage(id = msgId, sender = Sender.USER, text = caption, attachment = attachment, status = MessageStatus.SENDING)
+        val replyingTo = _uiState.value.replyingTo
+        val userMsg = ChatMessage(
+            id = msgId,
+            sender = Sender.USER,
+            text = caption,
+            attachment = attachment,
+            status = MessageStatus.SENDING,
+            quotedText = replyingTo?.replySummary(),
+            quotedSender = replyingTo?.sender,
+        )
         appendMessage(userMsg)
+        _uiState.update { it.copy(replyingTo = null) }
 
         viewModelScope.launch {
             try {
@@ -520,7 +546,14 @@ class ChatViewModel(private val appContext: Context) : ViewModel() {
 
                 var finalResult: ArisChatResult? = null
                 syncPhoneLocation()
-                client?.sendMediaChat(caption, base64, mime, attachment.fileName, SESSION_ID) { event ->
+                client?.sendMediaChat(
+                    caption,
+                    base64,
+                    mime,
+                    attachment.fileName,
+                    SESSION_ID,
+                    replyingTo?.replyContext(),
+                ) { event ->
                     when (event.type) {
                         "progress" -> _uiState.update { it.copy(progressMessage = event.message) }
                         "complete" -> {

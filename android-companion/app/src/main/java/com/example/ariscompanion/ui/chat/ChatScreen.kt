@@ -239,7 +239,7 @@ fun ChatScreen(
                 state.replyingTo?.let { reply ->
                     ReplyPreview(
                         title = if (reply.sender == Sender.ARIS) "Aris" else "You",
-                        content = reply.text.ifBlank { attachmentLabel(reply.attachment) },
+                        content = reply.replySummary(),
                         accent = accent,
                         onDismiss = { viewModel.onEvent(ChatUiEvent.ClearReply) },
                     )
@@ -563,6 +563,29 @@ private fun DateDivider(timestampMs: Long) {
             Text(label, modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp), color = Color(0xFFBDD0D4), fontSize = 10.sp, fontWeight = FontWeight.SemiBold, letterSpacing = 0.7.sp)
         }
     }
+}
+
+@Composable
+private fun CollapsibleMessageText(
+    text: String,
+    expanded: Boolean,
+    onExpandedChange: (Boolean) -> Unit,
+    onOverflowChange: (Boolean) -> Unit,
+    color: Color,
+    fontSize: androidx.compose.ui.unit.TextUnit,
+    lineHeight: androidx.compose.ui.unit.TextUnit,
+) {
+    Text(
+        text = text,
+        color = color,
+        fontSize = fontSize,
+        lineHeight = lineHeight,
+        maxLines = if (expanded) Int.MAX_VALUE else 8,
+        overflow = TextOverflow.Ellipsis,
+        onTextLayout = { result ->
+            if (!expanded) onOverflowChange(result.hasVisualOverflow)
+        },
+    )
 }
 
 private fun dayKey(timestampMs: Long): String =

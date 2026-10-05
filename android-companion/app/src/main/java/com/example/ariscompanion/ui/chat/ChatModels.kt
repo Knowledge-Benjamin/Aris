@@ -81,20 +81,25 @@ data class ChatMessage(
 )
 
 fun ChatMessage.replySummary(): String {
-    val attachmentSummary = when (val media = attachment) {
-        is MediaAttachment.Image -> "Photo: ${media.fileName}"
-        is MediaAttachment.Video -> "Video: ${media.fileName}"
-        is MediaAttachment.Audio -> "Audio: ${media.fileName}"
-        is MediaAttachment.VoiceNote -> "Voice note"
-        is MediaAttachment.Document -> "Document: ${media.fileName}"
-        null -> null
-    }
+    val media = listOfNotNull(attachment) + arisAttachments
+    val attachmentSummary = media.take(3).joinToString("\n") { it.replyAttachmentSummary() }.ifBlank { null }
     return listOfNotNull(
         text.takeIf(String::isNotBlank),
         transcript?.takeIf(String::isNotBlank)?.let { "Transcript: $it" },
         attachmentSummary,
     ).joinToString("\n").ifBlank { "Message" }.take(4000)
 }
+
+private fun MediaAttachment.replyAttachmentSummary(): String = when (this) {
+    is MediaAttachment.Image -> "Photo: $fileName"
+    is MediaAttachment.Video -> "Video: $fileName"
+    is MediaAttachment.Audio -> "Audio: $fileName"
+    is MediaAttachment.VoiceNote -> "Voice note"
+    is MediaAttachment.Document -> "Document: $fileName"
+}
+
+fun ChatMessage.replyContext(): String =
+    "${if (sender == Sender.USER) "User" else "Aris"} message: ${replySummary()}"
 
 data class ChatUiState(
     val messages: List<ChatMessage> = emptyList(),

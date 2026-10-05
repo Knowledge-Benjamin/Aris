@@ -13,7 +13,7 @@
     <path
         android:fillColor="#00000000"
         android:pathData="M22,58 L29,58 L34,51 L39,67 L45,46 L50,57 L54,28 L58,57 L63,46 L69,67 L74,51 L79,58 L86,58"
-        android:strokeColor="#70E8DF"
+        android:strokeColor="#00F0FF"
         android:strokeWidth="3.8"
         android:strokeLineCap="round"
         android:strokeLineJoin="round" />

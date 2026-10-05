@@ -136,7 +136,7 @@ export async function arisChatStream(req: Request, res: Response) {
 
 export async function arisVoice(req: Request, res: Response) {
   try {
-    const { audioBase64, mimeType, sessionId } = req.body;
+    const { audioBase64, mimeType, sessionId, replyContext } = req.body;
     const authReq = req as AuthenticatedRequest;
     const userId = authReq.authUserId;
 
@@ -163,6 +163,7 @@ export async function arisVoice(req: Request, res: Response) {
       sessionId,
       userId,
       mediaData: { mimeType, dataBase64: audioBase64, fileName: `voice-note-${Date.now()}` },
+      replyContext,
     });
     const voice = await voiceService.synthesizeSpeech(response.arisReply);
     const archivedVoice = await arisService.archiveGeneratedMedia(
