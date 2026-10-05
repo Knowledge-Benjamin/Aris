@@ -1247,6 +1247,39 @@ export class ArisService {
     return steps;
   }
 
+  private buildMemoryAwareExecutionContext(
+    memories: string[],
+    reusableAnswers: ReusableAnswerMemory[],
+    requestRoute: RequestRoutingDecision,
+    executionPlan: string[],
+    toolResults: Array<{ invocation: ToolInvocation; result: ToolExecutionResult }>,
+  ): string {
+    const answerLines = reusableAnswers.slice(0, 5).map((answer) =>
+      `- capturedAt=${answer.recordedAt} similarity=${answer.similarity.toFixed(3)} question=${answer.question}\n  answer=${answer.answer.slice(0, 1200)}\n  sources=${JSON.stringify(answer.sources.slice(0, 3))}`
+    );
+    const factLines = memories.slice(0, 12).map((memory, index) =>
+      `${index + 1}. ${memory.slice(0, 800)}`
+    );
+    const observationLines = toolResults.map(({ invocation, result }) =>
+      `- ${invocation.tool}: ${result.success ? `completed; ${this.summarizeToolData(result.data).slice(0, 900)}` : `failed; ${String(result.error || "unknown error").slice(0, 400)}`}`
+    );
+
+    return [
+      "MEMORY-INFORMED PLAN AND TASK LIST",
+      `Pre-execution memory assessment: ${requestRoute.memoryAssessment}`,
+      `Information still missing according to the initial assessment: ${requestRoute.informationGaps.join("; ") || "None stated; reassess against the user's full request and evidence."}`,
+      "Treat memory as task context: use known facts to answer supported parts, seed precise lookups, and select the narrowest relevant tool. Identify partial facts separately from unknowns; gather only missing evidence. Do not present partial memory as complete or repeat work already completed.",
+      "After every tool result, update the task list: mark satisfied requirements complete, retain unresolved requirements, and revise the next action or fallback when evidence changes the plan. Do not repeat a successful lookup unless new evidence reveals a real gap or the user requested a refresh.",
+      requestRoute.forceRefresh
+        ? "Freshness override: prior answers may guide where and how to check, but must not be treated as the refreshed result."
+        : "For stable facts, prefer adequate stored evidence; obtain fresh data for volatile state or when the request explicitly requires it.",
+      `Current plan:\n${executionPlan.join("\n")}`,
+      `Current-run completed/failed steps:\n${observationLines.join("\n") || "(No tools have run yet.)"}`,
+      `Relevant timestamped answer memories:\n${answerLines.join("\n") || "(None.)"}`,
+      `Relevant semantic facts:\n${factLines.join("\n") || "(None.)"}`,
+    ].join("\n\n");
+  }
+
   private createStructuredExecutionPlan(userMessage: string, invocations: ToolInvocation[]) {
     const planSteps = this.buildExecutionPlan(userMessage, invocations);
     const tasks = planSteps.map((step, index) => {
