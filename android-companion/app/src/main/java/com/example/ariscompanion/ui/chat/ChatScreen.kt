@@ -397,130 +397,140 @@ private fun MessageBubble(
     ) {
         Row(
             modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = if (isAris) Arrangement.Start else Arrangement.End,
             verticalAlignment = Alignment.Bottom,
         ) {
-            Surface(
-                modifier = Modifier.fillMaxWidth(0.88f),
-                shape = if (isAris) {
-                    RoundedCornerShape(topStart = 5.dp, topEnd = 17.dp, bottomEnd = 17.dp, bottomStart = 17.dp)
-                } else {
-                    RoundedCornerShape(topStart = 17.dp, topEnd = 5.dp, bottomEnd = 17.dp, bottomStart = 17.dp)
-                },
-                color = bubbleColor,
-                shadowElevation = 1.dp,
+            if (!isAris) ReplyAction(onReply)
+            Box(
+                modifier = Modifier.weight(1f),
+                contentAlignment = if (isAris) Alignment.CenterStart else Alignment.CenterEnd,
             ) {
-                Column(
-                    modifier = Modifier
-                        .pointerInput(message.id, isAris) {
-                            var inwardDrag = 0f
-                            detectHorizontalDragGestures(
-                                onHorizontalDrag = { change, dragAmount ->
-                                    change.consume()
-                                    inwardDrag += if (isAris) dragAmount else -dragAmount
-                                },
-                                onDragEnd = {
-                                    if (inwardDrag >= 56.dp.toPx()) onReply()
-                                },
-                            )
-                        }
-                        .padding(start = 11.dp, end = 10.dp, top = 8.dp, bottom = 6.dp),
-                    verticalArrangement = Arrangement.spacedBy(5.dp),
+                Surface(
+                    modifier = Modifier.fillMaxWidth(0.92f),
+                    shape = if (isAris) {
+                        RoundedCornerShape(topStart = 5.dp, topEnd = 17.dp, bottomEnd = 17.dp, bottomStart = 17.dp)
+                    } else {
+                        RoundedCornerShape(topStart = 17.dp, topEnd = 5.dp, bottomEnd = 17.dp, bottomStart = 17.dp)
+                    },
+                    color = bubbleColor,
+                    shadowElevation = 1.dp,
                 ) {
-                    if (isAris) {
-                        Text("ARIS", color = Color(0xFF00F0FF), fontSize = 10.sp, fontWeight = FontWeight.Bold, letterSpacing = 1.1.sp)
-                    }
-                    message.quotedText?.takeIf(String::isNotBlank)?.let {
-                        Surface(
-                            shape = RoundedCornerShape(5.dp),
-                            color = Color.Black.copy(alpha = 0.18f),
-                            modifier = Modifier.fillMaxWidth(),
-                        ) {
-                            Column(Modifier.padding(start = 8.dp, top = 5.dp, bottom = 5.dp, end = 7.dp)) {
-                                Text(
-                                    if (message.quotedSender == Sender.USER) "You" else "Aris",
-                                    color = Color(0xFF00D8E8),
-                                    fontSize = 10.sp,
-                                    fontWeight = FontWeight.SemiBold,
+                    Column(
+                        modifier = Modifier
+                            .pointerInput(message.id, isAris) {
+                                var inwardDrag = 0f
+                                detectHorizontalDragGestures(
+                                    onHorizontalDrag = { change, dragAmount ->
+                                        change.consume()
+                                        inwardDrag += if (isAris) dragAmount else -dragAmount
+                                    },
+                                    onDragEnd = {
+                                        if (inwardDrag >= 56.dp.toPx()) onReply()
+                                    },
                                 )
-                                Text(it, color = Color(0xFFC5D1D5), fontSize = 12.sp, maxLines = 2, overflow = TextOverflow.Ellipsis)
+                            }
+                            .padding(start = 11.dp, end = 10.dp, top = 8.dp, bottom = 6.dp),
+                        verticalArrangement = Arrangement.spacedBy(5.dp),
+                    ) {
+                        if (isAris) {
+                            Text("ARIS", color = Color(0xFF00F0FF), fontSize = 10.sp, fontWeight = FontWeight.Bold, letterSpacing = 1.1.sp)
+                        }
+                        message.quotedText?.takeIf(String::isNotBlank)?.let {
+                            Surface(
+                                shape = RoundedCornerShape(5.dp),
+                                color = Color.Black.copy(alpha = 0.18f),
+                                modifier = Modifier.fillMaxWidth(),
+                            ) {
+                                Column(Modifier.padding(start = 8.dp, top = 5.dp, bottom = 5.dp, end = 7.dp)) {
+                                    Text(
+                                        if (message.quotedSender == Sender.USER) "You" else "Aris",
+                                        color = Color(0xFF00D8E8),
+                                        fontSize = 10.sp,
+                                        fontWeight = FontWeight.SemiBold,
+                                    )
+                                    Text(it, color = Color(0xFFC5D1D5), fontSize = 12.sp, maxLines = 2, overflow = TextOverflow.Ellipsis)
+                                }
                             }
                         }
-                    }
-                    message.text.takeIf(String::isNotBlank)?.let {
-                        CollapsibleMessageText(
-                            text = it,
-                            color = Color(0xFFF0F4F5),
-                            fontSize = 15.sp,
-                            lineHeight = 21.sp,
-                        )
-                    }
-                    message.transcript?.takeIf(String::isNotBlank)?.let {
-                        CollapsibleMessageText(
-                            text = "Transcript · $it",
-                            color = Color(0xFFCAD4D7),
-                            fontSize = 13.sp,
-                            lineHeight = 18.sp,
-                        )
-                    }
-                    message.attachment?.let { AttachmentPreview(it, message.id, 0, state, onEvent) }
-                    message.arisAttachments.forEachIndexed { index, attachment ->
-                        AttachmentPreview(attachment, message.id, index, state, onEvent)
-                    }
-                    if (message.voiceBase64 != null) {
-                        TextButton(
-                            onClick = { onEvent(ChatUiEvent.PlayVoice(message.id)) },
-                            contentPadding = PaddingValues(horizontal = 4.dp, vertical = 0.dp),
-                        ) {
-                            Text(if (state.playbackKey == message.id) "Ⅱ  Stop voice" else "▶  Play voice", color = Color(0xFF00D8E8))
+                        message.text.takeIf(String::isNotBlank)?.let {
+                            CollapsibleMessageText(
+                                text = it,
+                                color = Color(0xFFF0F4F5),
+                                fontSize = 15.sp,
+                                lineHeight = 21.sp,
+                            )
                         }
-                    }
-                    message.pendingAction?.let {
-                        Surface(color = Color.Black.copy(alpha = 0.18f), shape = RoundedCornerShape(10.dp)) {
-                            Column(Modifier.padding(10.dp)) {
-                                Text("Approval requested · ${it.tool}", color = Color(0xFFE8F0F2), fontSize = 13.sp)
-                                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                                    TextButton(onClick = { onEvent(ChatUiEvent.ApproveAction(message.id)) }) { Text("Approve") }
-                                    TextButton(onClick = { onEvent(ChatUiEvent.DenyAction(message.id)) }) {
-                                        Text("Decline", color = Color(0xFFFFA3A3))
+                        message.transcript?.takeIf(String::isNotBlank)?.let {
+                            CollapsibleMessageText(
+                                text = "Transcript · $it",
+                                color = Color(0xFFCAD4D7),
+                                fontSize = 13.sp,
+                                lineHeight = 18.sp,
+                            )
+                        }
+                        message.attachment?.let { AttachmentPreview(it, message.id, 0, state, onEvent) }
+                        message.arisAttachments.forEachIndexed { index, attachment ->
+                            AttachmentPreview(attachment, message.id, index, state, onEvent)
+                        }
+                        if (message.voiceBase64 != null) {
+                            TextButton(
+                                onClick = { onEvent(ChatUiEvent.PlayVoice(message.id)) },
+                                contentPadding = PaddingValues(horizontal = 4.dp, vertical = 0.dp),
+                            ) {
+                                Text(if (state.playbackKey == message.id) "Ⅱ  Stop voice" else "▶  Play voice", color = Color(0xFF00D8E8))
+                            }
+                        }
+                        message.pendingAction?.let {
+                            Surface(color = Color.Black.copy(alpha = 0.18f), shape = RoundedCornerShape(10.dp)) {
+                                Column(Modifier.padding(10.dp)) {
+                                    Text("Approval requested · ${it.tool}", color = Color(0xFFE8F0F2), fontSize = 13.sp)
+                                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                        TextButton(onClick = { onEvent(ChatUiEvent.ApproveAction(message.id)) }) { Text("Approve") }
+                                        TextButton(onClick = { onEvent(ChatUiEvent.DenyAction(message.id)) }) {
+                                            Text("Decline", color = Color(0xFFFFA3A3))
+                                        }
                                     }
                                 }
                             }
                         }
-                    }
-                    Row(
-                        modifier = Modifier.align(Alignment.End),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(5.dp),
-                    ) {
-                        if (message.status == MessageStatus.ERROR) {
-                            Text("Not sent", color = Color(0xFFFFB1A9), fontSize = 10.sp)
-                        } else if (message.status == MessageStatus.SENDING) {
-                            Text("Sending…", color = Color(0xFFB5C5CA), fontSize = 10.sp)
-                        }
-                        Text(formatMessageTime(message.timestampMs), color = Color(0xFFB5C5CA), fontSize = 10.sp)
-                        if (!isAris) {
-                            Text(
-                                if (message.status == MessageStatus.SENT) "✓" else if (message.status == MessageStatus.ERROR) "!" else "◷",
-                                color = if (message.status == MessageStatus.ERROR) Color(0xFFFFB1A9) else Color(0xFF00D8E8),
-                                fontSize = 12.sp,
-                                fontWeight = FontWeight.Bold,
-                            )
+                        Row(
+                            modifier = Modifier.align(Alignment.End),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(5.dp),
+                        ) {
+                            if (message.status == MessageStatus.ERROR) {
+                                Text("Not sent", color = Color(0xFFFFB1A9), fontSize = 10.sp)
+                            } else if (message.status == MessageStatus.SENDING) {
+                                Text("Sending…", color = Color(0xFFB5C5CA), fontSize = 10.sp)
+                            }
+                            Text(formatMessageTime(message.timestampMs), color = Color(0xFFB5C5CA), fontSize = 10.sp)
+                            if (!isAris) {
+                                Text(
+                                    if (message.status == MessageStatus.SENT) "✓" else if (message.status == MessageStatus.ERROR) "!" else "◷",
+                                    color = if (message.status == MessageStatus.ERROR) Color(0xFFFFB1A9) else Color(0xFF00D8E8),
+                                    fontSize = 12.sp,
+                                    fontWeight = FontWeight.Bold,
+                                )
+                            }
                         }
                     }
                 }
             }
-            Text(
-                text = "Reply",
-                color = Color(0xFF9DAAC2),
-                fontSize = 10.sp,
-                modifier = Modifier
-                    .padding(horizontal = 2.dp, vertical = 5.dp)
-                    .clickable(onClick = onReply)
-                    .padding(horizontal = 4.dp, vertical = 6.dp),
-            )
+            if (isAris) ReplyAction(onReply)
         }
     }
+}
+
+@Composable
+private fun ReplyAction(onReply: () -> Unit) {
+    Text(
+        text = "Reply",
+        color = Color(0xFF9DAAC2),
+        fontSize = 10.sp,
+        modifier = Modifier
+            .padding(horizontal = 2.dp, vertical = 5.dp)
+            .clickable(onClick = onReply)
+            .padding(horizontal = 4.dp, vertical = 6.dp),
+    )
 }
 
 @Composable
