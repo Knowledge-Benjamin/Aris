@@ -16,6 +16,8 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.*
@@ -34,6 +36,9 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.navigation3.runtime.NavKey
 import com.example.ariscompanion.AudioState
 import com.example.ariscompanion.SensorStreamService
@@ -41,6 +46,8 @@ import com.example.ariscompanion.ScreenCaptureService
 import com.example.ariscompanion.VisionState
 import com.example.ariscompanion.ConnectivityState
 import com.example.ariscompanion.NotificationState
+import com.example.ariscompanion.AccessibilityState
+import com.example.ariscompanion.ui.chat.ChatSession
 import androidx.core.app.NotificationManagerCompat
 
 @Composable
@@ -54,9 +61,24 @@ fun MainScreen(
     val isVisionActive by VisionState.isCapturing.collectAsState()
     val isOnline by ConnectivityState.isOnline.collectAsState()
     val notificationCount by NotificationState.notificationCount.collectAsState()
-    val notificationAccessEnabled = NotificationManagerCompat.getEnabledListenerPackages(context).contains(context.packageName)
-    val floatingArisEnabled = context.getSharedPreferences("aris_chat_prefs", Context.MODE_PRIVATE)
-        .getBoolean("floating_aris_enabled", false)
+    val lifecycleOwner = LocalLifecycleOwner.current
+    var settingsRefresh by remember { mutableIntStateOf(0) }
+    var showSystemSettings by remember { mutableStateOf(false) }
+    var showLogoutConfirmation by remember { mutableStateOf(false) }
+    val notificationAccessEnabled = remember(settingsRefresh) {
+        NotificationManagerCompat.getEnabledListenerPackages(context).contains(context.packageName)
+    }
+    val floatingArisEnabled = remember(settingsRefresh) {
+        context.getSharedPreferences("aris_chat_prefs", Context.MODE_PRIVATE)
+            .getBoolean("floating_aris_enabled", false) && AccessibilityState.activeService != null
+    }
+    DisposableEffect(lifecycleOwner) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME) settingsRefresh += 1
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+    }
     val requestAudioPermission = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestPermission()
     ) { granted ->
@@ -130,20 +152,30 @@ fun MainScreen(
                 .border(1.dp, Color.White.copy(alpha = 0.09f), RoundedCornerShape(28.dp))
                 .padding(top = 20.dp, bottom = 18.dp)
         ) {
-            Text(
-                text = "ARIS",
-                color = Color.White,
-                fontSize = 26.sp,
-                fontWeight = FontWeight.Bold,
-                letterSpacing = 8.sp
-            )
-            Text(
-                text = "YOUR DIGITAL COMPANION",
-                color = accentNeon.copy(alpha = 0.7f),
-                fontSize = 12.sp,
-                letterSpacing = 4.sp,
-                modifier = Modifier.padding(top = 8.dp)
-            )
+            Box(modifier = Modifier.fillMaxWidth()) {
+                Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.fillMaxWidth()) {
+                    Text(
+                        text = "ARIS",
+                        color = Color.White,
+                        fontSize = 26.sp,
+                        fontWeight = FontWeight.Bold,
+                        letterSpacing = 8.sp
+                    )
+                    Text(
+                        text = "YOUR DIGITAL COMPANION",
+                        color = accentNeon.copy(alpha = 0.7f),
+                        fontSize = 12.sp,
+                        letterSpacing = 4.sp,
+                        modifier = Modifier.padding(top = 8.dp)
+                    )
+                }
+                IconButton(
+                    onClick = { showSystemSettings = true },
+                    modifier = Modifier.align(Alignment.TopEnd).padding(end = 8.dp).size(40.dp),
+                ) {
+                    Text("⚙", color = Color.White.copy(alpha = 0.9f), fontSize = 24.sp)
+                }
+            }
         }
             
         ArisCharacter(
@@ -184,82 +216,6 @@ fun MainScreen(
                 modifier = Modifier.padding(bottom = 24.dp)
             )
 
-            // Audio Toggle
-            Button(
-                onClick = {
-                    if (isListening) {
-                        context.stopService(Intent(context, SensorStreamService::class.java))
-                    } else if (ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) {
-                        startAudioService(context)
-                    } else {
-                        requestAudioPermission.launch(Manifest.permission.RECORD_AUDIO)
-                    }
-                },
-                colors = ButtonDefaults.buttonColors(
-                    containerColor = if (isListening) Color(0xFF1E1E2A) else accentPurple,
-                    contentColor = Color.White
-                ),
-                shape = RoundedCornerShape(18.dp),
-                modifier = Modifier.fillMaxWidth().height(52.dp)
-            ) {
-                Text(if (isListening) "DISABLE AUDIO" else "ENABLE AUDIO", fontWeight = FontWeight.SemiBold, letterSpacing = 1.sp)
-            }
-            
-            Spacer(modifier = Modifier.height(16.dp))
-
-            // Vision Toggle
-            Button(
-                onClick = {
-                    if (isVisionActive) {
-                        context.stopService(Intent(context, ScreenCaptureService::class.java))
-                    } else {
-                        screenCaptureLauncher.launch(projectionManager.createScreenCaptureIntent())
-                    }
-                },
-                colors = ButtonDefaults.buttonColors(
-                    containerColor = if (isVisionActive) Color(0xFF1E1E2A) else accentGreen.copy(alpha = 0.7f),
-                    contentColor = Color.White
-                ),
-                shape = RoundedCornerShape(18.dp),
-                modifier = Modifier.fillMaxWidth().height(52.dp)
-            ) {
-                Text(if (isVisionActive) "DISABLE VISION" else "ENABLE VISION", fontWeight = FontWeight.SemiBold, letterSpacing = 1.sp)
-            }
-
-            Spacer(modifier = Modifier.height(16.dp))
-
-            Text(
-                text = if (notificationAccessEnabled) "NOTIFICATIONS CONNECTED" else "CONNECT NOTIFICATIONS",
-                color = if (notificationAccessEnabled) accentGreen.copy(alpha = 0.85f) else Color(0xFFFFB86B),
-                fontSize = 11.sp,
-                letterSpacing = 1.sp,
-                modifier = Modifier.clickable {
-                    if (!notificationAccessEnabled) {
-                        context.startActivity(Intent("android.settings.ACTION_NOTIFICATION_LISTENER_SETTINGS"))
-                    } else {
-                        NotificationState.clearAttention()
-                    }
-                }.padding(10.dp),
-            )
-
-            Text(
-                text = if (floatingArisEnabled) "DISABLE FLOATING ARIS" else "ENABLE FLOATING ARIS",
-                color = if (floatingArisEnabled) accentNeon else Color(0xFFFFB86B),
-                fontSize = 11.sp,
-                letterSpacing = 1.sp,
-                modifier = Modifier.clickable {
-                    if (floatingArisEnabled) {
-                        context.getSharedPreferences("aris_chat_prefs", Context.MODE_PRIVATE)
-                            .edit().putBoolean("floating_aris_enabled", false).apply()
-                        com.example.ariscompanion.AccessibilityState.activeService?.setFloatingArisEnabled(false)
-                    } else {
-                        context.getSharedPreferences("aris_chat_prefs", Context.MODE_PRIVATE)
-                            .edit().putBoolean("floating_aris_enabled", true).apply()
-                        context.startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
-                    }
-                }.padding(10.dp),
-            )
-
             // Chat — navigate to the dedicated Aris chat screen
             Button(
                 onClick = { onItemClick(com.example.ariscompanion.Chat) },
@@ -275,11 +231,153 @@ fun MainScreen(
         }
         }
     }
+
+    if (showSystemSettings) {
+        AlertDialog(
+            onDismissRequest = { showSystemSettings = false },
+            title = { Text("System settings") },
+            text = {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .heightIn(max = 440.dp)
+                        .verticalScroll(rememberScrollState()),
+                    verticalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    Text(
+                        "Choose which device capabilities Aris can use.",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    SettingsSwitchRow(
+                        title = "Enable audio",
+                        description = "Allow Aris to listen through the microphone.",
+                        checked = isListening,
+                        onCheckedChange = { enabled ->
+                            if (!enabled) {
+                                context.stopService(Intent(context, SensorStreamService::class.java))
+                            } else if (
+                                ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
+                            ) {
+                                startAudioService(context)
+                            } else {
+                                requestAudioPermission.launch(Manifest.permission.RECORD_AUDIO)
+                            }
+                        },
+                    )
+                    SettingsSwitchRow(
+                        title = "Enable video",
+                        description = "Share the screen with Aris while enabled.",
+                        checked = isVisionActive,
+                        onCheckedChange = { enabled ->
+                            if (enabled) {
+                                screenCaptureLauncher.launch(projectionManager.createScreenCaptureIntent())
+                            } else {
+                                context.stopService(Intent(context, ScreenCaptureService::class.java))
+                            }
+                        },
+                    )
+                    SettingsSwitchRow(
+                        title = "Connect notifications",
+                        description = if (notificationAccessEnabled) {
+                            "Notification access is connected. Tap to manage it."
+                        } else {
+                            "Allow Aris to read notifications in Android settings."
+                        },
+                        checked = notificationAccessEnabled,
+                        onCheckedChange = {
+                            context.startActivity(Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS))
+                        },
+                    )
+                    SettingsSwitchRow(
+                        title = "Enable floating Aris",
+                        description = if (floatingArisEnabled) {
+                            "Floating Aris is active. Turn off to hide it."
+                        } else {
+                            "Requires Aris accessibility access in Android settings."
+                        },
+                        checked = floatingArisEnabled,
+                        onCheckedChange = { enabled ->
+                            context.getSharedPreferences("aris_chat_prefs", Context.MODE_PRIVATE)
+                                .edit().putBoolean("floating_aris_enabled", enabled).apply()
+                            if (enabled) {
+                                context.startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
+                            } else {
+                                AccessibilityState.activeService?.setFloatingArisEnabled(false)
+                            }
+                            settingsRefresh += 1
+                        },
+                    )
+                    HorizontalDivider(modifier = Modifier.padding(vertical = 4.dp))
+                    TextButton(
+                        onClick = {
+                            showSystemSettings = false
+                            showLogoutConfirmation = true
+                        },
+                        modifier = Modifier.fillMaxWidth(),
+                        colors = ButtonDefaults.textButtonColors(contentColor = MaterialTheme.colorScheme.error),
+                    ) {
+                        Text("Log out")
+                    }
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = { showSystemSettings = false }) { Text("Done") }
+            },
+        )
+    }
+
+    if (showLogoutConfirmation) {
+        AlertDialog(
+            onDismissRequest = { showLogoutConfirmation = false },
+            title = { Text("Log out of Aris?") },
+            text = { Text("Your saved chat on this device will be cleared. You can sign in again at any time.") },
+            dismissButton = {
+                TextButton(onClick = { showLogoutConfirmation = false }) { Text("Cancel") }
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        ChatSession.logout(context)
+                        showLogoutConfirmation = false
+                        onItemClick(com.example.ariscompanion.Chat)
+                    },
+                    colors = ButtonDefaults.textButtonColors(contentColor = MaterialTheme.colorScheme.error),
+                ) {
+                    Text("Log out")
+                }
+            },
+        )
+    }
 }
 
 private fun startAudioService(context: Context) {
     val serviceIntent = Intent(context, SensorStreamService::class.java)
     ContextCompat.startForegroundService(context, serviceIntent)
+}
+
+@Composable
+private fun SettingsSwitchRow(
+    title: String,
+    description: String,
+    checked: Boolean,
+    onCheckedChange: (Boolean) -> Unit,
+) {
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(12.dp),
+    ) {
+        Column(modifier = Modifier.weight(1f)) {
+            Text(title, style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.SemiBold)
+            Text(
+                description,
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+        Switch(checked = checked, onCheckedChange = onCheckedChange)
+    }
 }
 
 @Composable
