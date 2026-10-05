@@ -404,48 +404,144 @@ private fun ArisCharacter(
     pulseScale: Float,
     isOnline: Boolean,
     notificationCount: Int,
+    cycle: Float,
     modifier: Modifier = Modifier,
 ) {
-    val pulse = pulseScale * (if (isListening) 1f + (amplitude / 32767f).coerceIn(0f, 1f) * 0.16f else 1f)
     val characterColor = when {
         !isOnline -> Color(0xFFFFB86B)
         isListening -> Color(0xFF00F0FF)
-        isVisionActive -> Color(0xFF00FF88)
+        isVisionActive -> Color(0xFF73F7C2)
         notificationCount > 0 -> Color(0xFFFF668E)
-        else -> Color(0xFF8A2BE2)
+        else -> Color(0xFF62DBF5)
     }
+    val audioEnergy = if (isListening) (amplitude / 32767f).coerceIn(0f, 1f) else 0f
 
     Box(
-        modifier = modifier.size(240.dp),
+        modifier = modifier,
         contentAlignment = Alignment.Center,
     ) {
         Canvas(Modifier.fillMaxSize()) {
-            val radius = size.minDimension * 0.32f
+            val radius = size.minDimension * 0.29f
+            val breathing = 1f + (pulseScale - 1f) * 1.5f + audioEnergy * 0.08f
             drawCircle(
-                color = characterColor.copy(alpha = 0.10f),
-                radius = radius * 1.65f * pulse,
+                brush = Brush.radialGradient(
+                    listOf(characterColor.copy(alpha = 0.18f), Color.Transparent),
+                    center,
+                    radius * 2.15f,
+                ),
+                radius = radius * 2.15f,
             )
             drawCircle(
-                color = characterColor.copy(alpha = 0.20f),
-                radius = radius * 1.3f * pulse,
+                color = characterColor.copy(alpha = 0.12f + audioEnergy * 0.14f),
+                radius = radius * 1.26f * breathing,
+            )
+
+            rotate(degrees = cycle * 360f, pivot = center) {
+                drawCircle(
+                    color = characterColor.copy(alpha = 0.34f),
+                    radius = radius * 1.52f,
+                    style = Stroke(width = 1.2.dp.toPx(), pathEffect = androidx.compose.ui.graphics.PathEffect.dashPathEffect(floatArrayOf(3.dp.toPx(), 8.dp.toPx()))),
+                )
+                drawArc(
+                    color = characterColor.copy(alpha = 0.85f),
+                    startAngle = -112f,
+                    sweepAngle = 72f,
+                    useCenter = false,
+                    topLeft = Offset(center.x - radius * 1.52f, center.y - radius * 1.52f),
+                    size = Size(radius * 3.04f, radius * 3.04f),
+                    style = Stroke(width = 2.dp.toPx(), cap = StrokeCap.Round),
+                )
+                drawArc(
+                    color = Color(0xFFB887FF).copy(alpha = 0.7f),
+                    startAngle = 62f,
+                    sweepAngle = 42f,
+                    useCenter = false,
+                    topLeft = Offset(center.x - radius * 1.38f, center.y - radius * 1.38f),
+                    size = Size(radius * 2.76f, radius * 2.76f),
+                    style = Stroke(width = 1.5.dp.toPx(), cap = StrokeCap.Round),
+                )
+                for (index in 0 until 8) {
+                    val angle = (cycle * 2f * PI + index * PI / 4f).toFloat()
+                    val orbitRadius = radius * 1.52f
+                    val dotCenter = Offset(
+                        center.x + cos(angle) * orbitRadius,
+                        center.y + sin(angle) * orbitRadius,
+                    )
+                    drawCircle(characterColor.copy(alpha = if (index % 2 == 0) 0.9f else 0.35f), if (index % 2 == 0) 2.7.dp.toPx() else 1.6.dp.toPx(), dotCenter)
+                }
+            }
+
+            drawCircle(
+                color = Color.White.copy(alpha = 0.08f),
+                radius = radius * 1.18f,
+                style = Stroke(width = 1.dp.toPx()),
+            )
+
+            val face = Path().apply {
+                moveTo(center.x, center.y - radius * 1.03f)
+                lineTo(center.x + radius * 0.72f, center.y - radius * 0.62f)
+                lineTo(center.x + radius * 0.61f, center.y + radius * 0.39f)
+                lineTo(center.x, center.y + radius * 0.96f)
+                lineTo(center.x - radius * 0.61f, center.y + radius * 0.39f)
+                lineTo(center.x - radius * 0.72f, center.y - radius * 0.62f)
+                close()
+            }
+            drawPath(face, characterColor.copy(alpha = 0.07f * breathing))
+            drawPath(face, characterColor.copy(alpha = 0.75f), style = Stroke(width = 2.2.dp.toPx()))
+
+            val innerMark = Path().apply {
+                moveTo(center.x - radius * 0.34f, center.y + radius * 0.48f)
+                lineTo(center.x, center.y - radius * 0.53f)
+                lineTo(center.x + radius * 0.34f, center.y + radius * 0.48f)
+            }
+            drawPath(
+                innerMark,
+                Color.White.copy(alpha = 0.5f),
+                style = Stroke(width = 1.2.dp.toPx(), cap = StrokeCap.Round, join = androidx.compose.ui.graphics.StrokeJoin.Round),
+            )
+
+            for (side in -1..1 step 2) {
+                val eye = Path().apply {
+                    moveTo(center.x + side * radius * 0.48f, center.y - radius * 0.05f)
+                    lineTo(center.x + side * radius * 0.13f, center.y + radius * 0.04f)
+                }
+                drawPath(eye, characterColor.copy(alpha = 0.95f), style = Stroke(width = 2.4.dp.toPx(), cap = StrokeCap.Round))
+                drawCircle(characterColor.copy(alpha = 0.95f), 2.dp.toPx(), Offset(center.x + side * radius * 0.13f, center.y + radius * 0.04f))
+            }
+
+            val waveform = Path()
+            val points = 33
+            for (index in 0 until points) {
+                val x = center.x - radius * 1.28f + (radius * 2.56f * index / (points - 1))
+                val envelope = (1f - kotlin.math.abs(index - (points - 1) / 2f) / ((points - 1) / 2f)).coerceAtLeast(0.12f)
+                val oscillation = sin(index * 1.67f + cycle * 2f * PI).toFloat()
+                val secondary = cos(index * 0.73f - cycle * 4f * PI).toFloat() * 0.28f
+                val height = (radius * 0.08f + radius * (0.13f + audioEnergy * 0.4f) * envelope * kotlin.math.abs(oscillation + secondary)).coerceAtMost(radius * 0.47f)
+                val y = center.y + if (index % 2 == 0) -height else height
+                if (index == 0) waveform.moveTo(x, y) else waveform.lineTo(x, y)
+            }
+            drawPath(waveform, characterColor.copy(alpha = 0.22f), style = Stroke(width = 7.dp.toPx(), cap = StrokeCap.Round, join = androidx.compose.ui.graphics.StrokeJoin.Round))
+            drawPath(waveform, Color(0xFFE4FFFF), style = Stroke(width = 1.7.dp.toPx(), cap = StrokeCap.Round, join = androidx.compose.ui.graphics.StrokeJoin.Round))
+
+            val scanY = center.y - radius + (cycle * radius * 2f)
+            drawLine(
+                characterColor.copy(alpha = 0.22f),
+                Offset(center.x - radius * 0.57f, scanY),
+                Offset(center.x + radius * 0.57f, scanY),
+                strokeWidth = 1.dp.toPx(),
             )
             drawCircle(
                 brush = Brush.radialGradient(
-                    colors = listOf(characterColor.copy(alpha = 0.95f), characterColor.copy(alpha = 0.3f), Color.Transparent),
+                    colors = listOf(characterColor.copy(alpha = 0.12f * breathing), Color.Transparent),
                     center = center,
-                    radius = radius * 1.2f * pulse,
+                    radius = radius * 0.9f,
                 ),
-                radius = radius * 1.2f * pulse,
+                radius = radius * 0.9f,
             )
             drawCircle(
-                color = Color.White.copy(alpha = 0.75f),
-                radius = radius * 0.23f,
-                center = Offset(center.x - radius * 0.27f, center.y - radius * 0.08f),
-            )
-            drawCircle(
-                color = Color.White.copy(alpha = 0.75f),
-                radius = radius * 0.23f,
-                center = Offset(center.x + radius * 0.27f, center.y - radius * 0.08f),
+                color = Color.White.copy(alpha = 0.8f),
+                radius = 2.dp.toPx(),
+                center = Offset(center.x, center.y - radius * 1.03f),
             )
         }
     }
