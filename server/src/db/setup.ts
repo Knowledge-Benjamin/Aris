@@ -78,6 +78,31 @@ async function setup() {
   `);
 
   await pool.query(`
+    CREATE TABLE IF NOT EXISTS aris_answer_memories (
+      id BIGSERIAL PRIMARY KEY,
+      user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      question_key TEXT NOT NULL,
+      question TEXT NOT NULL,
+      answer TEXT NOT NULL,
+      intent TEXT NOT NULL DEFAULT 'other',
+      categories JSONB NOT NULL DEFAULT '[]',
+      sources JSONB NOT NULL DEFAULT '[]',
+      embedding VECTOR(768) NOT NULL,
+      captured_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+      updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+      UNIQUE (user_id, question_key)
+    );
+  `);
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS aris_answer_memories_embedding_idx
+    ON aris_answer_memories USING hnsw (embedding vector_cosine_ops);
+  `);
+  await pool.query(`
+    CREATE INDEX IF NOT EXISTS aris_answer_memories_user_captured_idx
+    ON aris_answer_memories (user_id, captured_at DESC);
+  `);
+
+  await pool.query(`
     CREATE TABLE IF NOT EXISTS media_library (
       id SERIAL PRIMARY KEY,
       user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,

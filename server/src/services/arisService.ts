@@ -1,6 +1,5 @@
-import { podcastMediaStore } from "../db/podcastMediaStore";
 import { audioContextStore } from "../db/audioContextStore";
-import { MemoryStore, UserProfileEntry } from "../db/memoryStore";
+import { MemoryStore, ReusableAnswerMemory, UserProfileEntry } from "../db/memoryStore";
 import { ContextStore } from "../db/contextStore";
 import { getDatabasePool } from "../db/db";
 import { GoogleAccountStore } from "../db/googleAccountStore";
@@ -56,6 +55,7 @@ interface ToolChainResult {
   reply: string;
   memoryEntries: string[];
   pendingAction?: ToolInvocation;
+  answerMemoryReused?: boolean;
   mediaAttachments?: Array<{
     mimeType: string;
     base64?: string;
@@ -87,6 +87,8 @@ interface RequestRoutingDecision {
   intent: RequestRouteIntent;
   categories: string[];
   reusePriorAnswer: boolean;
+  reuseAnswerId?: number;
+  forceRefresh: boolean;
 }
 
 interface ArisResponse {
@@ -102,6 +104,10 @@ interface ArisResponse {
     driveUrl?: string;
     downloadUrl?: string;
   }>;
+}
+
+function normalizeMemoryQuestion(question: string): string {
+  return question.toLowerCase().replace(/\s+/g, " ").replace(/[?!.]+$/g, "").trim();
 }
 
 export class ArisService {
@@ -126,6 +132,7 @@ export class ArisService {
         audioContentLength: data.audioBase64.length,
       });
     }
+
     return data?.summary ?? data?.text ?? JSON.stringify(data).slice(0, 4000);
   }
 
@@ -322,6 +329,8 @@ export class ArisService {
     conversationHistory: string[],
     userId: number | undefined,
     sessionId: string,
+    memories: string[],
+    reusableAnswers: ReusableAnswerMemory[],
   ): Promise<RequestRoutingDecision> {
     const allowedCategories = [
       "briefing", "calendar", "gmail", "contact", "whatsapp", "traffic",
@@ -345,12 +354,22 @@ export class ArisService {
       `Choose zero or more categories from: ${allowedCategories.join(", ")}.`,
       "Use time/location/weather/traffic native capabilities for local or device-context questions; do not route them to web search.",
       "Choose search only when the user explicitly asks for web research or the answer genuinely needs current public web information. Do not choose search merely because no other category matches.",
-      "Set reusePriorAnswer=true only when a previous Aris response in this same conversation already fully answers the current request and the answer is not time-sensitive or otherwise requires fresh data. Otherwise false.",
+      "Memory-first policy: use the supplied timestamped answer memories and relevant facts before planning tools. Reuse a matching answer for stable facts by default. Do not make a tool call just because a request is worded differently.",
+      "Force a fresh tool call when the user requests a refresh/update/check-again/latest/current answer, says the facts have changed or are stale, explicitly requests web research, or the subject is inherently volatile (time, location, weather, traffic, inbox/messages, calendar, or live news).",
+      "Set reusePriorAnswer=true only when a supplied answer memory or prior Aris reply fully answers this request and a fresh lookup is not required. If using a supplied memory, return its exact reuseAnswerId. Set forceRefresh=true for an explicit refresh or known changed/stale information.",
       `Web search enabled: ${searchToolEnabled}. If disabled, do not select the search category.`,
       `Recent conversation:\n${history.join("\n") || "(none)"}`,
       `Recent tool observations:\n${JSON.stringify(observations) || "[]"}`,
+      `Timestamped answer memories:\n${JSON.stringify(reusableAnswers.map((answer) => ({
+        id: answer.id,
+        question: answer.question,
+        answer: answer.answer.slice(0, 1800),
+        intent: answer.intent,
+        recordedAt: answer.recordedAt,
+        similarity: answer.similarity,
+      })))}\nRelevant semantic facts:\n${JSON.stringify(memories.map((memory) => memory.slice(0, 800)))}`,
       `Latest user request:\n${message}`,
-      'Return only JSON: {"intent":"other","categories":[],"reusePriorAnswer":false}.',
+      'Return only JSON: {"intent":"other","categories":[],"reusePriorAnswer":false,"reuseAnswerId":null,"forceRefresh":false}.',
     ].join("\n\n");
 
     try {
@@ -359,6 +378,8 @@ export class ArisService {
         intent?: unknown;
         categories?: unknown;
         reusePriorAnswer?: unknown;
+        reuseAnswerId?: unknown;
+        forceRefresh?: unknown;
       } | undefined;
       const validIntents: RequestRouteIntent[] = [
         "current_time", "current_date", "current_location", "weather", "traffic",
@@ -396,12 +417,19 @@ export class ArisService {
         if (intentCategory && (intentCategory !== "search" || searchToolEnabled)) {
           categories.push(intentCategory);
         }
-        const reusePriorAnswer = parsed.reusePriorAnswer === true;
-        info(`[arisService] routed intent=${intent} categories=${Array.from(new Set(categories)).join(",") || "none"} reusePriorAnswer=${reusePriorAnswer}`);
+        const forceRefresh = parsed.forceRefresh === true || this.isExplicitRefreshRequest(message);
+        const reuseAnswerId = Number.isInteger(parsed.reuseAnswerId)
+          && reusableAnswers.some((answer) => answer.id === parsed.reuseAnswerId)
+          ? Number(parsed.reuseAnswerId)
+          : undefined;
+        const reusePriorAnswer = parsed.reusePriorAnswer === true && !forceRefresh;
+        info(`[arisService] routed intent=${intent} categories=${Array.from(new Set(categories)).join(",") || "none"} reusePriorAnswer=${reusePriorAnswer} forceRefresh=${forceRefresh}`);
         return {
           intent,
           categories: Array.from(new Set(categories)),
           reusePriorAnswer,
+          reuseAnswerId,
+          forceRefresh,
         };
       }
       error("[arisService] request router returned an invalid classification; using conservative local routing");
@@ -423,7 +451,30 @@ export class ArisService {
                     : categories.includes("media_library") ? "media_library"
                       : categories.includes("search") ? "web_research"
                       : "other";
-    return { intent, categories, reusePriorAnswer: false };
+    const forceRefresh = this.isExplicitRefreshRequest(message);
+    const topAnswer = reusableAnswers[0];
+    const normalizedQuestion = normalizeMemoryQuestion(message);
+    const normalizedCachedQuestion = topAnswer ? normalizeMemoryQuestion(topAnswer.question) : "";
+    const isVolatileIntent = [
+      "current_time", "current_date", "current_location", "weather", "traffic",
+      "news", "calendar", "gmail", "whatsapp", "web_research",
+    ].includes(intent);
+    const exactReusableAnswer = topAnswer
+      && normalizedQuestion === normalizedCachedQuestion
+      && !isVolatileIntent
+      && !forceRefresh
+      && !this.isExplicitWebResearchRequest(message);
+    return {
+      intent,
+      categories,
+      reusePriorAnswer: Boolean(exactReusableAnswer),
+      reuseAnswerId: exactReusableAnswer ? topAnswer.id : undefined,
+      forceRefresh,
+    };
+  }
+
+  private isExplicitRefreshRequest(message: string): boolean {
+    return /\b(?:refresh|update(?:\s+(?:your|the|my)\s+memory)?|recheck|check again|verify again|look up again|search (?:the )?web again|latest|newest|current(?:ly)?|right now|today|this week|stale|outdated|out of date|no longer accurate|no longer|has changed|have changed|changed since|different now|still accurate|still correct|what changed|as of today)\b/i.test(message);
   }
 
   private getLastAssistantReply(conversationHistory: string[]): string | undefined {
@@ -759,6 +810,7 @@ export class ArisService {
 
   async handleChat(input: ChatInput, onProgress?: (msg: string) => void): Promise<ArisResponse> {
     const sessionId = input.sessionId || "default";
+    const requestStartedAt = Date.now();
     await this.contextStore.warmCache(this.getContextKey(input.userId, sessionId));
     const storedAttachment = input.mediaData
       ? await this.storeChatAttachment(input.userId, sessionId, input.message, input.mediaData)
@@ -784,12 +836,6 @@ export class ArisService {
       );
     }
 
-    const saveUserMessagePromise = this.memoryStore.saveConversationMessage({
-      userId: input.userId,
-      sessionId,
-      role: "user",
-      content: this.formatMessageWithAttachment(input.message, storedAttachment),
-    });
     if (input.userId && input.message.trim().length >= 40) {
       void this.extractAndStoreEvidence(
         input.userId,
@@ -827,29 +873,57 @@ export class ArisService {
     });
 
     const [userProfile, conversationHistory] = await Promise.all([userProfilePromise, conversationHistoryPromise]);
+    await this.memoryStore.saveConversationMessage({
+      userId: input.userId,
+      sessionId,
+      role: "user",
+      content: this.formatMessageWithAttachment(input.message, storedAttachment),
+    });
     const effectiveMessage = input.message.trim();
     const messageWithAttachment = this.formatMessageWithAttachment(effectiveMessage, storedAttachment);
     const messageWithReplyContext = [
       messageWithAttachment,
       input.replyContext?.trim() ? `Message being replied to:\n${input.replyContext.trim()}` : "",
     ].filter(Boolean).join("\n\n");
+    const requestMemoryQuery = [
+      effectiveMessage,
+      input.replyContext?.trim() ? `Replied-to context: ${input.replyContext.trim()}` : "",
+    ].filter(Boolean).join("\n");
+    let memoryContext: string[] = [];
+    let reusableAnswers: ReusableAnswerMemory[] = [];
+    let requestEmbedding: number[] | undefined;
+    if (!isShortConversational) {
+      try {
+        const requestMemory = await this.memoryStore.getRequestMemory(
+          input.userId,
+          sessionId,
+          requestMemoryQuery,
+          12,
+          5,
+        );
+        memoryContext = requestMemory.memories;
+        reusableAnswers = requestMemory.answers;
+        requestEmbedding = requestMemory.queryEmbedding;
+      } catch (memoryError) {
+        error("[arisService] request memory retrieval failed; routing without cached memory", memoryError);
+      }
+    }
     const requestRoute = isShortConversational
-      ? { intent: "other", categories: [], reusePriorAnswer: false } satisfies RequestRoutingDecision
+      ? { intent: "other", categories: [], reusePriorAnswer: false, forceRefresh: false } satisfies RequestRoutingDecision
       : await this.classifyRequestRoute(
         messageWithReplyContext,
         conversationHistory,
         input.userId,
         sessionId,
+        memoryContext,
+        reusableAnswers,
       );
     
-    // Similarly, don't fetch heavy semantic memories for basic greetings
-    let memoryContext: string[] = [];
     const recentGmailMessages = requestRoute.categories.includes("gmail") || requestRoute.categories.includes("briefing")
       ? this.getRecentGmailMessages(input.userId, sessionId)
       : [];
     if (!isShortConversational) {
       try {
-        memoryContext = await this.memoryStore.getRelevantMemories(input.userId, sessionId, effectiveMessage, 12);
         if (requestRoute.categories.includes("search")) {
           memoryContext = [
             ...memoryContext,
@@ -866,7 +940,7 @@ export class ArisService {
         }
         info(`[arisService] grounding loaded profile=${userProfile.length} conversation=${conversationHistory.length} memories=${memoryContext.length} recentToolObservations=${this.getRecentToolObservations(input.userId, sessionId).length} recentGmail=${recentGmailMessages.length}`);
       } catch (err) {
-        console.error("[arisService] Failed to load relevant memories:", err);
+        error("[arisService] Failed to load supplementary memory context:", err);
       }
     }
 
@@ -876,8 +950,8 @@ export class ArisService {
     }
       
     // Catch initial save errors so they don't block the chain
-    Promise.all([saveUserMessagePromise, ...profileSavePromises, ...directMemorySavePromises]).catch(err => {
-      console.error("[arisService] Background save failed for user message:", err);
+    void Promise.all([...profileSavePromises, ...directMemorySavePromises]).catch(err => {
+      error("[arisService] Background save failed for profile/direct memories:", err);
     });
 
     let coachPersona = "encouraging";
@@ -905,6 +979,7 @@ export class ArisService {
       memoryContext,
       conversationHistory,
       requestRoute,
+      reusableAnswers,
       sessionId,
       searchToolEnabled,
       coachPersona,
@@ -947,10 +1022,35 @@ export class ArisService {
       ? [this.storeMemoryEntries(input.userId, sessionId, memoryEntries)]
       : [];
 
-    // Fire-and-forget saving to the database to prevent database timeouts 
-    // from crashing the chat response stream
-    Promise.all([saveArisReplyPromise, ...memoryStorePromises]).catch(err => {
-      console.error("[arisService] Background save failed for chat reply/memories:", err);
+    const durableWrites: Promise<unknown>[] = [saveArisReplyPromise, ...memoryStorePromises];
+    if (
+      input.userId
+      && !isShortConversational
+      && toolChainResult.status === "finished"
+      && !toolChainResult.answerMemoryReused
+      && arisReply.trim().length >= 40
+      && requestEmbedding?.length
+    ) {
+      const recentSources = this.getRecentToolObservations(input.userId, sessionId)
+        .slice(-8)
+        .filter((observation) => Date.parse(observation.recordedAt) >= requestStartedAt)
+        .map((observation) => ({
+          tool: observation.tool,
+          recordedAt: observation.recordedAt,
+          summary: observation.summary.slice(0, 1200),
+        }));
+      durableWrites.push(this.memoryStore.storeReusableAnswer({
+        userId: input.userId,
+        question: requestMemoryQuery,
+        answer: arisReply,
+        intent: requestRoute.intent,
+        categories: requestRoute.categories,
+        sources: recentSources,
+        embedding: requestEmbedding,
+      }));
+    }
+    await Promise.all(durableWrites).catch((err) => {
+      error("[arisService] Failed to persist response conversation/memory", err);
     });
 
     return {
@@ -2092,7 +2192,7 @@ export class ArisService {
           data: {
             summary: analysis || `Retrieved ${record.fileName} from your Aris Media Library.`,
             analysis,
-            mediaLibraryAttachment: attachment,
+            ...(payload?.analyze === true ? {} : { mediaLibraryAttachment: attachment }),
           },
         };
       }
@@ -2266,31 +2366,38 @@ export class ArisService {
           if (!account) return { success: false, tool: toolName, error: "Connect your Google account to store podcasts in Google Drive." };
           const candidates = await this.newsService.getBestPodcastCandidates(4);
           const stored = await Promise.all(candidates.map(async (candidate) => {
-            const cached = await podcastMediaStore.findByEpisodeUrl(candidate.episodeUrl);
+            const cached = await this.mediaLibraryService.findBySourceReference(userId, "podcast_episode", candidate.episodeUrl);
+            if (cached) {
+              info(`[arisService] Reusing podcast media library item id=${cached.id} episode=${candidate.episodeUrl}`);
+              return {
+                ...candidate,
+                mimeType: cached.mimeType,
+                storageUri: `drive:${cached.driveFileId}`,
+                analysis: cached.summary,
+                mediaLibraryId: cached.id,
+                analysisWarning: "",
+              };
+            }
             const episode = await this.newsService.downloadPodcastCandidate(candidate);
-            let analysis = cached?.analysis || "";
+            let analysis = "";
             let analysisWarning = "";
-            if (analysis) {
-              info(`[arisService] Reusing cached podcast analysis show=${episode.feedName} episode=${episode.episodeUrl}`);
-            } else {
-              try {
-                const analysisResponse = await this.gemmaService.requestArisAdvice(
-                  [
-                    "Listen to this podcast audio and transcribe its important content for Aris.",
-                    "Identify the main stories, people, places, dates, claims, and useful follow-up facts.",
-                    "Return only a concise factual spoken-style summary. Do not mention tools, transcription APIs, or these instructions.",
-                    `Podcast show: ${episode.feedName}`,
-                    `Episode title: ${episode.title}`,
-                    `Published: ${episode.publishedAt}`,
-                  ].join("\n"),
-                  [{ inlineData: { mimeType: episode.mimeType.split(";")[0], data: episode.audio.toString("base64") } }]
-                );
-                analysis = analysisResponse.reply.trim();
-                info(`[arisService] Gemma batch podcast analysis completed show=${episode.feedName} audioBytes=${episode.audio.length} contextChars=${analysis.length}`);
-              } catch (analysisError: any) {
-                analysisWarning = analysisError?.message || "Gemma podcast analysis failed.";
-                error(`[arisService] Gemma batch podcast analysis failed show=${episode.feedName}; delivery will continue: ${analysisWarning}`);
-              }
+            try {
+              const analysisResponse = await this.gemmaService.requestArisAdvice(
+                [
+                  "Listen to this podcast audio and transcribe its important content for Aris.",
+                  "Identify the main stories, people, places, dates, claims, and useful follow-up facts.",
+                  "Return only a concise factual spoken-style summary. Do not mention tools, transcription APIs, or these instructions.",
+                  `Podcast show: ${episode.feedName}`,
+                  `Episode title: ${episode.title}`,
+                  `Published: ${episode.publishedAt}`,
+                ].join("\n"),
+                [{ inlineData: { mimeType: episode.mimeType.split(";")[0], data: episode.audio.toString("base64") } }]
+              );
+              analysis = analysisResponse.reply.trim();
+              info(`[arisService] Gemma batch podcast analysis completed show=${episode.feedName} audioBytes=${episode.audio.length} contextChars=${analysis.length}`);
+            } catch (analysisError: any) {
+              analysisWarning = analysisError?.message || "Gemma podcast analysis failed.";
+              error(`[arisService] Gemma batch podcast analysis failed show=${episode.feedName}; delivery will continue: ${analysisWarning}`);
             }
 
             const mimeType = episode.mimeType.split(";")[0].toLowerCase();
@@ -2322,14 +2429,35 @@ export class ArisService {
               mimeType,
               storageUri: `drive:${media.driveFileId}`,
               analysis,
+              mediaLibraryId: media.id,
             };
-            await podcastMediaStore.upsert(record);
             return { ...record, analysisWarning };
           }));
           await this.memoryStore.storeMemoryEntry(userId, sessionId, `Podcast catalog delivered on ${new Date().toISOString()}: ${stored.map((episode) => `${episode.feedName} - ${episode.title}: ${episode.analysis || "Analysis unavailable"}`).join(" | ")}. Ask the user which podcasts they enjoyed to build a custom list.`).catch((memoryError) => error("[arisService] Podcast catalog memory failed", memoryError));
-          return { success: true, tool: toolName, data: { episodes: stored, summary: `Prepared ${stored.length} podcast episodes and indexed them privately in your Aris Media Library. NPR is included.`, askPreference: "After delivery, ask the user which podcasts they enjoyed so Aris can build a custom list." } };
+          return { success: true, tool: toolName, data: { episodes: stored, summary: `Prepared ${stored.length} podcast episodes; reusing previously archived episodes from your Aris Media Library when available. NPR is included.`, askPreference: "After delivery, ask the user which podcasts they enjoyed so Aris can build a custom list." } };
         }
-        const episode = await this.newsService.downloadLatestPodcast(invocation.payload?.feedUrl);
+        if (!userId) throw new Error("Sign in before storing podcasts in your Aris Media Library.");
+        const candidate = await this.newsService.getLatestPodcastCandidate(invocation.payload?.feedUrl);
+        const cached = await this.mediaLibraryService.findBySourceReference(userId, "podcast_episode", candidate.episodeUrl);
+        if (cached) {
+          info(`[arisService] Reusing podcast media library item id=${cached.id} episode=${candidate.episodeUrl}`);
+          return {
+            success: true,
+            tool: toolName,
+            data: {
+              title: candidate.title,
+              feedUrl: candidate.feedUrl,
+              episodeUrl: candidate.episodeUrl,
+              publishedAt: candidate.publishedAt,
+              transcript: cached.summary,
+              storageUri: `drive:${cached.driveFileId}`,
+              mediaLibraryAttachment: this.toMediaLibraryAttachment(cached),
+              contextSource: "media_library_cache",
+              delivery: "Use app_send_message for a text summary or google_gmail_send for an email summary. Use the existing approval flow for delivery.",
+            },
+          };
+        }
+        const episode = await this.newsService.downloadPodcastCandidate(candidate);
         const safeTitle = episode.title.replace(/[^a-zA-Z0-9._-]+/g, "-").slice(0, 80) || "news-podcast";
         let transcript = "";
         let analysisWarning: string | undefined;
@@ -2352,7 +2480,6 @@ export class ArisService {
           error(`[arisService] Gemma podcast analysis failed; delivery will continue: ${analysisWarning}`);
         }
 
-        if (!userId) throw new Error("Sign in before storing podcasts in your Aris Media Library.");
         const mimeType = episode.mimeType.split(";")[0].toLowerCase();
         const extension = mimeType === "audio/ogg" || mimeType.includes("opus")
           ? "ogg"
@@ -3034,6 +3161,9 @@ export class ArisService {
             if (!selfJid) {
               return { success: false, tool: toolName, error: "Connect your WhatsApp self-chat before sending a voice note." };
             }
+            if (!userId) {
+              return { success: false, tool: toolName, error: "Sign in before saving generated audio to your Aris Media Library." };
+            }
             const { whatsappOutboxStore } = await import("../db/whatsappOutboxStore");
             const referenceCreatedAt = matchingAudio.createdAt?.getTime() ?? 0;
             const reusableAudio = existingAudio
@@ -3093,12 +3223,22 @@ export class ArisService {
           const subject = String(invocation.payload.subject || "Audio from Aris").trim();
           const body = String(invocation.payload.body || "Audio generated by Aris.").trim();
           const filename = String(invocation.payload.filename || "aris-audio.mp3").replace(/[^a-zA-Z0-9._-]/g, "_");
+          const mimeType = voice.mimeType.split(";")[0].toLowerCase();
+          await this.archiveGeneratedMedia(
+            userId,
+            sessionId,
+            filename,
+            mimeType,
+            Buffer.from(voice.audioBase64, "base64"),
+            "aris_generated_audio",
+            text,
+          );
           const sent = await this.googleService.sendEmail(
             account,
             to,
             subject,
             body,
-            { filename, mimeType: voice.mimeType, contentBase64: voice.audioBase64 },
+            { filename, mimeType, contentBase64: voice.audioBase64 },
             persistTokens
           );
           return { success: true, tool: toolName, data: { summary: `Audio emailed to ${to}.`, messageId: sent.id } };
@@ -3113,19 +3253,21 @@ export class ArisService {
         const queuedIds: number[] = [];
         for (let index = 0; index < speechChunks.length; index += 1) {
           const voice = await this.voiceService.synthesizeSpeech(speechChunks[index], encoding);
-          const driveFile = await this.googleService.uploadDriveFile(
-            account,
-            `aris-audio-${Date.now()}-${index + 1}.ogg`,
-            voice.mimeType,
+          const mimeType = voice.mimeType.split(";")[0].toLowerCase();
+          const media = await this.archiveGeneratedMedia(
+            userId,
+            sessionId,
+            `aris-audio-${Date.now()}-${index + 1}${this.getExtensionForMimeType(mimeType)}`,
+            mimeType,
             Buffer.from(voice.audioBase64, "base64"),
-            persistTokens
+            stableAudioType || "aris_generated_audio",
+            speechChunks[index],
           );
-          if (!driveFile.id) throw new Error("Google Drive did not return an audio file ID.");
-          const storageUri = `drive:${driveFile.id}`;
+          const storageUri = `drive:${media.driveFileId}`;
           await audioContextStore.upsert({
             userId,
             storageUri,
-            mimeType: voice.mimeType,
+            mimeType,
             sourceType: stableAudioType || "aris_generated_audio",
             sourceText: speechChunks[index],
             chunkIndex: index + 1,
@@ -3137,7 +3279,7 @@ export class ArisService {
             "audio",
             undefined,
             storageUri,
-            voice.mimeType,
+            mimeType,
             userId,
             replyToWhatsappMessage
           );
@@ -4451,6 +4593,7 @@ export class ArisService {
     memories: string[],
     conversationHistory: string[],
     requestRoute: RequestRoutingDecision,
+    reusableAnswers: ReusableAnswerMemory[],
     sessionId: string,
     includeSearch: boolean,
     coachPersona: string,
@@ -4483,13 +4626,27 @@ export class ArisService {
     const requiresFreshData = [
       "current_time", "current_date", "current_location", "weather", "traffic",
       "news", "calendar", "gmail", "whatsapp",
-    ].includes(requestRoute.intent);
+    ].includes(requestRoute.intent)
+      || requestRoute.intent === "web_research"
+      || this.isExplicitWebResearchRequest(userMessage);
     if (
       !approvedAction
       && requestRoute.reusePriorAnswer
       && !requiresFreshData
-      && !this.isExplicitWebResearchRequest(userMessage)
+      && !requestRoute.forceRefresh
     ) {
+      const cachedAnswer = reusableAnswers.find((answer) => answer.id === requestRoute.reuseAnswerId)
+        || reusableAnswers[0];
+      if (cachedAnswer) {
+        const capturedAt = new Date(cachedAnswer.recordedAt).toLocaleString();
+        info(`[arisService] reusing persisted answer id=${cachedAnswer.id} similarity=${cachedAnswer.similarity.toFixed(3)} capturedAt=${cachedAnswer.recordedAt}`);
+        return {
+          status: "finished",
+          reply: `Previously answered on ${capturedAt}:\n\n${cachedAnswer.answer}`,
+          memoryEntries: [],
+          answerMemoryReused: true,
+        };
+      }
       const previousReply = this.getLastAssistantReply(conversationHistory);
       if (previousReply) {
         info("[arisService] reusing prior assistant answer for a semantically matching, non-current request");
@@ -4497,6 +4654,7 @@ export class ArisService {
           status: "finished",
           reply: previousReply,
           memoryEntries: [],
+          answerMemoryReused: true,
         };
       }
     }
@@ -4619,7 +4777,20 @@ export class ArisService {
       ].join('\n');
       prompt = `${skillContext}\n\nWorkflow plan:\n${executionPlan.map((step) => `- ${step}`).join("\n")}\n\n${prompt}`;
     } else {
-      prompt = this.buildToolChainPrompt(userMessage, userProfile, memories, conversationHistory, activeCategories, locationContext, coachPersona, goalState, activeGoals, pendingTasks);
+      prompt = this.buildToolChainPrompt(
+        userMessage,
+        userProfile,
+        memories,
+        conversationHistory,
+        activeCategories,
+        locationContext,
+        coachPersona,
+        goalState,
+        activeGoals,
+        pendingTasks,
+        reusableAnswers,
+        requestRoute.forceRefresh,
+      );
       prompt = `${skillContext}\n\nWorkflow plan:\n${executionPlan.map((step) => `- ${step}`).join("\n")}\n\n${this.buildFollowUpContext(userId, sessionId)}\n\n${prompt}`;
       if (mediaData) {
         prompt = `${mediaContext}\n\n${prompt}`;
@@ -5339,7 +5510,20 @@ export class ArisService {
     ].join("\n");
   }
 
-  private buildToolChainPrompt(userMessage: string, userProfile: UserProfileEntry[], memories: string[], conversationHistory: string[], activeCategories: Set<string>, locationContext: string, coachPersona: string, goalState: any, activeGoals: any[], pendingTasks: any[]) {
+  private buildToolChainPrompt(
+    userMessage: string,
+    userProfile: UserProfileEntry[],
+    memories: string[],
+    conversationHistory: string[],
+    activeCategories: Set<string>,
+    locationContext: string,
+    coachPersona: string,
+    goalState: any,
+    activeGoals: any[],
+    pendingTasks: any[],
+    reusableAnswers: ReusableAnswerMemory[],
+    forceRefresh: boolean,
+  ) {
     const profileLines = userProfile.length
       ? ["User profile:", ...userProfile.map((item) => `- ${item.profileKey}: ${item.profileValue}`), ""]
       : [];
@@ -5633,7 +5817,8 @@ export class ArisService {
       `Do not include markdown, code fences, or any extra text outside the expected formats.`,
       `Use the user's conversation history and memories to resolve pronouns and implicit requests.`,
       `Interpret the latest user message on its own first. Do not rewrite a standalone request using an unrelated prior tool result; only carry forward context when the conversation clearly makes the request a follow-up.`,
-      `Before calling a tool, compare the request with recent user/Aris turns. If a previous Aris answer already fully answers the same non-current question, reuse that answer instead of repeating the lookup. Always refresh inherently dynamic data such as current time, location, weather, traffic, inbox, calendar, or live news when the user asks for its current state.`,
+      `MEMORY-FIRST: Before any tool call, compare the request against timestamped answer memories and relevant facts. For a semantically matching stable question, answer from the latest supporting memory by default, regardless of wording; do not repeat a successful lookup. Cite its recorded date when useful and do not present old research as a live check.`,
+      `Refresh only when the user explicitly requests an update/recheck, says the information changed/is stale, explicitly requests web research, or asks for inherently dynamic state such as current time, location, weather, traffic, inbox, calendar, messages, or live news.`,
       `Resolve minor spelling, spacing, transliteration, and punctuation differences against remembered names, contact names, subjects, event titles, and tool results. Prefer the closest unambiguous match; ask a clarification only when two or more matches are genuinely plausible.`,
       `When a follow-up omits its subject, carry forward the most recent relevant entity and tool result. Do not reset context merely because the latest message is short.`,
       ...toolInstructions,
@@ -5650,6 +5835,12 @@ export class ArisService {
       ...profileLines,
       "Relevant memories:",
       ...memories.map((item, index) => `${index + 1}. ${item}`),
+      "",
+      "Timestamped prior answers (reuse only if they answer the same stable question and no refresh is required):",
+      ...reusableAnswers.map((answer) =>
+        `- id=${answer.id} recordedAt=${answer.recordedAt} similarity=${answer.similarity.toFixed(3)} question=${answer.question}\n  answer=${answer.answer.slice(0, 3000)}`
+      ),
+      ...(forceRefresh ? ["FRESHNESS OVERRIDE: This request explicitly requires refreshed information. Do not answer from older answer memories; use the most relevant fresh tool capability, or clearly state if the system cannot refresh this information."] : []),
       "",
       `User: ${userMessage}`,
       "Aris:"

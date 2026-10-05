@@ -15,6 +15,17 @@ export interface SemanticMemoryResult {
   similarity?: number;
 }
 
+export interface ReusableAnswerMemory {
+  id: number;
+  question: string;
+  answer: string;
+  intent: string;
+  categories: string[];
+  recordedAt: string;
+  similarity: number;
+  sources: Array<{ tool: string; recordedAt: string; summary: string }>;
+}
+
 export interface UserProfileEntry {
   profileKey: string;
   profileValue: string;
@@ -23,6 +34,7 @@ export interface UserProfileEntry {
 export class MemoryStore {
   private embeddingClient = new EmbeddingClient();
   private readonly minimumMemorySimilarity = 0.55;
+  private readonly minimumAnswerSimilarity = 0.72;
 
   constructor(private pool: Pool) {}
 
@@ -60,9 +72,13 @@ export class MemoryStore {
     userId: number | undefined,
     sessionId: string | undefined,
     queryText: string,
-    limit: number
+    limit: number,
+    suppliedEmbedding?: number[],
   ): Promise<SemanticMemoryResult[]> {
-    const [queryEmbedding] = await this.embeddingClient.embedTexts([queryText]);
+    const queryEmbedding = suppliedEmbedding || (await this.embeddingClient.embedTexts([queryText]))[0];
+    if (!queryEmbedding?.length) {
+      throw new Error("The embedding service returned no vector for semantic memory retrieval.");
+    }
     const vectorLiteral = `[${queryEmbedding.join(",")}]`;
 
     if (userId) {
@@ -100,6 +116,120 @@ export class MemoryStore {
     }
 
     throw new Error("Semantic search requires userId or sessionId.");
+  }
+
+  async getReusableAnswers(
+    userId: number | undefined,
+    queryText: string,
+    limit = 5,
+    suppliedEmbedding?: number[],
+  ): Promise<ReusableAnswerMemory[]> {
+    if (!userId || !queryText.trim()) return [];
+    const queryEmbedding = suppliedEmbedding || (await this.embeddingClient.embedTexts([queryText]))[0];
+    if (!queryEmbedding?.length) {
+      throw new Error("The embedding service returned no vector for reusable-answer retrieval.");
+    }
+    const vectorLiteral = `[${queryEmbedding.join(",")}]`;
+    const result = await this.pool.query(
+      `SELECT id, question, answer, intent, categories, sources, captured_at,
+         1 - (embedding <=> $2::vector) AS similarity
+       FROM aris_answer_memories
+       WHERE user_id = $1 AND embedding IS NOT NULL
+       ORDER BY embedding <=> $2::vector
+       LIMIT $3`,
+      [userId, vectorLiteral, Math.max(1, Math.min(limit, 10))]
+    );
+    return result.rows
+      .map((row): ReusableAnswerMemory => ({
+        id: Number(row.id),
+        question: row.question,
+        answer: row.answer,
+        intent: row.intent,
+        categories: Array.isArray(row.categories) ? row.categories : [],
+        recordedAt: new Date(row.captured_at).toISOString(),
+        similarity: Number(row.similarity),
+        sources: Array.isArray(row.sources) ? row.sources : [],
+      }))
+      .filter((answer) => answer.similarity >= this.minimumAnswerSimilarity);
+  }
+
+  async getRequestMemory(
+    userId: number | undefined,
+    sessionId: string | undefined,
+    queryText: string,
+    memoryLimit = 12,
+    answerLimit = 5,
+  ): Promise<{ memories: string[]; answers: ReusableAnswerMemory[]; queryEmbedding: number[] }> {
+    const [queryEmbedding] = await this.embeddingClient.embedTexts([queryText]);
+    if (!queryEmbedding?.length) {
+      throw new Error("The embedding service returned no vector for request memory retrieval.");
+    }
+    const [memoryResult, answerResult] = await Promise.allSettled([
+      this.getSemanticMemories(userId, sessionId, queryText, memoryLimit, queryEmbedding),
+      this.getReusableAnswers(userId, queryText, answerLimit, queryEmbedding),
+    ]);
+    if (memoryResult.status === "rejected") {
+      console.warn("[MemoryStore] semantic fact retrieval failed", memoryResult.reason);
+    }
+    if (answerResult.status === "rejected") {
+      console.warn("[MemoryStore] reusable answer retrieval failed; run npm run db:setup if the answer-memory table is missing", answerResult.reason);
+    }
+    const memoryResults = memoryResult.status === "fulfilled" ? memoryResult.value : [];
+    const answers = answerResult.status === "fulfilled" ? answerResult.value : [];
+    return {
+      memories: memoryResults
+        .filter((row) => (row.similarity ?? 0) >= this.minimumMemorySimilarity)
+        .map((row) => row.content),
+      answers,
+      queryEmbedding,
+    };
+  }
+
+  async storeReusableAnswer(input: {
+    userId: number;
+    question: string;
+    answer: string;
+    intent: string;
+    categories: string[];
+    sources: Array<{ tool: string; recordedAt: string; summary: string }>;
+    embedding?: number[];
+  }): Promise<void> {
+    const question = input.question.trim();
+    const answer = input.answer.trim();
+    if (!question || !answer) return;
+
+    const boundedQuestion = question.slice(0, 2000);
+    const embedding = input.embedding && question.length <= 2000
+      ? input.embedding
+      : (await this.embeddingClient.embedTexts([boundedQuestion]))[0];
+    if (!embedding?.length) {
+      throw new Error("The embedding service returned no vector for the reusable answer.");
+    }
+    const questionKey = boundedQuestion.toLowerCase().replace(/\s+/g, " ").replace(/[?!.]+$/g, "").trim();
+    await this.pool.query(
+      `INSERT INTO aris_answer_memories
+       (user_id, question_key, question, answer, intent, categories, sources, embedding, captured_at, updated_at)
+       VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7::jsonb, $8::vector, NOW(), NOW())
+       ON CONFLICT (user_id, question_key) DO UPDATE SET
+         question = EXCLUDED.question,
+         answer = EXCLUDED.answer,
+         intent = EXCLUDED.intent,
+         categories = EXCLUDED.categories,
+         sources = EXCLUDED.sources,
+         embedding = EXCLUDED.embedding,
+         captured_at = NOW(),
+         updated_at = NOW()`,
+      [
+        input.userId,
+        questionKey,
+        boundedQuestion,
+        answer.slice(0, 24000),
+        input.intent,
+        JSON.stringify(input.categories),
+        JSON.stringify(input.sources),
+        `[${embedding.join(",")}]`,
+      ]
+    );
   }
 
   async getUserProfile(userId: number): Promise<UserProfileEntry[]> {

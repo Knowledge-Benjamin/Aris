@@ -769,7 +769,8 @@ class ChatViewModel(private val appContext: Context) : ViewModel() {
             is MediaAttachment.Document -> attachment.mimeType
         }
         val bytes = Base64.decode(base64, Base64.DEFAULT)
-        File(appContext.filesDir, fileName).writeBytes(bytes)
+        val mediaDirectory = File(appContext.filesDir, "chat_media").apply { mkdirs() }
+        File(mediaDirectory, fileName).writeBytes(bytes)
         return JSONObject().apply {
             put("fileName", fileName)
             put("mimeType", mimeType)
@@ -796,7 +797,8 @@ class ChatViewModel(private val appContext: Context) : ViewModel() {
 
     private fun loadAttachment(messageId: String, metadata: JSONObject): MediaAttachment? {
         val fileName = metadata.optString("fileName")
-        val file = File(appContext.filesDir, fileName)
+        val file = File(appContext.filesDir, "chat_media/$fileName")
+            .takeIf(File::exists) ?: File(appContext.filesDir, fileName)
         if (fileName.isEmpty() || !file.exists()) return null
         val uri = Uri.fromFile(file)
         val base64 = Base64.encodeToString(file.readBytes(), Base64.NO_WRAP)

@@ -104,26 +104,31 @@ export class NewsService {
   }
 
   async downloadLatestPodcast(feedUrl?: string): Promise<DownloadedPodcast> {
-      const url = feedUrl?.trim() || process.env.NEWS_PODCAST_RSS_URL?.split(",")[0]?.trim() || DEFAULT_PODCAST_FEED;
-      const feed = await this.parser.parseURL(url);
-      const item = feed.items.find((entry) => {
-        const enclosure = (entry as typeof entry & { enclosure?: { url?: string } }).enclosure;
-        return typeof enclosure?.url === "string" && /^https?:\/\//i.test(enclosure.url);
-      });
-      const enclosure = item && (item as typeof item & { enclosure?: { url?: string; type?: string } }).enclosure;
-      if (!item || !enclosure?.url) {
-        throw new Error(`No downloadable podcast episode was found in feed ${url}.`);
-      }
+    const candidate = await this.getLatestPodcastCandidate(feedUrl);
+    return this.downloadPodcast(candidate);
+  }
 
-      return this.downloadPodcast({
-        feedName: feed.title || new URL(url).hostname,
-        feedUrl: url,
-        episodeUrl: enclosure.url,
-        title: item.title || "Untitled podcast episode",
-        publishedAt: item.pubDate || "",
-        mimeType: enclosure.type || "audio/mpeg",
-      });
+  async getLatestPodcastCandidate(feedUrl?: string): Promise<PodcastCandidate> {
+    const url = feedUrl?.trim() || process.env.NEWS_PODCAST_RSS_URL?.split(",")[0]?.trim() || DEFAULT_PODCAST_FEED;
+    const feed = await this.parser.parseURL(url);
+    const item = feed.items.find((entry) => {
+      const enclosure = (entry as typeof entry & { enclosure?: { url?: string } }).enclosure;
+      return typeof enclosure?.url === "string" && /^https?:\/\//i.test(enclosure.url);
+    });
+    const enclosure = item && (item as typeof item & { enclosure?: { url?: string; type?: string } }).enclosure;
+    if (!item || !enclosure?.url) {
+      throw new Error(`No downloadable podcast episode was found in feed ${url}.`);
     }
+
+    return {
+      feedName: feed.title || new URL(url).hostname,
+      feedUrl: url,
+      episodeUrl: enclosure.url,
+      title: item.title || "Untitled podcast episode",
+      publishedAt: item.pubDate || "",
+      mimeType: enclosure.type || "audio/mpeg",
+    };
+  }
 
   private async downloadPodcast(candidate: PodcastCandidate): Promise<DownloadedPodcast> {
     const response = await axios.get<ArrayBuffer>(candidate.episodeUrl, {

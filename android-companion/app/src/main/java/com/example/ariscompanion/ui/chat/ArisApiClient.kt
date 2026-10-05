@@ -106,7 +106,7 @@ class ArisApiClient(serverUrl: String, private val token: String) {
                 val errorText = connection.errorStream?.bufferedReader()?.use(BufferedReader::readText).orEmpty()
                 throw httpError(statusCode, errorText)
             }
-            connection.inputStream.use { it.readBytes() }
+            return connection.inputStream.use { it.readBytes() }
         } finally {
             connection.disconnect()
         }

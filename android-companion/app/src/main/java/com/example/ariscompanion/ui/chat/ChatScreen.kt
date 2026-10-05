@@ -1,13 +1,17 @@
 package com.example.ariscompanion.ui.chat
 
 import android.Manifest
+import android.content.ActivityNotFoundException
 import android.content.Context
+import android.content.Intent
 import android.graphics.BitmapFactory
 import android.net.Uri
 import android.provider.OpenableColumns
 import android.util.Base64
+import android.widget.Toast
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.core.content.FileProvider
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
@@ -56,6 +60,7 @@ import com.example.ariscompanion.ServerConfig
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import java.io.File
 import java.io.IOException
 
 @Composable
@@ -343,7 +348,12 @@ private fun AttachmentPreview(
         is MediaAttachment.Video -> Text("Video attachment (${attachment.mimeType})")
         is MediaAttachment.Audio -> AudioAttachmentButton(messageId, index, attachment, state, onEvent)
         is MediaAttachment.VoiceNote -> AudioAttachmentButton(messageId, index, attachment, state, onEvent)
-        is MediaAttachment.Document -> Text("File: ${attachment.fileName} (${attachment.mimeType})")
+        is MediaAttachment.Document -> {
+            val context = LocalContext.current
+            TextButton(onClick = { openDocument(context, attachment) }) {
+                Text("Open ${attachment.fileName}")
+            }
+        }
     }
 }
 
@@ -361,6 +371,26 @@ private fun AudioAttachmentButton(
             if (state.playbackKey == playbackKey) "Stop audio (${attachment.mimeType})"
             else "Play audio (${attachment.mimeType})"
         )
+    }
+}
+
+private fun openDocument(context: Context, attachment: MediaAttachment.Document) {
+    val uri = if (attachment.uri.scheme == "file") {
+        val path = attachment.uri.path ?: run {
+            Toast.makeText(context, "This file is no longer available.", Toast.LENGTH_SHORT).show()
+            return
+        }
+        FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", File(path))
+    } else {
+        attachment.uri
+    }
+    val intent = Intent(Intent.ACTION_VIEW)
+        .setDataAndType(uri, attachment.mimeType)
+        .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+    try {
+        context.startActivity(Intent.createChooser(intent, "Open ${attachment.fileName}"))
+    } catch (_: ActivityNotFoundException) {
+        Toast.makeText(context, "No app can open this file type.", Toast.LENGTH_SHORT).show()
     }
 }
 

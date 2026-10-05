@@ -41,6 +41,7 @@ export class MediaLibraryService {
     if (input.content.length > MAX_MEDIA_LIBRARY_BYTES) {
       throw new Error("Media library files are limited to 100 MiB each.");
     }
+    const account = await this.requireAccount(input.userId);
     if (input.sourceReference) {
       const existing = await this.mediaStore.findBySourceReference(
         input.userId,
@@ -50,7 +51,6 @@ export class MediaLibraryService {
       if (existing) return existing;
     }
 
-    const account = await this.requireAccount(input.userId);
     const fileName = sanitizeFileName(input.fileName);
     const summary = input.summary?.trim()
       || await this.summarizeUpload(fileName, input.mimeType, input.content, input.description);
@@ -87,9 +87,6 @@ export class MediaLibraryService {
         sessionId: input.sessionId,
       });
     } catch (indexError) {
-      const existing = input.sourceReference
-        ? await this.mediaStore.findBySourceReference(input.userId, input.sourceType, input.sourceReference)
-        : undefined;
       try {
         await this.googleService.deleteDriveFile(account, driveFile.id, this.tokenUpdater(input.userId));
       } catch (cleanupError) {
@@ -97,6 +94,9 @@ export class MediaLibraryService {
           `The file was uploaded to Drive but its library index failed (${errorMessage(indexError)}); cleanup also failed (${errorMessage(cleanupError)}).`
         );
       }
+      const existing = input.sourceReference
+        ? await this.mediaStore.findBySourceReference(input.userId, input.sourceType, input.sourceReference)
+        : undefined;
       if (existing) return existing;
       throw new Error(`The media library index failed; the unindexed Drive upload was removed. ${errorMessage(indexError)}`);
     }
@@ -145,6 +145,14 @@ export class MediaLibraryService {
 
   async findByDriveFileId(userId: number, driveFileId: string): Promise<MediaLibraryRecord | undefined> {
     return this.mediaStore.findByDriveFileId(userId, driveFileId);
+  }
+
+  async findBySourceReference(
+    userId: number,
+    sourceType: string,
+    sourceReference: string,
+  ): Promise<MediaLibraryRecord | undefined> {
+    return this.mediaStore.findBySourceReference(userId, sourceType, sourceReference);
   }
 
   async download(userId: number, record: MediaLibraryRecord): Promise<Buffer> {
