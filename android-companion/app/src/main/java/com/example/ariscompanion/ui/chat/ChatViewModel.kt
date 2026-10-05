@@ -482,7 +482,7 @@ class ChatViewModel(private val appContext: Context) : ViewModel() {
             try {
                 val arisId = UUID.randomUUID().toString()
                 appendMessage(ChatMessage(id = arisId, sender = Sender.ARIS, text = "", status = MessageStatus.SENDING))
-                _uiState.update { it.copy(progressMessage = "🎧 Transcribing voice note…") }
+                _uiState.update { it.copy(progressMessage = "🎧 Listening to your voice note…") }
 
                 syncPhoneLocation()
                 val result = client?.sendVoice(
@@ -498,7 +498,6 @@ class ChatViewModel(private val appContext: Context) : ViewModel() {
                 updateMessage(arisId) {
                     it.copy(
                         text = result.arisReply,
-                        transcript = result.transcript,
                         voiceBase64 = result.voiceBase64,
                         voiceMimeType = result.voiceMimeType,
                         status = MessageStatus.SENT,
