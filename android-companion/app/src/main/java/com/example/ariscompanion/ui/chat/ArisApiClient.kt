@@ -135,6 +135,7 @@ class ArisApiClient(serverUrl: String, private val token: String) {
                 memoryUpdates = result.optJSONArray("memoryUpdates").toStringList(),
                 voiceBase64 = result.optString("voiceBase64").ifEmpty { null },
                 voiceMimeType = result.optString("voiceMimeType").ifEmpty { null },
+                voiceError = result.optString("voiceError").ifEmpty { null },
             )
         }
 

@@ -17,6 +17,7 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.MutableSharedFlow
@@ -31,6 +32,9 @@ import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.FileOutputStream
 import java.io.IOException
+import java.net.ConnectException
+import java.net.SocketTimeoutException
+import java.net.UnknownHostException
 import java.util.UUID
 import org.json.JSONArray
 import org.json.JSONObject
@@ -221,6 +225,7 @@ class ChatViewModel(private val appContext: Context) : ViewModel() {
             is ChatUiEvent.ReplyToMessage -> {
                 _uiState.update { state -> state.copy(replyingTo = state.messages.firstOrNull { it.id == event.messageId }) }
             }
+            is ChatUiEvent.RetrySend -> retryFailedMessage(event.messageId)
             is ChatUiEvent.ClearReply -> _uiState.update { it.copy(replyingTo = null) }
         }
     }
@@ -257,26 +262,28 @@ class ChatViewModel(private val appContext: Context) : ViewModel() {
 
     // ── Text message ─────────────────────────────────────────────────────────
 
-    private fun sendTextMessage(text: String) {
-        val msgId = UUID.randomUUID().toString()
-        val replyingTo = _uiState.value.replyingTo
-        val userMsg = ChatMessage(
-            id = msgId,
-            sender = Sender.USER,
-            text = text,
-            status = MessageStatus.SENDING,
-            quotedText = replyingTo?.replySummary(),
-            quotedSender = replyingTo?.sender,
-        )
-        appendMessage(userMsg)
-        _uiState.update { it.copy(replyingTo = null) }
+    private fun sendTextMessage(text: String, retryMessage: ChatMessage? = null) {
+        val msgId = retryMessage?.id ?: UUID.randomUUID().toString()
+        val replyingTo = if (retryMessage == null) _uiState.value.replyingTo else null
+        if (retryMessage == null) {
+            appendMessage(
+                ChatMessage(
+                    id = msgId,
+                    sender = Sender.USER,
+                    text = text,
+                    status = MessageStatus.SENDING,
+                    quotedText = replyingTo?.replySummary(),
+                    quotedSender = replyingTo?.sender,
+                )
+            )
+            _uiState.update { it.copy(replyingTo = null) }
+        } else {
+            updateMessage(msgId) { it.copy(status = MessageStatus.SENDING) }
+        }
 
         viewModelScope.launch {
+            val arisId = beginAssistantReply(msgId)
             try {
-                val arisId = UUID.randomUUID().toString()
-                val placeholder = ChatMessage(id = arisId, sender = Sender.ARIS, text = "", status = MessageStatus.SENDING)
-                appendMessage(placeholder)
-
                 val visionFrame = if (VisionState.isCapturing.value) {
                     withContext(Dispatchers.IO) {
                         VisionState.captureService?.captureCurrentFrameBase64()
@@ -291,7 +298,7 @@ class ChatViewModel(private val appContext: Context) : ViewModel() {
                     text,
                     SESSION_ID,
                     mediaData = visionFrame,
-                    replyContext = replyingTo?.replyContext(),
+                    replyContext = retryMessage?.retryReplyContext() ?: replyingTo?.replyContext(),
                 ) { event ->
                     when (event.type) {
                         "progress" -> _uiState.update { it.copy(progressMessage = event.message) }
@@ -300,10 +307,7 @@ class ChatViewModel(private val appContext: Context) : ViewModel() {
                             finalResult = event.data
                             _uiState.update { it.copy(progressMessage = null) }
                         }
-                        "error" -> {
-                            _uiState.update { it.copy(progressMessage = null) }
-                            updateMessage(arisId) { it.copy(text = "⚠️ ${event.error ?: "Unknown error"}", status = MessageStatus.ERROR) }
-                        }
+                        "error" -> throw IOException("The chat stream ended with an error.")
                     }
                 }
 
@@ -329,10 +333,9 @@ class ChatViewModel(private val appContext: Context) : ViewModel() {
                     }
                 }
             } catch (e: Exception) {
+                if (e is CancellationException) throw e
                 Log.e(TAG, "sendTextMessage failed", e)
-                updateMessageStatus(msgId, MessageStatus.ERROR)
-                _uiState.update { it.copy(progressMessage = null) }
-                appendMessage(ChatMessage(id = UUID.randomUUID().toString(), sender = Sender.ARIS, text = "⚠️ ${e.message}", status = MessageStatus.ERROR))
+                showSendFailure(msgId, arisId, e)
             }
         }
     }
@@ -464,24 +467,31 @@ class ChatViewModel(private val appContext: Context) : ViewModel() {
         _uiState.update { it.copy(isRecordingVoice = false, recordingAmplitudes = emptyList()) }
     }
 
-    private fun sendVoiceNoteMessage(attachment: MediaAttachment.VoiceNote) {
-        val msgId = UUID.randomUUID().toString()
-        val replyingTo = _uiState.value.replyingTo
-        val userMsg = ChatMessage(
-            id = msgId,
-            sender = Sender.USER,
-            attachment = attachment,
-            status = MessageStatus.SENDING,
-            quotedText = replyingTo?.replySummary(),
-            quotedSender = replyingTo?.sender,
-        )
-        appendMessage(userMsg)
-        _uiState.update { it.copy(replyingTo = null) }
+    private fun sendVoiceNoteMessage(
+        attachment: MediaAttachment.VoiceNote,
+        retryMessage: ChatMessage? = null,
+    ) {
+        val msgId = retryMessage?.id ?: UUID.randomUUID().toString()
+        val replyingTo = if (retryMessage == null) _uiState.value.replyingTo else null
+        if (retryMessage == null) {
+            appendMessage(
+                ChatMessage(
+                    id = msgId,
+                    sender = Sender.USER,
+                    attachment = attachment,
+                    status = MessageStatus.SENDING,
+                    quotedText = replyingTo?.replySummary(),
+                    quotedSender = replyingTo?.sender,
+                )
+            )
+            _uiState.update { it.copy(replyingTo = null) }
+        } else {
+            updateMessage(msgId) { it.copy(status = MessageStatus.SENDING) }
+        }
 
         viewModelScope.launch {
+            val arisId = beginAssistantReply(msgId)
             try {
-                val arisId = UUID.randomUUID().toString()
-                appendMessage(ChatMessage(id = arisId, sender = Sender.ARIS, text = "", status = MessageStatus.SENDING))
                 _uiState.update { it.copy(progressMessage = "🎧 Listening to your voice note…") }
 
                 syncPhoneLocation()
@@ -489,7 +499,7 @@ class ChatViewModel(private val appContext: Context) : ViewModel() {
                     attachment.base64,
                     attachment.mimeType,
                     SESSION_ID,
-                    replyingTo?.replyContext(),
+                    retryMessage?.retryReplyContext() ?: replyingTo?.replyContext(),
                 )
                     ?: throw Exception("Not connected")
 
@@ -497,7 +507,7 @@ class ChatViewModel(private val appContext: Context) : ViewModel() {
                 _uiState.update { it.copy(progressMessage = null) }
                 updateMessage(arisId) {
                     it.copy(
-                        text = result.arisReply,
+                        text = listOfNotNull(result.arisReply, result.voiceError).joinToString("\n\n"),
                         voiceBase64 = result.voiceBase64,
                         voiceMimeType = result.voiceMimeType,
                         status = MessageStatus.SENT,
@@ -505,34 +515,42 @@ class ChatViewModel(private val appContext: Context) : ViewModel() {
                     )
                 }
             } catch (e: Exception) {
+                if (e is CancellationException) throw e
                 Log.e(TAG, "Voice note send failed", e)
-                _uiState.update { it.copy(progressMessage = null) }
-                updateMessageStatus(msgId, MessageStatus.ERROR)
+                showSendFailure(msgId, arisId, e)
             }
         }
     }
 
     // ── Media (image / video / audio file) ───────────────────────────────────
 
-    private fun sendMediaMessage(attachment: MediaAttachment, caption: String) {
-        val msgId = UUID.randomUUID().toString()
-        val replyingTo = _uiState.value.replyingTo
-        val userMsg = ChatMessage(
-            id = msgId,
-            sender = Sender.USER,
-            text = caption,
-            attachment = attachment,
-            status = MessageStatus.SENDING,
-            quotedText = replyingTo?.replySummary(),
-            quotedSender = replyingTo?.sender,
-        )
-        appendMessage(userMsg)
-        _uiState.update { it.copy(replyingTo = null) }
+    private fun sendMediaMessage(
+        attachment: MediaAttachment,
+        caption: String,
+        retryMessage: ChatMessage? = null,
+    ) {
+        val msgId = retryMessage?.id ?: UUID.randomUUID().toString()
+        val replyingTo = if (retryMessage == null) _uiState.value.replyingTo else null
+        if (retryMessage == null) {
+            appendMessage(
+                ChatMessage(
+                    id = msgId,
+                    sender = Sender.USER,
+                    text = caption,
+                    attachment = attachment,
+                    status = MessageStatus.SENDING,
+                    quotedText = replyingTo?.replySummary(),
+                    quotedSender = replyingTo?.sender,
+                )
+            )
+            _uiState.update { it.copy(replyingTo = null) }
+        } else {
+            updateMessage(msgId) { it.copy(status = MessageStatus.SENDING) }
+        }
 
         viewModelScope.launch {
+            val arisId = beginAssistantReply(msgId)
             try {
-                val arisId = UUID.randomUUID().toString()
-                appendMessage(ChatMessage(id = arisId, sender = Sender.ARIS, text = "", status = MessageStatus.SENDING))
                 _uiState.update { it.copy(progressMessage = "📎 Processing attachment…") }
 
                 val (base64, mime) = when (attachment) {
@@ -551,7 +569,7 @@ class ChatViewModel(private val appContext: Context) : ViewModel() {
                     mime,
                     attachment.fileName,
                     SESSION_ID,
-                    replyingTo?.replyContext(),
+                    retryMessage?.retryReplyContext() ?: replyingTo?.replyContext(),
                 ) { event ->
                     when (event.type) {
                         "progress" -> _uiState.update { it.copy(progressMessage = event.message) }
@@ -559,10 +577,7 @@ class ChatViewModel(private val appContext: Context) : ViewModel() {
                             finalResult = event.data
                             _uiState.update { it.copy(progressMessage = null) }
                         }
-                        "error" -> {
-                            _uiState.update { it.copy(progressMessage = null) }
-                            updateMessage(arisId) { it.copy(text = "⚠️ ${event.error}", status = MessageStatus.ERROR) }
-                        }
+                        "error" -> throw IOException("The chat stream ended with an error.")
                     }
                 }
                 val result = finalResult ?: throw IOException("The server did not confirm the message.")
@@ -573,11 +588,75 @@ class ChatViewModel(private val appContext: Context) : ViewModel() {
                     }
                 }
             } catch (e: Exception) {
+                if (e is CancellationException) throw e
                 Log.e(TAG, "Media send failed", e)
-                _uiState.update { it.copy(progressMessage = null) }
-                updateMessageStatus(msgId, MessageStatus.ERROR)
+                showSendFailure(msgId, arisId, e)
             }
         }
+    }
+
+    private fun retryFailedMessage(messageId: String) {
+        val message = _uiState.value.messages.firstOrNull {
+            it.id == messageId && it.sender == Sender.USER && it.status == MessageStatus.ERROR
+        } ?: return
+        when (val attachment = message.attachment) {
+            is MediaAttachment.VoiceNote -> sendVoiceNoteMessage(attachment, message)
+            null -> if (message.text.isNotBlank()) sendTextMessage(message.text, message)
+            else -> sendMediaMessage(attachment, message.text, message)
+        }
+    }
+
+    private fun beginAssistantReply(userMessageId: String): String {
+        val existingReply = _uiState.value.messages.firstOrNull {
+            it.sender == Sender.ARIS && it.inReplyToMessageId == userMessageId
+        }
+        if (existingReply != null) {
+            updateMessage(existingReply.id) {
+                it.copy(
+                    text = "",
+                    status = MessageStatus.SENDING,
+                    voiceBase64 = null,
+                    voiceMimeType = null,
+                    arisAttachments = emptyList(),
+                    memoryUpdates = emptyList(),
+                    pendingAction = null,
+                )
+            }
+            return existingReply.id
+        }
+        val assistantMessageId = UUID.randomUUID().toString()
+        appendMessage(
+            ChatMessage(
+                id = assistantMessageId,
+                sender = Sender.ARIS,
+                status = MessageStatus.SENDING,
+                inReplyToMessageId = userMessageId,
+            )
+        )
+        return assistantMessageId
+    }
+
+    private fun showSendFailure(userMessageId: String, assistantMessageId: String, cause: Exception) {
+        updateMessageStatus(userMessageId, MessageStatus.ERROR)
+        _uiState.update { it.copy(progressMessage = null) }
+        updateMessage(assistantMessageId) {
+            it.copy(text = friendlySendFailure(cause), status = MessageStatus.SENT)
+        }
+    }
+
+    private fun friendlySendFailure(cause: Exception): String = when (cause) {
+        is SocketTimeoutException ->
+            "I’m taking longer than expected to respond. Your message is saved—tap Retry to try again."
+        is UnknownHostException, is ConnectException ->
+            "I couldn’t reach the server just now. Your message is saved—tap Retry when you’re ready."
+        else ->
+            "I couldn’t complete that just now. Your message is saved—tap Retry to try again."
+    }
+
+    private fun ChatMessage.retryReplyContext(): String? {
+        val quoted = quotedText?.takeIf(String::isNotBlank) ?: return null
+        val speaker = if (quotedSender == Sender.USER) "User" else "Aris"
+        return "$speaker message: $quoted"
     }
 
     // ── Approval actions ─────────────────────────────────────────────────────
@@ -593,9 +672,16 @@ class ChatViewModel(private val appContext: Context) : ViewModel() {
         updateMessage(messageId) { it.copy(pendingAction = null) }
 
         viewModelScope.launch {
+            val arisId = UUID.randomUUID().toString()
+            appendMessage(
+                ChatMessage(
+                    id = arisId,
+                    sender = Sender.ARIS,
+                    status = MessageStatus.SENDING,
+                    inReplyToMessageId = msgId,
+                )
+            )
             try {
-                val arisId = UUID.randomUUID().toString()
-                appendMessage(ChatMessage(id = arisId, sender = Sender.ARIS, text = "", status = MessageStatus.SENDING))
                 var finalResult: ArisChatResult? = null
                 syncPhoneLocation()
                 client?.chatStream("approved", SESSION_ID, approvedActionPayload) { event ->
@@ -605,17 +691,22 @@ class ChatViewModel(private val appContext: Context) : ViewModel() {
                             finalResult = event.data
                             _uiState.update { it.copy(progressMessage = null) }
                         }
-                        "error" -> {
-                            _uiState.update { it.copy(progressMessage = null) }
-                            updateMessage(arisId) { it.copy(text = "⚠️ ${event.error}", status = MessageStatus.ERROR) }
-                        }
+                        "error" -> throw IOException("The approval stream ended with an error.")
                     }
                 }
-                finalResult?.let { result ->
-                    updateMessage(arisId) { it.copy(text = result.arisReply, status = MessageStatus.SENT, memoryUpdates = result.memoryUpdates) }
+                val result = finalResult ?: throw IOException("The server did not confirm the approved action.")
+                updateMessage(arisId) {
+                    it.copy(text = result.arisReply, status = MessageStatus.SENT, memoryUpdates = result.memoryUpdates)
                 }
             } catch (e: Exception) {
+                if (e is CancellationException) throw e
                 Log.e(TAG, "Approval send failed", e)
+                updateMessage(arisId) {
+                    it.copy(
+                        text = "I couldn’t confirm whether that action completed. Please check before trying it again.",
+                        status = MessageStatus.SENT,
+                    )
+                }
                 _uiState.update { it.copy(progressMessage = null) }
             }
         }
@@ -811,6 +902,7 @@ class ChatViewModel(private val appContext: Context) : ViewModel() {
                 message.transcript?.let { put("transcript", it) }
                 message.quotedText?.let { put("quotedText", it) }
                 message.quotedSender?.let { put("quotedSender", it.name) }
+                message.inReplyToMessageId?.let { put("inReplyToMessageId", it) }
                 message.attachment?.let { put("attachment", persistAttachment(message.id, "main", it)) }
                 if (!message.voiceBase64.isNullOrEmpty()) {
                     val voiceFileName = "chat_media_${message.id}_voice"
@@ -911,12 +1003,14 @@ class ChatViewModel(private val appContext: Context) : ViewModel() {
                         sender = Sender.valueOf(item.getString("sender")),
                         text = item.optString("text"),
                         status = runCatching { MessageStatus.valueOf(item.optString("status")) }
-                            .getOrDefault(MessageStatus.SENT),
+                            .getOrDefault(MessageStatus.SENT)
+                            .let { if (it == MessageStatus.SENDING) MessageStatus.ERROR else it },
                         timestampMs = item.optLong("timestampMs", System.currentTimeMillis()),
                         transcript = item.optString("transcript").ifEmpty { null },
                         quotedText = item.optString("quotedText").ifEmpty { null },
                         quotedSender = item.optString("quotedSender").takeIf { it.isNotEmpty() }
                             ?.let { runCatching { Sender.valueOf(it) }.getOrNull() },
+                        inReplyToMessageId = item.optString("inReplyToMessageId").ifEmpty { null },
                         voiceBase64 = item.optString("voiceFileName").takeIf { it.isNotEmpty() }?.let { fileName ->
                             File(appContext.filesDir, fileName).takeIf { it.exists() }?.let { file ->
                                 Base64.encodeToString(file.readBytes(), Base64.NO_WRAP)

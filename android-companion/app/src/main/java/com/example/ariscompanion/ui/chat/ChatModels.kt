@@ -78,6 +78,7 @@ data class ChatMessage(
     val pendingAction: PendingAction? = null,
     val quotedText: String? = null,
     val quotedSender: Sender? = null,
+    val inReplyToMessageId: String? = null,
 )
 
 fun ChatMessage.replySummary(): String {
@@ -139,6 +140,7 @@ sealed interface ChatUiEvent {
     data class PlayAttachment(val messageId: String, val attachmentIndex: Int) : ChatUiEvent
     data class SeekAudio(val messageId: String, val attachmentIndex: Int, val positionMs: Long) : ChatUiEvent
     data class ReplyToMessage(val messageId: String) : ChatUiEvent
+    data class RetrySend(val messageId: String) : ChatUiEvent
     data object ClearReply : ChatUiEvent
 }
 
@@ -160,6 +162,7 @@ data class VoiceChatResult(
     val memoryUpdates: List<String> = emptyList(),
     val voiceBase64: String? = null,
     val voiceMimeType: String? = null,
+    val voiceError: String? = null,
 )
 
 data class ChatStreamEvent(

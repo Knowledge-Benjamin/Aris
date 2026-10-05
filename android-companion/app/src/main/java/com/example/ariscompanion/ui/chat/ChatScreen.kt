@@ -504,7 +504,16 @@ private fun MessageBubble(
                             horizontalArrangement = Arrangement.spacedBy(5.dp),
                         ) {
                             if (message.status == MessageStatus.ERROR) {
-                                Text("Not sent", color = Color(0xFFFFB1A9), fontSize = 10.sp)
+                                if (!isAris && (message.text.isNotBlank() || message.attachment != null)) {
+                                    TextButton(
+                                        onClick = { onEvent(ChatUiEvent.RetrySend(message.id)) },
+                                        contentPadding = PaddingValues(horizontal = 2.dp, vertical = 0.dp),
+                                    ) {
+                                        Text("Retry", color = Color(0xFFFFB1A9), fontSize = 11.sp)
+                                    }
+                                } else {
+                                    Text("Not sent", color = Color(0xFFFFB1A9), fontSize = 10.sp)
+                                }
                             } else if (message.status == MessageStatus.SENDING) {
                                 Text("Sending…", color = Color(0xFFB5C5CA), fontSize = 10.sp)
                             }
