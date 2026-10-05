@@ -86,6 +86,8 @@ type RequestRouteIntent =
 interface RequestRoutingDecision {
   intent: RequestRouteIntent;
   categories: string[];
+  memoryAssessment: string;
+  informationGaps: string[];
   reusePriorAnswer: boolean;
   reuseAnswerId?: number;
   refreshAnswerId?: number;
@@ -356,6 +358,7 @@ export class ArisService {
       "Use time/location/weather/traffic native capabilities for local or device-context questions; do not route them to web search.",
       "Choose search only when the user explicitly asks for web research or the answer genuinely needs current public web information. Do not choose search merely because no other category matches.",
       "Memory-first policy: use the supplied timestamped answer memories and relevant facts before planning tools. Reuse a matching answer for stable facts by default. Do not make a tool call just because a request is worded differently.",
+      "Before choosing tools, assess what relevant memory already establishes, what it only partially establishes, and what remains unknown. Ground this assessment only in supplied memories; use remembered names, facts, sources, and dates to narrow tool choice and query scope. Do not treat partial memory as a complete answer.",
       "Force a fresh tool call when the user requests a refresh/update/check-again/latest/current answer, says the facts have changed or are stale, explicitly requests web research, or the subject is inherently volatile (time, location, weather, traffic, inbox/messages, calendar, or live news).",
       "Set reusePriorAnswer=true only when a supplied answer memory or prior Aris reply fully answers this request and a fresh lookup is not required. If reusing memory, return its exact reuseAnswerId. If refreshing a fact represented by a supplied answer memory, return that memory's id in refreshAnswerId so the fresh result replaces it rather than becoming a stale duplicate. Set forceRefresh=true for an explicit refresh or known changed/stale information.",
       `Web search enabled: ${searchToolEnabled}. If disabled, do not select the search category.`,
@@ -375,7 +378,7 @@ export class ArisService {
         })),
       })))}\nRelevant semantic facts:\n${JSON.stringify(memories.map((memory) => memory.slice(0, 800)))}`,
       `Latest user request:\n${message}`,
-      'Return only JSON: {"intent":"other","categories":[],"reusePriorAnswer":false,"reuseAnswerId":null,"refreshAnswerId":null,"forceRefresh":false}.',
+      'Return only JSON: {"intent":"other","categories":[],"memoryAssessment":"No relevant stored memory was found.","informationGaps":[],"reusePriorAnswer":false,"reuseAnswerId":null,"refreshAnswerId":null,"forceRefresh":false}.',
     ].join("\n\n");
 
     try {
@@ -387,6 +390,8 @@ export class ArisService {
         reuseAnswerId?: unknown;
         refreshAnswerId?: unknown;
         forceRefresh?: unknown;
+        memoryAssessment?: unknown;
+        informationGaps?: unknown;
       } | undefined;
       const validIntents: RequestRouteIntent[] = [
         "current_time", "current_date", "current_location", "weather", "traffic",
@@ -425,6 +430,17 @@ export class ArisService {
           categories.push(intentCategory);
         }
         const forceRefresh = parsed.forceRefresh === true || this.isExplicitRefreshRequest(message);
+        const memoryAssessment = typeof parsed.memoryAssessment === "string"
+          ? parsed.memoryAssessment.trim().slice(0, 1200)
+          : reusableAnswers.length || memories.length
+            ? "Relevant stored information is available; verify whether it fully answers the request before selecting tools."
+            : "No relevant stored memory was found.";
+        const informationGaps = Array.isArray(parsed.informationGaps)
+          ? parsed.informationGaps
+            .filter((gap): gap is string => typeof gap === "string" && gap.trim().length > 0)
+            .slice(0, 8)
+            .map((gap) => gap.trim().slice(0, 300))
+          : [];
         const reuseAnswerId = Number.isInteger(parsed.reuseAnswerId)
           && reusableAnswers.some((answer) => answer.id === parsed.reuseAnswerId)
           ? Number(parsed.reuseAnswerId)
@@ -438,6 +454,8 @@ export class ArisService {
         return {
           intent,
           categories: Array.from(new Set(categories)),
+          memoryAssessment,
+          informationGaps,
           reusePriorAnswer,
           reuseAnswerId,
           refreshAnswerId,
@@ -479,6 +497,10 @@ export class ArisService {
     return {
       intent,
       categories,
+      memoryAssessment: reusableAnswers.length || memories.length
+        ? "Relevant stored information is available; verify whether it fully answers the request before selecting tools."
+        : "No relevant stored memory was found.",
+      informationGaps: [],
       reusePriorAnswer: Boolean(exactReusableAnswer),
       reuseAnswerId: exactReusableAnswer ? topAnswer.id : undefined,
       refreshAnswerId: undefined,
