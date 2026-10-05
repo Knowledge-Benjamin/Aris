@@ -88,6 +88,7 @@ interface RequestRoutingDecision {
   categories: string[];
   reusePriorAnswer: boolean;
   reuseAnswerId?: number;
+  refreshAnswerId?: number;
   forceRefresh: boolean;
 }
 
@@ -356,7 +357,7 @@ export class ArisService {
       "Choose search only when the user explicitly asks for web research or the answer genuinely needs current public web information. Do not choose search merely because no other category matches.",
       "Memory-first policy: use the supplied timestamped answer memories and relevant facts before planning tools. Reuse a matching answer for stable facts by default. Do not make a tool call just because a request is worded differently.",
       "Force a fresh tool call when the user requests a refresh/update/check-again/latest/current answer, says the facts have changed or are stale, explicitly requests web research, or the subject is inherently volatile (time, location, weather, traffic, inbox/messages, calendar, or live news).",
-      "Set reusePriorAnswer=true only when a supplied answer memory or prior Aris reply fully answers this request and a fresh lookup is not required. If using a supplied memory, return its exact reuseAnswerId. Set forceRefresh=true for an explicit refresh or known changed/stale information.",
+      "Set reusePriorAnswer=true only when a supplied answer memory or prior Aris reply fully answers this request and a fresh lookup is not required. If reusing memory, return its exact reuseAnswerId. If refreshing a fact represented by a supplied answer memory, return that memory's id in refreshAnswerId so the fresh result replaces it rather than becoming a stale duplicate. Set forceRefresh=true for an explicit refresh or known changed/stale information.",
       `Web search enabled: ${searchToolEnabled}. If disabled, do not select the search category.`,
       `Recent conversation:\n${history.join("\n") || "(none)"}`,
       `Recent tool observations:\n${JSON.stringify(observations) || "[]"}`,
@@ -367,9 +368,14 @@ export class ArisService {
         intent: answer.intent,
         recordedAt: answer.recordedAt,
         similarity: answer.similarity,
+        sources: answer.sources.slice(0, 3).map((source) => ({
+          tool: source.tool,
+          recordedAt: source.recordedAt,
+          summary: source.summary.slice(0, 300),
+        })),
       })))}\nRelevant semantic facts:\n${JSON.stringify(memories.map((memory) => memory.slice(0, 800)))}`,
       `Latest user request:\n${message}`,
-      'Return only JSON: {"intent":"other","categories":[],"reusePriorAnswer":false,"reuseAnswerId":null,"forceRefresh":false}.',
+      'Return only JSON: {"intent":"other","categories":[],"reusePriorAnswer":false,"reuseAnswerId":null,"refreshAnswerId":null,"forceRefresh":false}.',
     ].join("\n\n");
 
     try {
@@ -379,6 +385,7 @@ export class ArisService {
         categories?: unknown;
         reusePriorAnswer?: unknown;
         reuseAnswerId?: unknown;
+        refreshAnswerId?: unknown;
         forceRefresh?: unknown;
       } | undefined;
       const validIntents: RequestRouteIntent[] = [
@@ -422,6 +429,10 @@ export class ArisService {
           && reusableAnswers.some((answer) => answer.id === parsed.reuseAnswerId)
           ? Number(parsed.reuseAnswerId)
           : undefined;
+        const refreshAnswerId = Number.isInteger(parsed.refreshAnswerId)
+          && reusableAnswers.some((answer) => answer.id === parsed.refreshAnswerId)
+          ? Number(parsed.refreshAnswerId)
+          : undefined;
         const reusePriorAnswer = parsed.reusePriorAnswer === true && !forceRefresh;
         info(`[arisService] routed intent=${intent} categories=${Array.from(new Set(categories)).join(",") || "none"} reusePriorAnswer=${reusePriorAnswer} forceRefresh=${forceRefresh}`);
         return {
@@ -429,6 +440,7 @@ export class ArisService {
           categories: Array.from(new Set(categories)),
           reusePriorAnswer,
           reuseAnswerId,
+          refreshAnswerId,
           forceRefresh,
         };
       }
@@ -457,7 +469,7 @@ export class ArisService {
     const normalizedCachedQuestion = topAnswer ? normalizeMemoryQuestion(topAnswer.question) : "";
     const isVolatileIntent = [
       "current_time", "current_date", "current_location", "weather", "traffic",
-      "news", "calendar", "gmail", "whatsapp", "web_research",
+      "news", "calendar", "gmail", "whatsapp",
     ].includes(intent);
     const exactReusableAnswer = topAnswer
       && normalizedQuestion === normalizedCachedQuestion
@@ -469,6 +481,7 @@ export class ArisService {
       categories,
       reusePriorAnswer: Boolean(exactReusableAnswer),
       reuseAnswerId: exactReusableAnswer ? topAnswer.id : undefined,
+      refreshAnswerId: undefined,
       forceRefresh,
     };
   }
@@ -1022,7 +1035,7 @@ export class ArisService {
       ? [this.storeMemoryEntries(input.userId, sessionId, memoryEntries)]
       : [];
 
-    const durableWrites: Promise<unknown>[] = [saveArisReplyPromise, ...memoryStorePromises];
+    const durableWrites: Promise<unknown>[] = [saveArisReplyPromise];
     if (
       input.userId
       && !isShortConversational
@@ -1047,10 +1060,14 @@ export class ArisService {
         categories: requestRoute.categories,
         sources: recentSources,
         embedding: requestEmbedding,
+        replaceAnswerId: requestRoute.forceRefresh ? requestRoute.refreshAnswerId : undefined,
       }));
     }
     await Promise.all(durableWrites).catch((err) => {
       error("[arisService] Failed to persist response conversation/memory", err);
+    });
+    void Promise.all(memoryStorePromises).catch((err) => {
+      error("[arisService] Background save failed for extracted chat memories:", err);
     });
 
     return {
@@ -4627,7 +4644,6 @@ export class ArisService {
       "current_time", "current_date", "current_location", "weather", "traffic",
       "news", "calendar", "gmail", "whatsapp",
     ].includes(requestRoute.intent)
-      || requestRoute.intent === "web_research"
       || this.isExplicitWebResearchRequest(userMessage);
     if (
       !approvedAction
@@ -5838,7 +5854,7 @@ export class ArisService {
       "",
       "Timestamped prior answers (reuse only if they answer the same stable question and no refresh is required):",
       ...reusableAnswers.map((answer) =>
-        `- id=${answer.id} recordedAt=${answer.recordedAt} similarity=${answer.similarity.toFixed(3)} question=${answer.question}\n  answer=${answer.answer.slice(0, 3000)}`
+        `- id=${answer.id} recordedAt=${answer.recordedAt} similarity=${answer.similarity.toFixed(3)} question=${answer.question}\n  answer=${answer.answer.slice(0, 3000)}\n  sources=${JSON.stringify(answer.sources.slice(0, 3))}`
       ),
       ...(forceRefresh ? ["FRESHNESS OVERRIDE: This request explicitly requires refreshed information. Do not answer from older answer memories; use the most relevant fresh tool capability, or clearly state if the system cannot refresh this information."] : []),
       "",

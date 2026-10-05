@@ -193,6 +193,7 @@ export class MemoryStore {
     categories: string[];
     sources: Array<{ tool: string; recordedAt: string; summary: string }>;
     embedding?: number[];
+    replaceAnswerId?: number;
   }): Promise<void> {
     const question = input.question.trim();
     const answer = input.answer.trim();
@@ -206,6 +207,49 @@ export class MemoryStore {
       throw new Error("The embedding service returned no vector for the reusable answer.");
     }
     const questionKey = boundedQuestion.toLowerCase().replace(/\s+/g, " ").replace(/[?!.]+$/g, "").trim();
+    if (input.replaceAnswerId) {
+      const client = await this.pool.connect();
+      try {
+        await client.query("BEGIN");
+        const refreshed = await client.query(
+          `INSERT INTO aris_answer_memories
+           (user_id, question_key, question, answer, intent, categories, sources, embedding, captured_at, updated_at)
+           VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7::jsonb, $8::vector, NOW(), NOW())
+           ON CONFLICT (user_id, question_key) DO UPDATE SET
+             question = EXCLUDED.question,
+             answer = EXCLUDED.answer,
+             intent = EXCLUDED.intent,
+             categories = EXCLUDED.categories,
+             sources = EXCLUDED.sources,
+             embedding = EXCLUDED.embedding,
+             captured_at = NOW(),
+             updated_at = NOW()
+           RETURNING id`,
+          [
+            input.userId,
+            questionKey,
+            boundedQuestion,
+            answer.slice(0, 24000),
+            input.intent,
+            JSON.stringify(input.categories),
+            JSON.stringify(input.sources),
+            `[${embedding.join(",")}]`,
+          ]
+        );
+        await client.query(
+          `DELETE FROM aris_answer_memories
+           WHERE user_id = $1 AND id = $2 AND id <> $3`,
+          [input.userId, input.replaceAnswerId, refreshed.rows[0].id]
+        );
+        await client.query("COMMIT");
+      } catch (refreshError) {
+        await client.query("ROLLBACK");
+        throw refreshError;
+      } finally {
+        client.release();
+      }
+      return;
+    }
     await this.pool.query(
       `INSERT INTO aris_answer_memories
        (user_id, question_key, question, answer, intent, categories, sources, embedding, captured_at, updated_at)
