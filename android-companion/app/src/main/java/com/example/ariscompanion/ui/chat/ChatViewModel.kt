@@ -810,6 +810,8 @@ class ChatViewModel(private val appContext: Context) : ViewModel() {
                 put("status", message.status.name)
                 put("timestampMs", message.timestampMs)
                 message.transcript?.let { put("transcript", it) }
+                message.quotedText?.let { put("quotedText", it) }
+                message.quotedSender?.let { put("quotedSender", it.name) }
                 message.attachment?.let { put("attachment", persistAttachment(message.id, "main", it)) }
                 if (!message.voiceBase64.isNullOrEmpty()) {
                     val voiceFileName = "chat_media_${message.id}_voice"
@@ -913,6 +915,9 @@ class ChatViewModel(private val appContext: Context) : ViewModel() {
                             .getOrDefault(MessageStatus.SENT),
                         timestampMs = item.optLong("timestampMs", System.currentTimeMillis()),
                         transcript = item.optString("transcript").ifEmpty { null },
+                        quotedText = item.optString("quotedText").ifEmpty { null },
+                        quotedSender = item.optString("quotedSender").takeIf { it.isNotEmpty() }
+                            ?.let { runCatching { Sender.valueOf(it) }.getOrNull() },
                         voiceBase64 = item.optString("voiceFileName").takeIf { it.isNotEmpty() }?.let { fileName ->
                             File(appContext.filesDir, fileName).takeIf { it.exists() }?.let { file ->
                                 Base64.encodeToString(file.readBytes(), Base64.NO_WRAP)

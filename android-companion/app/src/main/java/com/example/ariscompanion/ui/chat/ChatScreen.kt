@@ -19,6 +19,7 @@ import androidx.compose.foundation.Image
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.detectHorizontalDragGestures
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -126,8 +127,6 @@ fun ChatScreen(
     }
 
     val chatBackground = Color(0xFF07070B)
-    val arisBubble = Color(0xFF17162A)
-    val userBubble = Color(0xFF07384A)
     val accent = Color(0xFF00F0FF)
     val inputEnabled = state.inputText.isNotBlank() || state.stagedAttachment != null
 
@@ -392,8 +391,6 @@ private fun MessageBubble(
 ) {
     val isAris = message.sender == Sender.ARIS
     val bubbleColor = if (isAris) Color(0xFF17162A) else Color(0xFF07384A)
-    var expandedText by remember(message.id) { mutableStateOf(false) }
-    var textOverflows by remember(message.id) { mutableStateOf(false) }
     AnimatedVisibility(
         visible = true,
         enter = fadeIn() + slideInVertically(initialOffsetY = { it / 5 }),
@@ -453,9 +450,6 @@ private fun MessageBubble(
                     message.text.takeIf(String::isNotBlank)?.let {
                         CollapsibleMessageText(
                             text = it,
-                            expanded = expandedText,
-                            onExpandedChange = { expandedText = it },
-                            onOverflowChange = { textOverflows = it },
                             color = Color(0xFFF0F4F5),
                             fontSize = 15.sp,
                             lineHeight = 21.sp,
@@ -464,26 +458,10 @@ private fun MessageBubble(
                     message.transcript?.takeIf(String::isNotBlank)?.let {
                         CollapsibleMessageText(
                             text = "Transcript · $it",
-                            expanded = expandedText,
-                            onExpandedChange = { expandedText = it },
-                            onOverflowChange = { textOverflows = it },
                             color = Color(0xFFCAD4D7),
                             fontSize = 13.sp,
                             lineHeight = 18.sp,
                         )
-                    }
-                    if (textOverflows || expandedText) {
-                        TextButton(
-                            onClick = { expandedText = !expandedText },
-                            contentPadding = PaddingValues(horizontal = 0.dp, vertical = 0.dp),
-                        ) {
-                            Text(
-                                if (expandedText) "Show less" else "Show more",
-                                color = Color(0xFF00F0FF),
-                                fontSize = 12.sp,
-                                fontWeight = FontWeight.Medium,
-                            )
-                        }
                     }
                     message.attachment?.let { AttachmentPreview(it, message.id, 0, state, onEvent) }
                     message.arisAttachments.forEachIndexed { index, attachment ->
@@ -568,13 +546,12 @@ private fun DateDivider(timestampMs: Long) {
 @Composable
 private fun CollapsibleMessageText(
     text: String,
-    expanded: Boolean,
-    onExpandedChange: (Boolean) -> Unit,
-    onOverflowChange: (Boolean) -> Unit,
     color: Color,
     fontSize: androidx.compose.ui.unit.TextUnit,
     lineHeight: androidx.compose.ui.unit.TextUnit,
 ) {
+    var expanded by remember(text) { mutableStateOf(false) }
+    var hasOverflow by remember(text) { mutableStateOf(false) }
     Text(
         text = text,
         color = color,
@@ -583,9 +560,22 @@ private fun CollapsibleMessageText(
         maxLines = if (expanded) Int.MAX_VALUE else 8,
         overflow = TextOverflow.Ellipsis,
         onTextLayout = { result ->
-            if (!expanded) onOverflowChange(result.hasVisualOverflow)
+            if (!expanded) hasOverflow = result.hasVisualOverflow
         },
     )
+    if (hasOverflow || expanded) {
+        TextButton(
+            onClick = { expanded = !expanded },
+            contentPadding = PaddingValues(horizontal = 0.dp, vertical = 0.dp),
+        ) {
+            Text(
+                if (expanded) "Show less" else "Show more",
+                color = Color(0xFF00F0FF),
+                fontSize = 12.sp,
+                fontWeight = FontWeight.Medium,
+            )
+        }
+    }
 }
 
 private fun dayKey(timestampMs: Long): String =
