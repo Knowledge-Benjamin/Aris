@@ -944,7 +944,14 @@ export class ArisService {
       }
     }
     const requestRoute = isShortConversational
-      ? { intent: "other", categories: [], reusePriorAnswer: false, forceRefresh: false } satisfies RequestRoutingDecision
+      ? {
+          intent: "other",
+          categories: [],
+          memoryAssessment: "Conversational request; no tool planning is needed.",
+          informationGaps: [],
+          reusePriorAnswer: false,
+          forceRefresh: false,
+        } satisfies RequestRoutingDecision
       : await this.classifyRequestRoute(
         messageWithReplyContext,
         conversationHistory,
@@ -1251,6 +1258,7 @@ export class ArisService {
     memories: string[],
     reusableAnswers: ReusableAnswerMemory[],
     requestRoute: RequestRoutingDecision,
+    initialInvocations: ToolInvocation[],
     executionPlan: string[],
     toolResults: Array<{ invocation: ToolInvocation; result: ToolExecutionResult }>,
   ): string {
@@ -1263,6 +1271,22 @@ export class ArisService {
     const observationLines = toolResults.map(({ invocation, result }) =>
       `- ${invocation.tool}: ${result.success ? `completed; ${this.summarizeToolData(result.data).slice(0, 900)}` : `failed; ${String(result.error || "unknown error").slice(0, 400)}`}`
     );
+    const matchedResults = new Set<ToolExecutionResult>();
+    const taskLines = initialInvocations.map((invocation, index) => {
+      const match = toolResults.find((entry) =>
+        !matchedResults.has(entry.result)
+        && entry.invocation.tool === invocation.tool
+        && JSON.stringify(entry.invocation.payload) === JSON.stringify(invocation.payload)
+      );
+      if (match) matchedResults.add(match.result);
+      const status = match ? match.result.success ? "completed" : "blocked; revise" : "pending";
+      return `${index + 1}. [${status}] ${this.describeToolForSkill(invocation.tool)}`;
+    });
+    for (const entry of toolResults) {
+      if (matchedResults.has(entry.result)) continue;
+      taskLines.push(`${taskLines.length + 1}. [${entry.result.success ? "completed" : "blocked; revise"}] ${this.describeToolForSkill(entry.invocation.tool)}`);
+    }
+    taskLines.push(`${taskLines.length + 1}. [pending] Synthesize the supported findings and verify every requested part is addressed.`);
 
     return [
       "MEMORY-INFORMED PLAN AND TASK LIST",
@@ -1273,8 +1297,10 @@ export class ArisService {
       requestRoute.forceRefresh
         ? "Freshness override: prior answers may guide where and how to check, but must not be treated as the refreshed result."
         : "For stable facts, prefer adequate stored evidence; obtain fresh data for volatile state or when the request explicitly requires it.",
-      `Current plan:\n${executionPlan.join("\n")}`,
-      `Current-run completed/failed steps:\n${observationLines.join("\n") || "(No tools have run yet.)"}`,
+      `Initial plan:\n${executionPlan.join("\n")}`,
+      `Updated task list:\n${taskLines.join("\n")}`,
+      `Current-run evidence and blockers:\n${observationLines.join("\n") || "(No tools have run yet.)"}`,
+      "Revise the remaining task list when evidence makes a step unnecessary, exposes a missing detail, or requires a suitable fallback; never repeat completed work just to follow the initial plan.",
       `Relevant timestamped answer memories:\n${answerLines.join("\n") || "(None.)"}`,
       `Relevant semantic facts:\n${factLines.join("\n") || "(None.)"}`,
     ].join("\n\n");
@@ -5090,8 +5116,12 @@ export class ArisService {
 
       onProgress?.("Thinking...");
       const browserMediaParts = this.extractBrowserMediaParts(toolResults);
-      const modelResponse = await this.gemmaService.requestArisAdvice(
+      const iterationPrompt = [
+        this.buildMemoryAwareExecutionContext(memories, reusableAnswers, requestRoute, executionPlan, toolResults),
         prompt,
+      ].join("\n\n");
+      const modelResponse = await this.gemmaService.requestArisAdvice(
+        iterationPrompt,
         [...(mediaParts || []), ...browserMediaParts]
       );
       lastModelReply = modelResponse.reply.trim();
