@@ -185,7 +185,7 @@ fun ChatScreen(
                     MessageBubble(
                         message = message,
                         state = state,
-                        onReply = { onEvent(ChatUiEvent.ReplyToMessage(message.id)) },
+                        onReply = { viewModel.onEvent(ChatUiEvent.ReplyToMessage(message.id)) },
                         onEvent = viewModel::onEvent,
                     )
                 }
@@ -211,7 +211,7 @@ fun ChatScreen(
                         title = if (reply.sender == Sender.ARIS) "Aris" else "You",
                         content = reply.text.ifBlank { attachmentLabel(reply.attachment) },
                         accent = accent,
-                        onDismiss = { onEvent(ChatUiEvent.ClearReply) },
+                        onDismiss = { viewModel.onEvent(ChatUiEvent.ClearReply) },
                     )
                 }
                 state.stagedAttachment?.let { attachment ->
@@ -219,15 +219,15 @@ fun ChatScreen(
                         title = attachment.fileName,
                         content = "${attachment.mimeType} · ready to send",
                         accent = Color(0xFF80D6C5),
-                        onDismiss = { onEvent(ChatUiEvent.ClearStagedAttachment) },
+                        onDismiss = { viewModel.onEvent(ChatUiEvent.ClearStagedAttachment) },
                     )
                 }
                 if (state.isRecordingVoice) {
                     RecordingComposer(
                         durationMs = state.recordingDurationMs,
                         amplitudes = state.recordingAmplitudes,
-                        onCancel = { onEvent(ChatUiEvent.CancelRecording) },
-                        onSend = { onEvent(ChatUiEvent.StopRecording) },
+                        onCancel = { viewModel.onEvent(ChatUiEvent.CancelRecording) },
+                        onSend = { viewModel.onEvent(ChatUiEvent.StopRecording) },
                     )
                 } else {
                     Row(
@@ -245,7 +245,7 @@ fun ChatScreen(
                         ) {
                             BasicTextField(
                                 value = state.inputText,
-                                onValueChange = { onEvent(ChatUiEvent.UpdateInput(it)) },
+                                onValueChange = { viewModel.onEvent(ChatUiEvent.UpdateInput(it)) },
                                 modifier = Modifier.fillMaxWidth().heightIn(min = 46.dp, max = 130.dp).padding(horizontal = 16.dp, vertical = 12.dp),
                                 textStyle = TextStyle(color = Color(0xFFF3F7F8), fontSize = 15.sp),
                                 cursorBrush = Brush.verticalGradient(listOf(accent, accent)),
@@ -262,7 +262,7 @@ fun ChatScreen(
                         }
                         if (inputEnabled) {
                             IconButton(
-                                onClick = { onEvent(ChatUiEvent.SendText(state.inputText)) },
+                                onClick = { viewModel.onEvent(ChatUiEvent.SendText(state.inputText)) },
                                 modifier = Modifier.size(48.dp).background(accent, CircleShape),
                             ) {
                                 Text("➤", color = Color(0xFF062B2A), fontSize = 21.sp, fontWeight = FontWeight.Bold)
@@ -273,7 +273,7 @@ fun ChatScreen(
                                     if (context.checkSelfPermission(Manifest.permission.RECORD_AUDIO) ==
                                         android.content.pm.PackageManager.PERMISSION_GRANTED
                                     ) {
-                                        onEvent(ChatUiEvent.StartRecording)
+                                        viewModel.onEvent(ChatUiEvent.StartRecording)
                                     } else {
                                         audioPermission.launch(Manifest.permission.RECORD_AUDIO)
                                     }
