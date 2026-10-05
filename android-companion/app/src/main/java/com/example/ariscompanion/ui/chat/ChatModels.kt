@@ -80,6 +80,22 @@ data class ChatMessage(
     val quotedSender: Sender? = null,
 )
 
+fun ChatMessage.replySummary(): String {
+    val attachmentSummary = when (val media = attachment) {
+        is MediaAttachment.Image -> "Photo: ${media.fileName}"
+        is MediaAttachment.Video -> "Video: ${media.fileName}"
+        is MediaAttachment.Audio -> "Audio: ${media.fileName}"
+        is MediaAttachment.VoiceNote -> "Voice note"
+        is MediaAttachment.Document -> "Document: ${media.fileName}"
+        null -> null
+    }
+    return listOfNotNull(
+        text.takeIf(String::isNotBlank),
+        transcript?.takeIf(String::isNotBlank)?.let { "Transcript: $it" },
+        attachmentSummary,
+    ).joinToString("\n").ifBlank { "Message" }.take(4000)
+}
+
 data class ChatUiState(
     val messages: List<ChatMessage> = emptyList(),
     val serverUrl: String = "",

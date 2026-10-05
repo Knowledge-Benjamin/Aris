@@ -61,7 +61,10 @@ import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.input.pointer.consume
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
@@ -73,6 +76,7 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.example.ariscompanion.ServerConfig
+import com.example.ariscompanion.R
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -180,9 +184,11 @@ fun ChatScreen(
                     shape = CircleShape,
                     color = Color(0xFF16253A),
                 ) {
-                    Box(contentAlignment = Alignment.Center) {
-                        Text("A", color = accent, fontSize = 21.sp, fontWeight = FontWeight.Bold)
-                    }
+                    Image(
+                        painter = painterResource(R.drawable.ic_launcher_foreground),
+                        contentDescription = "Aris logo",
+                        modifier = Modifier.size(30.dp),
+                    )
                 }
                 Column(modifier = Modifier.weight(1f).padding(start = 11.dp)) {
                     Text("Aris", color = Color(0xFFF3F7F8), fontSize = 17.sp, fontWeight = FontWeight.SemiBold)
@@ -386,6 +392,8 @@ private fun MessageBubble(
 ) {
     val isAris = message.sender == Sender.ARIS
     val bubbleColor = if (isAris) Color(0xFF17162A) else Color(0xFF07384A)
+    var expandedText by remember(message.id) { mutableStateOf(false) }
+    var textOverflows by remember(message.id) { mutableStateOf(false) }
     AnimatedVisibility(
         visible = true,
         enter = fadeIn() + slideInVertically(initialOffsetY = { it / 5 }),
@@ -406,7 +414,20 @@ private fun MessageBubble(
                 shadowElevation = 1.dp,
             ) {
                 Column(
-                    modifier = Modifier.padding(start = 11.dp, end = 10.dp, top = 8.dp, bottom = 6.dp),
+                    modifier = Modifier
+                        .pointerInput(message.id, isAris) {
+                            var inwardDrag = 0f
+                            detectHorizontalDragGestures(
+                                onHorizontalDrag = { change, dragAmount ->
+                                    change.consume()
+                                    inwardDrag += if (isAris) dragAmount else -dragAmount
+                                },
+                                onDragEnd = {
+                                    if (inwardDrag >= 56.dp.toPx()) onReply()
+                                },
+                            )
+                        }
+                        .padding(start = 11.dp, end = 10.dp, top = 8.dp, bottom = 6.dp),
                     verticalArrangement = Arrangement.spacedBy(5.dp),
                 ) {
                     if (isAris) {
@@ -430,10 +451,39 @@ private fun MessageBubble(
                         }
                     }
                     message.text.takeIf(String::isNotBlank)?.let {
-                        Text(it, color = Color(0xFFF0F4F5), fontSize = 15.sp, lineHeight = 21.sp)
+                        CollapsibleMessageText(
+                            text = it,
+                            expanded = expandedText,
+                            onExpandedChange = { expandedText = it },
+                            onOverflowChange = { textOverflows = it },
+                            color = Color(0xFFF0F4F5),
+                            fontSize = 15.sp,
+                            lineHeight = 21.sp,
+                        )
                     }
                     message.transcript?.takeIf(String::isNotBlank)?.let {
-                        Text("Transcript · $it", color = Color(0xFFCAD4D7), fontSize = 13.sp, lineHeight = 18.sp)
+                        CollapsibleMessageText(
+                            text = "Transcript · $it",
+                            expanded = expandedText,
+                            onExpandedChange = { expandedText = it },
+                            onOverflowChange = { textOverflows = it },
+                            color = Color(0xFFCAD4D7),
+                            fontSize = 13.sp,
+                            lineHeight = 18.sp,
+                        )
+                    }
+                    if (textOverflows || expandedText) {
+                        TextButton(
+                            onClick = { expandedText = !expandedText },
+                            contentPadding = PaddingValues(horizontal = 0.dp, vertical = 0.dp),
+                        ) {
+                            Text(
+                                if (expandedText) "Show less" else "Show more",
+                                color = Color(0xFF00F0FF),
+                                fontSize = 12.sp,
+                                fontWeight = FontWeight.Medium,
+                            )
+                        }
                     }
                     message.attachment?.let { AttachmentPreview(it, message.id, 0, state, onEvent) }
                     message.arisAttachments.forEachIndexed { index, attachment ->
