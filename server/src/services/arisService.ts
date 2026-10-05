@@ -4784,12 +4784,6 @@ export class ArisService {
     initialInvocations = initialInvocations.map((invocation) =>
       this.applyRequestSpecificDefaults(invocation, userMessage, sessionId)
     );
-    const executionPlan = this.buildExecutionPlan(userMessage, initialInvocations);
-    if (!approvedAction && initialInvocations.length > 0) {
-      await this.createExecutionPlanTasks(userId, userMessage, initialInvocations);
-      const { goalsStore } = await import("../db/goalsStore");
-      pendingTasks = await goalsStore.getPendingTasks(userId!).catch(() => []);
-    }
     const availableSkills = userId ? await this.skillService.list(userId).catch(() => []) : [];
     if (!approvedAction && this.isMorningBriefRequest(userMessage.toLowerCase())) {
       const morningSkill = availableSkills.find((skill) =>
@@ -4821,6 +4815,12 @@ export class ArisService {
           },
         }];
       }
+    }
+    const executionPlan = this.buildExecutionPlan(userMessage, initialInvocations);
+    if (!approvedAction && initialInvocations.length > 0) {
+      await this.createExecutionPlanTasks(userId, userMessage, initialInvocations);
+      const { goalsStore } = await import("../db/goalsStore");
+      pendingTasks = await goalsStore.getPendingTasks(userId!).catch(() => []);
     }
     const skillContext = availableSkills.length
       ? [
@@ -5117,7 +5117,14 @@ export class ArisService {
       onProgress?.("Thinking...");
       const browserMediaParts = this.extractBrowserMediaParts(toolResults);
       const iterationPrompt = [
-        this.buildMemoryAwareExecutionContext(memories, reusableAnswers, requestRoute, executionPlan, toolResults),
+        this.buildMemoryAwareExecutionContext(
+          memories,
+          reusableAnswers,
+          requestRoute,
+          initialInvocations,
+          executionPlan,
+          toolResults,
+        ),
         prompt,
       ].join("\n\n");
       const modelResponse = await this.gemmaService.requestArisAdvice(
