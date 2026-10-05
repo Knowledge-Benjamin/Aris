@@ -16,6 +16,7 @@ import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.slideInVertically
 import androidx.compose.foundation.Image
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
@@ -38,20 +39,16 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material3.Button
-import androidx.compose.material3.Card
-import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
-import androidx.compose.material3.TextFieldDefaults
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
-import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -118,25 +115,19 @@ fun ChatScreen(
         else pickerError = "Microphone permission is required to record a voice note."
     }
 
-    LaunchedEffect(state.messages.size) {
+    LaunchedEffect(state.messages.size, state.progressMessage) {
         if (state.messages.isNotEmpty()) listState.animateScrollToItem(state.messages.lastIndex)
     }
 
-    Column(
-        modifier = modifier
-            .fillMaxSize()
-            .background(MaterialTheme.colorScheme.background)
-            .padding(12.dp),
-    ) {
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(8.dp),
-        ) {
-            TextButton(onClick = onBack) { Text("Back") }
-            Text("Chat with Aris", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
-        }
+    val chatBackground = Color(0xFF07131B)
+    val arisBubble = Color(0xFF172832)
+    val userBubble = Color(0xFF075E54)
+    val accent = Color(0xFF65E6D0)
+    val inputEnabled = state.inputText.isNotBlank() || state.stagedAttachment != null
 
+    Column(
+        modifier = modifier.fillMaxSize().background(chatBackground),
+    ) {
         if (!state.isAuthenticated) {
             LoginForm(
                 serverUrl = serverUrl,
@@ -147,100 +138,159 @@ fun ChatScreen(
                 onPasswordChanged = { password = it },
                 isLoggingIn = state.isLoggingIn,
                 error = state.loginError,
-                onLogin = {
-                    viewModel.onEvent(ChatUiEvent.Login(serverUrl.trim(), email.trim(), password))
-                },
-                modifier = Modifier.fillMaxWidth().weight(1f),
+                onLogin = { viewModel.onEvent(ChatUiEvent.Login(serverUrl.trim(), email.trim(), password)) },
+                modifier = Modifier.fillMaxSize().padding(20.dp),
             )
         } else {
+            Row(
+                modifier = Modifier.fillMaxWidth().background(Color(0xFF10212A)).padding(horizontal = 8.dp, vertical = 8.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                TextButton(onClick = onBack, contentPadding = PaddingValues(horizontal = 8.dp)) {
+                    Text("‹", color = accent, fontSize = 30.sp, fontWeight = FontWeight.Light)
+                }
+                Surface(
+                    modifier = Modifier.size(42.dp),
+                    shape = CircleShape,
+                    color = Color(0xFF0A4850),
+                ) {
+                    Box(contentAlignment = Alignment.Center) {
+                        Text("A", color = accent, fontSize = 21.sp, fontWeight = FontWeight.Bold)
+                    }
+                }
+                Column(modifier = Modifier.weight(1f).padding(start = 11.dp)) {
+                    Text("Aris", color = Color(0xFFF3F7F8), fontSize = 17.sp, fontWeight = FontWeight.SemiBold)
+                    Text(
+                        "Your private assistant",
+                        color = Color(0xFF9EB1B9),
+                        fontSize = 12.sp,
+                    )
+                }
+                Text("⋮", color = Color(0xFFB8C9CF), fontSize = 24.sp, modifier = Modifier.padding(horizontal = 8.dp))
+            }
+
             LazyColumn(
                 state = listState,
                 modifier = Modifier.fillMaxWidth().weight(1f),
-                verticalArrangement = Arrangement.spacedBy(8.dp),
+                contentPadding = PaddingValues(horizontal = 10.dp, vertical = 14.dp),
+                verticalArrangement = Arrangement.spacedBy(5.dp),
             ) {
-                items(state.messages, key = ChatMessage::id) { message ->
-                    MessageCard(
+                itemsIndexed(state.messages, key = { _, message -> message.id }) { index, message ->
+                    val previous = state.messages.getOrNull(index - 1)
+                    if (previous == null || !isSameLocalDay(previous.timestampMs, message.timestampMs)) {
+                        DateDivider(message.timestampMs)
+                    }
+                    MessageBubble(
                         message = message,
                         state = state,
+                        onReply = { onEvent(ChatUiEvent.ReplyToMessage(message.id)) },
                         onEvent = viewModel::onEvent,
                     )
                 }
                 if (!state.progressMessage.isNullOrBlank()) {
                     item(key = "progress") {
-                        Text(
-                            text = state.progressMessage.orEmpty(),
-                            color = MaterialTheme.colorScheme.secondary,
-                            modifier = Modifier.padding(12.dp),
-                        )
+                        Row(
+                            modifier = Modifier.padding(start = 7.dp, top = 2.dp, bottom = 5.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        ) {
+                            Text("●", color = accent, fontSize = 9.sp)
+                            Text(state.progressMessage.orEmpty(), color = Color(0xFFAFBDC2), fontSize = 13.sp)
+                        }
                     }
                 }
             }
 
-            state.replyingTo?.let { reply ->
-                Row(
-                    modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                ) {
-                    Text(
-                        text = "Replying to: ${reply.text.take(100)}",
-                        modifier = Modifier.weight(1f),
-                        style = MaterialTheme.typography.bodySmall,
-                    )
-                    TextButton(onClick = { viewModel.onEvent(ChatUiEvent.ClearReply) }) { Text("Cancel") }
-                }
-            }
-
-            state.stagedAttachment?.let { attachment ->
-                Row(
-                    modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                ) {
-                    Text(
-                        text = "Attached: ${attachment.fileName} (${attachment.mimeType})",
-                        modifier = Modifier.weight(1f),
-                        style = MaterialTheme.typography.bodySmall,
-                    )
-                    TextButton(onClick = { viewModel.onEvent(ChatUiEvent.ClearStagedAttachment) }) { Text("Remove") }
-                }
-            }
-
-            OutlinedTextField(
-                value = state.inputText,
-                onValueChange = { viewModel.onEvent(ChatUiEvent.UpdateInput(it)) },
-                modifier = Modifier.fillMaxWidth(),
-                placeholder = { Text("Message Aris") },
-                maxLines = 4,
-                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Text),
-            )
-            Row(
-                modifier = Modifier.fillMaxWidth().padding(top = 4.dp),
-                horizontalArrangement = Arrangement.spacedBy(4.dp),
-                verticalAlignment = Alignment.CenterVertically,
+            Column(
+                modifier = Modifier.fillMaxWidth().background(Color(0xFF0D1D25)).padding(horizontal = 9.dp, vertical = 7.dp),
             ) {
-                TextButton(onClick = { filePicker.launch(arrayOf("*/*")) }) { Text("Attach") }
-                if (state.isRecordingVoice) {
-                    TextButton(onClick = { viewModel.onEvent(ChatUiEvent.CancelRecording) }) { Text("Cancel") }
-                    Button(onClick = { viewModel.onEvent(ChatUiEvent.StopRecording) }) { Text("Stop voice") }
-                } else {
-                    TextButton(
-                        onClick = {
-                            if (context.checkSelfPermission(Manifest.permission.RECORD_AUDIO) ==
-                                android.content.pm.PackageManager.PERMISSION_GRANTED
-                            ) {
-                                viewModel.onEvent(ChatUiEvent.StartRecording)
-                            } else {
-                                audioPermission.launch(Manifest.permission.RECORD_AUDIO)
-                            }
-                        },
-                    ) { Text("Voice") }
-                    Button(
-                        onClick = { viewModel.onEvent(ChatUiEvent.SendText(state.inputText)) },
-                        enabled = state.inputText.isNotBlank() || state.stagedAttachment != null,
-                    ) { Text("Send") }
+                state.replyingTo?.let { reply ->
+                    ReplyPreview(
+                        title = if (reply.sender == Sender.ARIS) "Aris" else "You",
+                        content = reply.text.ifBlank { attachmentLabel(reply.attachment) },
+                        accent = accent,
+                        onDismiss = { onEvent(ChatUiEvent.ClearReply) },
+                    )
                 }
-            }
-            pickerError?.let {
-                Text(it, color = MaterialTheme.colorScheme.error, style = MaterialTheme.typography.bodySmall)
+                state.stagedAttachment?.let { attachment ->
+                    ReplyPreview(
+                        title = attachment.fileName,
+                        content = "${attachment.mimeType} · ready to send",
+                        accent = Color(0xFF80D6C5),
+                        onDismiss = { onEvent(ChatUiEvent.ClearStagedAttachment) },
+                    )
+                }
+                if (state.isRecordingVoice) {
+                    RecordingComposer(
+                        durationMs = state.recordingDurationMs,
+                        amplitudes = state.recordingAmplitudes,
+                        onCancel = { onEvent(ChatUiEvent.CancelRecording) },
+                        onSend = { onEvent(ChatUiEvent.StopRecording) },
+                    )
+                } else {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.Bottom,
+                        horizontalArrangement = Arrangement.spacedBy(7.dp),
+                    ) {
+                        IconButton(onClick = { filePicker.launch(arrayOf("*/*")) }, modifier = Modifier.size(46.dp)) {
+                            Text("＋", color = Color(0xFFCBDBDF), fontSize = 30.sp, fontWeight = FontWeight.Light)
+                        }
+                        Surface(
+                            modifier = Modifier.weight(1f),
+                            shape = RoundedCornerShape(25.dp),
+                            color = Color(0xFF1A2C35),
+                        ) {
+                            BasicTextField(
+                                value = state.inputText,
+                                onValueChange = { onEvent(ChatUiEvent.UpdateInput(it)) },
+                                modifier = Modifier.fillMaxWidth().heightIn(min = 46.dp, max = 130.dp).padding(horizontal = 16.dp, vertical = 12.dp),
+                                textStyle = TextStyle(color = Color(0xFFF3F7F8), fontSize = 15.sp),
+                                cursorBrush = Brush.verticalGradient(listOf(accent, accent)),
+                                decorationBox = { innerTextField ->
+                                    Box {
+                                        if (state.inputText.isEmpty()) {
+                                            Text("Message Aris", color = Color(0xFF91A6AE), fontSize = 15.sp)
+                                        }
+                                        innerTextField()
+                                    }
+                                },
+                                keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Text),
+                            )
+                        }
+                        if (inputEnabled) {
+                            IconButton(
+                                onClick = { onEvent(ChatUiEvent.SendText(state.inputText)) },
+                                modifier = Modifier.size(48.dp).background(accent, CircleShape),
+                            ) {
+                                Text("➤", color = Color(0xFF062B2A), fontSize = 21.sp, fontWeight = FontWeight.Bold)
+                            }
+                        } else {
+                            IconButton(
+                                onClick = {
+                                    if (context.checkSelfPermission(Manifest.permission.RECORD_AUDIO) ==
+                                        android.content.pm.PackageManager.PERMISSION_GRANTED
+                                    ) {
+                                        onEvent(ChatUiEvent.StartRecording)
+                                    } else {
+                                        audioPermission.launch(Manifest.permission.RECORD_AUDIO)
+                                    }
+                                },
+                                modifier = Modifier.size(48.dp).background(accent, CircleShape),
+                            ) {
+                                Text("●", color = Color(0xFF062B2A), fontSize = 17.sp)
+                            }
+                        }
+                    }
+                }
+                AnimatedVisibility(visible = pickerError != null) {
+                    Text(
+                        pickerError.orEmpty(),
+                        color = MaterialTheme.colorScheme.error,
+                        style = MaterialTheme.typography.bodySmall,
+                        modifier = Modifier.padding(start = 8.dp, top = 5.dp),
+                    )
+                }
             }
         }
     }
@@ -301,51 +351,221 @@ private fun LoginForm(
 }
 
 @Composable
-private fun MessageCard(
+private fun MessageBubble(
     message: ChatMessage,
     state: ChatUiState,
+    onReply: () -> Unit,
     onEvent: (ChatUiEvent) -> Unit,
 ) {
     val isAris = message.sender == Sender.ARIS
-    Card(
-        modifier = Modifier.fillMaxWidth(),
-        colors = CardDefaults.cardColors(
-            containerColor = if (isAris) MaterialTheme.colorScheme.surfaceVariant else MaterialTheme.colorScheme.primaryContainer,
-        ),
+    val bubbleColor = if (isAris) Color(0xFF172832) else Color(0xFF075E54)
+    AnimatedVisibility(
+        visible = true,
+        enter = fadeIn() + slideInVertically(initialOffsetY = { it / 5 }),
     ) {
-        Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
-            Text(if (isAris) "Aris" else "You", style = MaterialTheme.typography.labelLarge, fontWeight = FontWeight.Bold)
-            message.quotedText?.takeIf(String::isNotBlank)?.let {
-                Text("Replying to: $it", style = MaterialTheme.typography.bodySmall)
-            }
-            message.text.takeIf(String::isNotBlank)?.let { Text(it) }
-            message.transcript?.takeIf(String::isNotBlank)?.let { Text("Transcript: $it") }
-            message.attachment?.let { AttachmentPreview(it, message.id, 0, state, onEvent) }
-            message.arisAttachments.forEachIndexed { index, attachment ->
-                AttachmentPreview(attachment, message.id, index, state, onEvent)
-            }
-            if (message.voiceBase64 != null) {
-                TextButton(onClick = { onEvent(ChatUiEvent.PlayVoice(message.id)) }) {
-                    Text(if (state.playbackKey == message.id) "Stop audio" else "Play audio")
-                }
-            }
-            if (message.status != MessageStatus.SENT) {
-                Text(message.status.name.lowercase(), style = MaterialTheme.typography.labelSmall)
-            }
-            message.pendingAction?.let {
-                Text("Aris is requesting approval for ${it.tool}.")
-                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                    Button(onClick = { onEvent(ChatUiEvent.ApproveAction(message.id)) }) { Text("Approve") }
-                    TextButton(onClick = { onEvent(ChatUiEvent.DenyAction(message.id)) }) {
-                        Text("Deny", color = MaterialTheme.colorScheme.error)
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = if (isAris) Arrangement.Start else Arrangement.End,
+            verticalAlignment = Alignment.Bottom,
+        ) {
+            Surface(
+                modifier = Modifier.fillMaxWidth(0.88f),
+                shape = if (isAris) {
+                    RoundedCornerShape(topStart = 5.dp, topEnd = 17.dp, bottomEnd = 17.dp, bottomStart = 17.dp)
+                } else {
+                    RoundedCornerShape(topStart = 17.dp, topEnd = 5.dp, bottomEnd = 17.dp, bottomStart = 17.dp)
+                },
+                color = bubbleColor,
+                shadowElevation = 1.dp,
+            ) {
+                Column(
+                    modifier = Modifier.padding(start = 11.dp, end = 10.dp, top = 8.dp, bottom = 6.dp),
+                    verticalArrangement = Arrangement.spacedBy(5.dp),
+                ) {
+                    if (isAris) {
+                        Text("ARIS", color = Color(0xFF65E6D0), fontSize = 10.sp, fontWeight = FontWeight.Bold, letterSpacing = 1.1.sp)
+                    }
+                    message.quotedText?.takeIf(String::isNotBlank)?.let {
+                        Surface(
+                            shape = RoundedCornerShape(5.dp),
+                            color = Color.Black.copy(alpha = 0.18f),
+                            modifier = Modifier.fillMaxWidth(),
+                        ) {
+                            Column(Modifier.padding(start = 8.dp, top = 5.dp, bottom = 5.dp, end = 7.dp)) {
+                                Text(
+                                    if (message.quotedSender == Sender.USER) "You" else "Aris",
+                                    color = Color(0xFF76D9C7),
+                                    fontSize = 10.sp,
+                                    fontWeight = FontWeight.SemiBold,
+                                )
+                                Text(it, color = Color(0xFFC5D1D5), fontSize = 12.sp, maxLines = 2, overflow = TextOverflow.Ellipsis)
+                            }
+                        }
+                    }
+                    message.text.takeIf(String::isNotBlank)?.let {
+                        Text(it, color = Color(0xFFF0F4F5), fontSize = 15.sp, lineHeight = 21.sp)
+                    }
+                    message.transcript?.takeIf(String::isNotBlank)?.let {
+                        Text("Transcript · $it", color = Color(0xFFCAD4D7), fontSize = 13.sp, lineHeight = 18.sp)
+                    }
+                    message.attachment?.let { AttachmentPreview(it, message.id, 0, state, onEvent) }
+                    message.arisAttachments.forEachIndexed { index, attachment ->
+                        AttachmentPreview(attachment, message.id, index, state, onEvent)
+                    }
+                    if (message.voiceBase64 != null) {
+                        TextButton(
+                            onClick = { onEvent(ChatUiEvent.PlayVoice(message.id)) },
+                            contentPadding = PaddingValues(horizontal = 4.dp, vertical = 0.dp),
+                        ) {
+                            Text(if (state.playbackKey == message.id) "Ⅱ  Stop voice" else "▶  Play voice", color = Color(0xFF8CE5D6))
+                        }
+                    }
+                    message.pendingAction?.let {
+                        Surface(color = Color.Black.copy(alpha = 0.18f), shape = RoundedCornerShape(10.dp)) {
+                            Column(Modifier.padding(10.dp)) {
+                                Text("Approval requested · ${it.tool}", color = Color(0xFFE8F0F2), fontSize = 13.sp)
+                                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                    TextButton(onClick = { onEvent(ChatUiEvent.ApproveAction(message.id)) }) { Text("Approve") }
+                                    TextButton(onClick = { onEvent(ChatUiEvent.DenyAction(message.id)) }) {
+                                        Text("Decline", color = Color(0xFFFFA3A3))
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Row(
+                        modifier = Modifier.align(Alignment.End),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(5.dp),
+                    ) {
+                        if (message.status == MessageStatus.ERROR) {
+                            Text("Not sent", color = Color(0xFFFFB1A9), fontSize = 10.sp)
+                        } else if (message.status == MessageStatus.SENDING) {
+                            Text("Sending…", color = Color(0xFFB5C5CA), fontSize = 10.sp)
+                        }
+                        Text(formatMessageTime(message.timestampMs), color = Color(0xFFB5C5CA), fontSize = 10.sp)
+                        if (!isAris) {
+                            Text(
+                                if (message.status == MessageStatus.SENT) "✓" else if (message.status == MessageStatus.ERROR) "!" else "◷",
+                                color = if (message.status == MessageStatus.ERROR) Color(0xFFFFB1A9) else Color(0xFF9DD9DB),
+                                fontSize = 12.sp,
+                                fontWeight = FontWeight.Bold,
+                            )
+                        }
+                    }
+                    if (message.status == MessageStatus.ERROR) {
+                        Text("Tap to review this message", color = Color(0xFFFFC5BD), fontSize = 10.sp)
                     }
                 }
             }
-            if (isAris && message.text.isNotBlank()) {
-                TextButton(onClick = { onEvent(ChatUiEvent.ReplyToMessage(message.id)) }) { Text("Reply") }
-            }
+            Text(
+                text = "↩",
+                color = Color(0xFF91A7AE),
+                fontSize = 18.sp,
+                modifier = Modifier
+                    .padding(horizontal = 3.dp, vertical = 5.dp)
+                    .clickable(onClick = onReply)
+                    .padding(4.dp),
+            )
         }
     }
+}
+
+@Composable
+private fun DateDivider(timestampMs: Long) {
+    val today = remember { dayKey(System.currentTimeMillis()) }
+    val yesterday = remember { dayKey(System.currentTimeMillis() - 24L * 60L * 60L * 1000L) }
+    val messageDay = remember(timestampMs) { dayKey(timestampMs) }
+    val formattedDate = remember(timestampMs) {
+        SimpleDateFormat("EEE, MMM d, yyyy", Locale.getDefault()).format(Date(timestampMs)).uppercase(Locale.getDefault())
+    }
+    val label = when (messageDay) {
+        today -> "TODAY"
+        yesterday -> "YESTERDAY"
+        else -> formattedDate
+    }
+    Box(Modifier.fillMaxWidth().padding(vertical = 9.dp), contentAlignment = Alignment.Center) {
+        Surface(shape = RoundedCornerShape(20.dp), color = Color(0xFF1A3038), shadowElevation = 1.dp) {
+            Text(label, modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp), color = Color(0xFFBDD0D4), fontSize = 10.sp, fontWeight = FontWeight.SemiBold, letterSpacing = 0.7.sp)
+        }
+    }
+}
+
+private fun dayKey(timestampMs: Long): String =
+    SimpleDateFormat("yyyyMMdd", Locale.ROOT).format(Date(timestampMs))
+
+private fun isSameLocalDay(first: Long, second: Long): Boolean = dayKey(first) == dayKey(second)
+
+private fun formatMessageTime(timestampMs: Long): String =
+    SimpleDateFormat("h:mm a", Locale.getDefault()).format(Date(timestampMs))
+
+private fun attachmentLabel(attachment: MediaAttachment?): String = when (attachment) {
+    is MediaAttachment.Image -> "Photo"
+    is MediaAttachment.Video -> "Video"
+    is MediaAttachment.Audio -> "Audio"
+    is MediaAttachment.VoiceNote -> "Voice note"
+    is MediaAttachment.Document -> attachment.fileName
+    null -> "Message"
+}
+
+@Composable
+private fun ReplyPreview(title: String, content: String, accent: Color, onDismiss: () -> Unit) {
+    Row(
+        modifier = Modifier.fillMaxWidth().padding(bottom = 7.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Surface(
+            modifier = Modifier.weight(1f),
+            shape = RoundedCornerShape(8.dp),
+            color = Color(0xFF1A2C35),
+        ) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Box(Modifier.width(3.dp).height(42.dp).background(accent))
+                Column(Modifier.weight(1f).padding(horizontal = 9.dp, vertical = 5.dp)) {
+                    Text(title, color = accent, fontWeight = FontWeight.SemiBold, fontSize = 11.sp)
+                    Text(content, color = Color(0xFFC7D4D8), fontSize = 12.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                }
+            }
+        }
+        TextButton(onClick = onDismiss, contentPadding = PaddingValues(horizontal = 8.dp)) {
+            Text("×", color = Color(0xFFB8C7CB), fontSize = 21.sp)
+        }
+    }
+}
+
+@Composable
+private fun RecordingComposer(
+    durationMs: Long,
+    amplitudes: List<Float>,
+    onCancel: () -> Unit,
+    onSend: () -> Unit,
+) {
+    Row(
+        modifier = Modifier.fillMaxWidth().heightIn(min = 54.dp).padding(horizontal = 4.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(10.dp),
+    ) {
+        Text("×", color = Color(0xFFFF8888), fontSize = 26.sp, modifier = Modifier.clickable(onClick = onCancel).padding(horizontal = 7.dp))
+        Text("●", color = Color(0xFFFF6868), fontSize = 12.sp)
+        Text(formatRecordingDuration(durationMs), color = Color(0xFFE8F0F2), fontSize = 13.sp, fontWeight = FontWeight.Medium)
+        Canvas(Modifier.weight(1f).height(30.dp)) {
+            val sampleCount = amplitudes.size.coerceAtLeast(1)
+            val step = size.width / sampleCount
+            amplitudes.forEachIndexed { index, sample ->
+                val barHeight = (4.dp.toPx() + sample.coerceIn(0f, 1f) * size.height * 0.8f).coerceAtMost(size.height)
+                val x = step * (index + 0.5f)
+                drawLine(Color(0xFF65E6D0), Offset(x, (size.height - barHeight) / 2), Offset(x, (size.height + barHeight) / 2), 2.dp.toPx(), cap = androidx.compose.ui.graphics.StrokeCap.Round)
+            }
+        }
+        IconButton(onClick = onSend, modifier = Modifier.size(46.dp).background(Color(0xFF65E6D0), CircleShape)) {
+            Text("➤", color = Color(0xFF062B2A), fontSize = 20.sp, fontWeight = FontWeight.Bold)
+        }
+    }
+}
+
+private fun formatRecordingDuration(durationMs: Long): String {
+    val totalSeconds = (durationMs / 1000).coerceAtLeast(0)
+    return "%d:%02d".format(Locale.ROOT, totalSeconds / 60, totalSeconds % 60)
 }
 
 @Composable
