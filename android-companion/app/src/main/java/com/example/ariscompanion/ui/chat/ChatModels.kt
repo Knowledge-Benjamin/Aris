@@ -82,7 +82,8 @@ data class ChatMessage(
 
 fun ChatMessage.replySummary(): String {
     val media = listOfNotNull(attachment) + arisAttachments
-    val attachmentSummary = media.take(3).joinToString("\n") { it.replyAttachmentSummary() }.ifBlank { null }
+    val attachmentSummary = media.take(3).joinToString("\n") { it.replyAttachmentSummary() }
+        .takeIf(String::isNotBlank)
     return listOfNotNull(
         text.takeIf(String::isNotBlank),
         transcript?.takeIf(String::isNotBlank)?.let { "Transcript: $it" },
