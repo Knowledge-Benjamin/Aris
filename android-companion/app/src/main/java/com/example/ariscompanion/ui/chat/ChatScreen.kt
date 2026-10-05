@@ -49,6 +49,7 @@ import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
+import androidx.compose.material3.Slider
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
@@ -944,11 +945,36 @@ private fun AudioAttachmentButton(
     onEvent: (ChatUiEvent) -> Unit,
 ) {
     val playbackKey = if (index < 0) messageId else "${messageId}_att_$index"
-    TextButton(onClick = { onEvent(ChatUiEvent.PlayAttachment(messageId, index)) }) {
-        Text(
-            if (state.playbackKey == playbackKey) "Stop audio (${attachment.mimeType})"
-            else "Play audio (${attachment.mimeType})"
-        )
+    val isPlaying = state.playbackKey == playbackKey
+    Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            TextButton(onClick = { onEvent(ChatUiEvent.PlayAttachment(messageId, index)) }) {
+                Text(
+                    if (isPlaying) "Ⅱ  Stop audio" else "▶  Play audio",
+                    color = Color(0xFF00D8E8),
+                )
+            }
+            Text(attachment.fileName, color = Color(0xFFC5D1D5), fontSize = 12.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+        }
+        if (isPlaying && state.playbackDurationMs > 0L) {
+            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(5.dp)) {
+                Text(formatRecordingDuration(state.playbackPositionMs), color = Color(0xFF9DAAC2), fontSize = 10.sp)
+                Slider(
+                    value = (state.playbackPositionMs.toFloat() / state.playbackDurationMs).coerceIn(0f, 1f),
+                    onValueChange = { fraction ->
+                        onEvent(
+                            ChatUiEvent.SeekAudio(
+                                messageId,
+                                index,
+                                (fraction * state.playbackDurationMs).toLong(),
+                            )
+                        )
+                    },
+                    modifier = Modifier.weight(1f),
+                )
+                Text(formatRecordingDuration(state.playbackDurationMs), color = Color(0xFF9DAAC2), fontSize = 10.sp)
+            }
+        }
     }
 }
 
