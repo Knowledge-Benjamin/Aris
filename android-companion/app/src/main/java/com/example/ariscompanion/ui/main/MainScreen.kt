@@ -113,16 +113,16 @@ fun MainScreen(
         animationSpec = infiniteRepeatable(tween(7000, easing = LinearEasing)),
         label = "avatarCycle",
     )
-    val typingProgress by infiniteTransition.animateInt(
-        initialValue = 0,
-        targetValue = 4,
+    val typingProgress by infiniteTransition.animateFloat(
+        initialValue = 0f,
+        targetValue = 4f,
         animationSpec = infiniteRepeatable(
             animation = keyframes {
                 durationMillis = 4600
-                0 at 0
-                4 at 1400
-                4 at 3200
-                0 at 4600
+                0f at 0
+                4f at 1400
+                4f at 3200
+                0f at 4600
             },
             repeatMode = RepeatMode.Restart,
         ),
@@ -198,7 +198,7 @@ fun MainScreen(
                 Spacer(Modifier.height(8.dp))
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Text(
-                        text = "ARIS".take(typingProgress),
+                        text = "ARIS".take(typingProgress.toInt().coerceIn(0, 4)),
                         color = Color(0xFFE5FBFF),
                         fontFamily = FontFamily.Monospace,
                         fontWeight = FontWeight.Black,
