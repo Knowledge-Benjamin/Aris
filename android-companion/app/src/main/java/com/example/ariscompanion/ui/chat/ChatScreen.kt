@@ -67,6 +67,9 @@ import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.TextStyle
+import androidx.compose.ui.text.AnnotatedString
+import androidx.compose.ui.text.SpanStyle
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
@@ -452,7 +455,7 @@ private fun MessageBubble(
                             }
                         }
                         message.text.takeIf(String::isNotBlank)?.let {
-                            CollapsibleMessageText(
+                            MarkdownMessageText(
                                 text = it,
                                 color = Color(0xFFF0F4F5),
                                 fontSize = 15.sp,
@@ -585,6 +588,177 @@ private fun CollapsibleMessageText(
                 fontWeight = FontWeight.Medium,
             )
         }
+    }
+}
+
+@Composable
+private fun MarkdownMessageText(
+    text: String,
+    color: Color,
+    fontSize: androidx.compose.ui.unit.TextUnit,
+    lineHeight: androidx.compose.ui.unit.TextUnit,
+) {
+    var expanded by remember(text) { mutableStateOf(false) }
+    var hasOverflow by remember(text) { mutableStateOf(false) }
+    val markdown = remember(text, color, fontSize) { parseChatMarkdown(text, color, fontSize) }
+    Text(
+        text = markdown,
+        color = color,
+        fontSize = fontSize,
+        lineHeight = lineHeight,
+        maxLines = if (expanded) Int.MAX_VALUE else 8,
+        overflow = TextOverflow.Ellipsis,
+        onTextLayout = { result ->
+            if (!expanded) hasOverflow = result.hasVisualOverflow
+        },
+    )
+    if (hasOverflow || expanded) {
+        TextButton(
+            onClick = { expanded = !expanded },
+            contentPadding = PaddingValues(horizontal = 0.dp, vertical = 0.dp),
+        ) {
+            Text(
+                if (expanded) "Show less" else "Show more",
+                color = Color(0xFF00F0FF),
+                fontSize = 12.sp,
+                fontWeight = FontWeight.Medium,
+            )
+        }
+    }
+}
+
+private fun parseChatMarkdown(
+    markdown: String,
+    textColor: Color,
+    fontSize: androidx.compose.ui.unit.TextUnit,
+): AnnotatedString {
+    val result = AnnotatedString.Builder()
+    var inCodeBlock = false
+    markdown.replace("\r\n", "\n").split('\n').forEachIndexed { index, sourceLine ->
+        if (index > 0) result.append('\n')
+        val line = sourceLine.trimStart()
+        if (line.startsWith("```")) {
+            inCodeBlock = !inCodeBlock
+            return@forEachIndexed
+        }
+        if (inCodeBlock) {
+            result.pushStyle(
+                SpanStyle(
+                    color = Color(0xFF9FEAFF),
+                    background = Color(0xFF101322),
+                    fontFamily = FontFamily.Monospace,
+                )
+            )
+            result.append(sourceLine)
+            result.pop()
+            return@forEachIndexed
+        }
+
+        val heading = Regex("^(#{1,6})\\s+(.+)$").matchEntire(line)
+        val quote = Regex("^>\\s?(.*)$").matchEntire(line)
+        val unorderedList = Regex("^[-*+]\\s+(.+)$").matchEntire(line)
+        val orderedList = Regex("^(\\d+[.)])\\s+(.+)$").matchEntire(line)
+        when {
+            heading != null -> {
+                result.pushStyle(
+                    SpanStyle(
+                        color = textColor,
+                        fontWeight = FontWeight.Bold,
+                        fontSize = fontSize * if (heading.groupValues[1].length <= 2) 1.12f else 1f,
+                    )
+                )
+                appendInlineMarkdown(result, heading.groupValues[2])
+                result.pop()
+            }
+            quote != null -> {
+                result.pushStyle(SpanStyle(color = Color(0xFF00D8E8), fontWeight = FontWeight.Medium))
+                result.append("│ ")
+                appendInlineMarkdown(result, quote.groupValues[1])
+                result.pop()
+            }
+            unorderedList != null -> {
+                result.append("• ")
+                appendInlineMarkdown(result, unorderedList.groupValues[1])
+            }
+            orderedList != null -> {
+                result.append("${orderedList.groupValues[1]} ")
+                appendInlineMarkdown(result, orderedList.groupValues[2])
+            }
+            line.matches(Regex("^(\\*\\s*){3,}$|^(-\\s*){3,}$|^(_\\s*){3,}$")) -> {
+                result.pushStyle(SpanStyle(color = Color(0xFF51617A)))
+                result.append("────────────────────")
+                result.pop()
+            }
+            line.startsWith("|") && line.endsWith("|") &&
+                line.removePrefix("|").removeSuffix("|").replace("|", "").all { it == '-' || it == ':' || it.isWhitespace() } -> Unit
+            line.startsWith("|") && line.endsWith("|") -> {
+                appendInlineMarkdown(result, line.removePrefix("|").removeSuffix("|").replace("|", "  │  "))
+            }
+            else -> appendInlineMarkdown(result, sourceLine)
+        }
+    }
+    return result.toAnnotatedString()
+}
+
+private fun appendInlineMarkdown(builder: AnnotatedString.Builder, text: String) {
+    val linkPattern = Regex("\\[([^\\]]+)]\\((https?://[^\\s)]+)\\)")
+    val emphasis = listOf(
+        "**" to SpanStyle(fontWeight = FontWeight.Bold),
+        "__" to SpanStyle(fontWeight = FontWeight.Bold),
+        "~~" to SpanStyle(textDecoration = androidx.compose.ui.text.style.TextDecoration.LineThrough),
+        "*" to SpanStyle(fontStyle = androidx.compose.ui.text.font.FontStyle.Italic),
+        "_" to SpanStyle(fontStyle = androidx.compose.ui.text.font.FontStyle.Italic),
+    )
+    var index = 0
+    while (index < text.length) {
+        val link = linkPattern.find(text, index)?.takeIf { it.range.first == index }
+        if (link != null) {
+            builder.pushStringAnnotation("URL", link.groupValues[2])
+            builder.pushStyle(
+                SpanStyle(
+                    color = Color(0xFF00D8E8),
+                    textDecoration = androidx.compose.ui.text.style.TextDecoration.Underline,
+                )
+            )
+            builder.append(link.groupValues[1])
+            builder.pop()
+            builder.pop()
+            index = link.range.last + 1
+            continue
+        }
+
+        if (text[index] == '`') {
+            val end = text.indexOf('`', index + 1)
+            if (end > index + 1) {
+                builder.pushStyle(
+                    SpanStyle(
+                        color = Color(0xFF9FEAFF),
+                        background = Color(0xFF101322),
+                        fontFamily = FontFamily.Monospace,
+                    )
+                )
+                builder.append(text.substring(index + 1, end))
+                builder.pop()
+                index = end + 1
+                continue
+            }
+        }
+
+        val marker = emphasis.firstOrNull { (delimiter, _) -> text.startsWith(delimiter, index) }
+        if (marker != null) {
+            val (delimiter, style) = marker
+            val end = text.indexOf(delimiter, index + delimiter.length)
+            if (end > index + delimiter.length) {
+                builder.pushStyle(style)
+                appendInlineMarkdown(builder, text.substring(index + delimiter.length, end))
+                builder.pop()
+                index = end + delimiter.length
+                continue
+            }
+        }
+
+        builder.append(text[index])
+        index++
     }
 }
 
