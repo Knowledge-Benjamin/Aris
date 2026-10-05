@@ -17,5 +17,6 @@ dist/
 .meeting-profile/
 .research-browser-profile/
 **/build/
+**/.kotlin/
 *.log
 /Recovered data*/
