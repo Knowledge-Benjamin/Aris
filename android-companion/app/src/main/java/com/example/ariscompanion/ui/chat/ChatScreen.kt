@@ -385,7 +385,7 @@ private fun MessageBubble(
     onEvent: (ChatUiEvent) -> Unit,
 ) {
     val isAris = message.sender == Sender.ARIS
-    val bubbleColor = if (isAris) Color(0xFF172832) else Color(0xFF075E54)
+    val bubbleColor = if (isAris) Color(0xFF17162A) else Color(0xFF07384A)
     AnimatedVisibility(
         visible = true,
         enter = fadeIn() + slideInVertically(initialOffsetY = { it / 5 }),
@@ -410,7 +410,7 @@ private fun MessageBubble(
                     verticalArrangement = Arrangement.spacedBy(5.dp),
                 ) {
                     if (isAris) {
-                        Text("ARIS", color = Color(0xFF65E6D0), fontSize = 10.sp, fontWeight = FontWeight.Bold, letterSpacing = 1.1.sp)
+                        Text("ARIS", color = Color(0xFF00F0FF), fontSize = 10.sp, fontWeight = FontWeight.Bold, letterSpacing = 1.1.sp)
                     }
                     message.quotedText?.takeIf(String::isNotBlank)?.let {
                         Surface(
@@ -421,7 +421,7 @@ private fun MessageBubble(
                             Column(Modifier.padding(start = 8.dp, top = 5.dp, bottom = 5.dp, end = 7.dp)) {
                                 Text(
                                     if (message.quotedSender == Sender.USER) "You" else "Aris",
-                                    color = Color(0xFF76D9C7),
+                                    color = Color(0xFF00D8E8),
                                     fontSize = 10.sp,
                                     fontWeight = FontWeight.SemiBold,
                                 )
@@ -444,7 +444,7 @@ private fun MessageBubble(
                             onClick = { onEvent(ChatUiEvent.PlayVoice(message.id)) },
                             contentPadding = PaddingValues(horizontal = 4.dp, vertical = 0.dp),
                         ) {
-                            Text(if (state.playbackKey == message.id) "Ⅱ  Stop voice" else "▶  Play voice", color = Color(0xFF8CE5D6))
+                            Text(if (state.playbackKey == message.id) "Ⅱ  Stop voice" else "▶  Play voice", color = Color(0xFF00D8E8))
                         }
                     }
                     message.pendingAction?.let {
@@ -474,7 +474,7 @@ private fun MessageBubble(
                         if (!isAris) {
                             Text(
                                 if (message.status == MessageStatus.SENT) "✓" else if (message.status == MessageStatus.ERROR) "!" else "◷",
-                                color = if (message.status == MessageStatus.ERROR) Color(0xFFFFB1A9) else Color(0xFF9DD9DB),
+                                color = if (message.status == MessageStatus.ERROR) Color(0xFFFFB1A9) else Color(0xFF00D8E8),
                                 fontSize = 12.sp,
                                 fontWeight = FontWeight.Bold,
                             )
@@ -484,7 +484,7 @@ private fun MessageBubble(
             }
             Text(
                 text = "Reply",
-                color = Color(0xFF91A7AE),
+                color = Color(0xFF9DAAC2),
                 fontSize = 10.sp,
                 modifier = Modifier
                     .padding(horizontal = 2.dp, vertical = 5.dp)
@@ -541,7 +541,7 @@ private fun ReplyPreview(title: String, content: String, accent: Color, onDismis
         Surface(
             modifier = Modifier.weight(1f),
             shape = RoundedCornerShape(8.dp),
-            color = Color(0xFF1A2C35),
+            color = Color(0xFF17182A),
         ) {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Box(Modifier.width(3.dp).height(42.dp).background(accent))
@@ -578,10 +578,10 @@ private fun RecordingComposer(
             amplitudes.forEachIndexed { index, sample ->
                 val barHeight = (4.dp.toPx() + sample.coerceIn(0f, 1f) * size.height * 0.8f).coerceAtMost(size.height)
                 val x = step * (index + 0.5f)
-                drawLine(Color(0xFF65E6D0), Offset(x, (size.height - barHeight) / 2), Offset(x, (size.height + barHeight) / 2), 2.dp.toPx(), cap = androidx.compose.ui.graphics.StrokeCap.Round)
+                drawLine(Color(0xFF00F0FF), Offset(x, (size.height - barHeight) / 2), Offset(x, (size.height + barHeight) / 2), 2.dp.toPx(), cap = androidx.compose.ui.graphics.StrokeCap.Round)
             }
         }
-        IconButton(onClick = onSend, modifier = Modifier.size(46.dp).background(Color(0xFF65E6D0), CircleShape)) {
+        IconButton(onClick = onSend, modifier = Modifier.size(46.dp).background(Color(0xFF00F0FF), CircleShape)) {
             Text("➤", color = Color(0xFF062B2A), fontSize = 20.sp, fontWeight = FontWeight.Bold)
         }
     }
