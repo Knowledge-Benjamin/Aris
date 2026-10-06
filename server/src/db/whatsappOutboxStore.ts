@@ -18,6 +18,13 @@ export interface OutboxMessage {
   sentAt?: Date;
 }
 
+export interface AppOutboxPackageItem {
+  messageType: OutboxMessageType;
+  body?: string;
+  mediaGcsUri?: string;
+  mediaMimeType?: string;
+}
+
 export const whatsappOutboxStore = {
   async enqueue(
     toJid: string,
@@ -35,6 +42,41 @@ export const whatsappOutboxStore = {
         quotedMessage === undefined ? null : JSON.stringify(quotedMessage)]
     );
     return mapRow(res.rows[0]);
+  },
+
+  async enqueueAppPackage(
+    userId: number,
+    items: AppOutboxPackageItem[],
+    quotedMessage?: unknown
+  ): Promise<OutboxMessage[]> {
+    if (!items.length) throw new Error("An app delivery package must contain at least one item.");
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      const rows: OutboxMessage[] = [];
+      for (const item of items) {
+        const result = await client.query(
+          `INSERT INTO whatsapp_outbox (user_id, to_jid, message_type, body, media_gcs_uri, media_mime_type, quoted_message, status)
+           VALUES ($1, 'app', $2, $3, $4, $5, $6, 'pending') RETURNING *`,
+          [
+            userId,
+            item.messageType,
+            item.body ?? null,
+            item.mediaGcsUri ?? null,
+            item.mediaMimeType ?? null,
+            quotedMessage === undefined ? null : JSON.stringify(quotedMessage),
+          ]
+        );
+        rows.push(mapRow(result.rows[0]));
+      }
+      await client.query("COMMIT");
+      return rows;
+    } catch (error) {
+      await client.query("ROLLBACK");
+      throw error;
+    } finally {
+      client.release();
+    }
   },
 
   async getAllForUser(userId: number): Promise<OutboxMessage[]> {
