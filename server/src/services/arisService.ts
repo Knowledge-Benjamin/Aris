@@ -533,11 +533,32 @@ export class ArisService {
     return /\b(?:refresh|update(?:\s+(?:your|the|my)\s+memory)?|recheck|check again|verify again|look up again|search (?:the )?web again|latest|newest|current(?:ly)?|right now|today|this week|stale|outdated|out of date|no longer accurate|no longer|has changed|have changed|changed since|different now|still accurate|still correct|what changed|as of today)\b/i.test(message);
   }
 
+  private isFailureReply(reply: string): boolean {
+    return /\b(?:couldn['’]?t|could not|unable to|failed to|failure to)\b.{0,120}\b(?:complete|prepare|send|deliver|retrieve|process|generate|produce|finish|resend|queue|save)\b|\b(?:delivery|request|task|operation|attempt)\s+(?:has\s+)?failed\b|\b(?:hit|reached) my processing limit\b|\bplease try again shortly\b/i.test(reply);
+  }
+
+  private isFailureMemoryEntry(memory: string): boolean {
+    try {
+      const parsed = JSON.parse(memory) as { statement?: unknown };
+      if (typeof parsed.statement === "string") {
+        return this.isFailureReply(parsed.statement);
+      }
+    } catch {
+      // Older memory rows may not be JSON.
+    }
+    return this.isFailureReply(memory);
+  }
+
   private getLastAssistantReply(conversationHistory: string[]): string | undefined {
-    return [...conversationHistory].reverse()
-      .find((item) => item.startsWith("Aris:"))
-      ?.slice("Aris:".length)
-      .trim();
+    const latestReply = [...conversationHistory].reverse().find((item) => item.startsWith("Aris:"));
+    if (!latestReply) return undefined;
+    const reply = latestReply.slice("Aris:".length).trim();
+    return this.isFailureReply(reply) ? undefined : reply;
+  }
+
+  private isAwaitingApproval(conversationHistory: string[]): boolean {
+    const latestReply = [...conversationversationHistory].reverse().find((item) => item.startsWith("Aris:"));
+    return Boolean(latestReply && /\b(?:approve|approval|confirm|would you like me to|shall i|should i)\b/i.test(latestReply));
   }
 
   private async recordRecentGmailMessages(userId: number | undefined, sessionId: string | undefined, messages: Array<{ id: string; subject: string; from: string; date?: string }>) {
