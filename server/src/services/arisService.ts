@@ -2920,16 +2920,21 @@ export class ArisService {
         const audioText = String(invocation.payload?.audioText || message).trim();
         if (!message || !audioText) return { success: false, tool: toolName, error: "Morning brief text and audio text are required." };
 
-        // App delivery (original path)
-        const textResult = await this.executeToolCall(userId, {
-          tool: "app_send_message",
-          payload: { message },
-        }, sessionId, replyToWhatsappMessage);
-        if (!textResult.success) return { success: false, tool: toolName, error: textResult.error };
+        const podcastEpisodes = Array.isArray(invocation.payload?.podcastEpisodes)
+          ? invocation.payload.podcastEpisodes
+          : [];
+        const validPodcastEpisodes = podcastEpisodes.filter((episode: any) =>
+          typeof episode?.storageUri === "string"
+          && episode.storageUri.startsWith("drive:")
+          && typeof episode?.mimeType === "string"
+        );
+        if (validPodcastEpisodes.length !== podcastEpisodes.length || validPodcastEpisodes.length === 0) {
+          return { success: false, tool: toolName, error: "The morning brief must include archived podcast episodes with Google Drive references." };
+        }
 
         const audioResult = await this.executeToolCall(userId, {
           tool: "audio_generate",
-          payload: { destination: "app", text: audioText, requestText: "morning brief" },
+          payload: { destination: "download", text: audioText, requestText: "morning brief" },
         }, sessionId, replyToWhatsappMessage);
         if (!audioResult.success) return { success: false, tool: toolName, error: audioResult.error };
 
@@ -2941,43 +2946,37 @@ export class ArisService {
         if (!audioAttachments.length) {
           return { success: false, tool: toolName, error: "Generated brief audio was not archived with a reusable Google Drive reference." };
         }
-        const queuedAudioAssets: Array<{
-          storageUri: string;
-          mimeType: string;
-          title: string;
-          mediaLibraryId?: number;
-        }> = [];
-        for (const asset of audioAttachments) {
-          const queuedAudio = await this.executeToolCall(userId, {
-            tool: "app_send_audio",
-            payload: { driveRef: asset.storageUri, mimeType: asset.mimeType },
-          }, sessionId, replyToWhatsappMessage);
-          if (!queuedAudio.success) return { success: false, tool: toolName, error: queuedAudio.error };
-          queuedAudioAssets.push({
-            storageUri: asset.storageUri,
-            mimeType: asset.mimeType || "audio/mpeg",
-            title: asset.fileName || "Morning brief audio",
-            ...(typeof asset.libraryId === "number" ? { mediaLibraryId: asset.libraryId } : {}),
-          });
-        }
+        const audioAssets = audioAttachments.map((asset: any) => ({
+          storageUri: String(asset.storageUri),
+          mimeType: asset.mimeType || "audio/mpeg",
+          title: asset.fileName || "Morning brief audio",
+          ...(typeof asset.libraryId === "number" ? { mediaLibraryId: asset.libraryId } : {}),
+        }));
+        const queuedAudioAssets = audioAssets.map(({ storageUri, mimeType, title, mediaLibraryId }) => ({
+          storageUri,
+          mimeType,
+          title,
+          ...(mediaLibraryId === undefined ? {} : { mediaLibraryId }),
+        }));
 
-        const podcastEpisodes = Array.isArray(invocation.payload?.podcastEpisodes)
-          ? invocation.payload.podcastEpisodes
-          : [];
-        const validPodcastEpisodes = podcastEpisodes.filter((episode: any) =>
-          typeof episode?.storageUri === "string" && episode.storageUri.startsWith("drive:")
+        const { whatsappOutboxStore } = await import("../db/whatsappOutboxStore");
+        const queuedItems = await whatsappOutboxStore.enqueueAppPackage(
+          userId,
+          [
+            { messageType: "text", body: message },
+            ...audioAssets.map((asset) => ({
+              messageType: "audio" as const,
+              mediaGcsUri: asset.storageUri,
+              mediaMimeType: asset.mimeType,
+            })),
+            ...validPodcastEpisodes.map((episode: any) => ({
+              messageType: "audio" as const,
+              mediaGcsUri: episode.storageUri,
+              mediaMimeType: episode.mimeType,
+            })),
+          ],
+          replyToWhatsappMessage,
         );
-        if (validPodcastEpisodes.length !== podcastEpisodes.length || validPodcastEpisodes.length === 0) {
-          return { success: false, tool: toolName, error: "The morning brief must include archived podcast episodes with Google Drive references." };
-        }
-        let podcastResult: ToolExecutionResult | undefined;
-        if (validPodcastEpisodes.length) {
-          podcastResult = await this.executeToolCall(userId, {
-            tool: "app_send_audio_batch",
-            payload: { episodes: validPodcastEpisodes },
-          }, sessionId, replyToWhatsappMessage);
-          if (!podcastResult.success) return { success: false, tool: toolName, error: podcastResult.error };
-        }
 
         let cacheSaved = true;
         try {
@@ -3001,10 +3000,10 @@ export class ArisService {
               ? "Complete morning brief queued and saved for reuse: text, matching audio, and podcast episodes."
               : "Complete morning brief queued, but the reusable package could not be saved.",
             cacheSaved,
-            text: textResult.data,
             audio: audioResult.data,
-            audioOutboxIds: queuedAudioAssets.map((asset: any) => asset.storageUri),
-            podcasts: podcastResult?.data,
+            outboxIds: queuedItems.map((item) => item.id),
+            audioOutboxIds: queuedItems.slice(1, 1 + audioAssets.length).map((item) => item.id),
+            podcastOutboxIds: queuedItems.slice(1 + audioAssets.length).map((item) => item.id),
           },
         };
       } catch (err: any) {
@@ -3389,7 +3388,7 @@ export class ArisService {
         }
         const isAppSession = sessionId?.startsWith("aris-android") || sessionId === "aris-android-chat";
         const encoding = (destination === "whatsapp") ? "OGG_OPUS" : "MP3";
-        const speechChunks = destination === "whatsapp" || destination === "app"
+        const speechChunks = destination === "whatsapp" || destination === "app" || destination === "download"
           ? this.splitTextForSynthesis(text)
           : [text];
         if (destination === "email" && text.length > 11000) {

@@ -91,7 +91,7 @@ export const whatsappOutboxStore = {
     const res = await pool.query(
       `SELECT * FROM whatsapp_outbox
        WHERE user_id = $1 AND to_jid = 'app' AND status = 'pending'
-       ORDER BY created_at ASC
+       ORDER BY created_at ASC, id ASC
        LIMIT $2`,
       [userId, Math.max(1, Math.min(limit, 100))]
     );
@@ -118,7 +118,7 @@ export const whatsappOutboxStore = {
 
   async getPending(limit = 20): Promise<OutboxMessage[]> {
     const res = await pool.query(
-      `SELECT * FROM whatsapp_outbox WHERE status = 'pending' ORDER BY created_at ASC LIMIT $1`,
+      `SELECT * FROM whatsapp_outbox WHERE status = 'pending' ORDER BY created_at ASC, id ASC LIMIT $1`,
       [limit]
     );
     return res.rows.map(mapRow);

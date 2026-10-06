@@ -4,6 +4,10 @@ import { info, error } from "../utils/logger";
 const ttsUrl = process.env.VOICE_TTS_URL || "https://bravadoben-cc-proxy.hf.space/v1/text:synthesize";
 const ttsVoiceName = process.env.VOICE_TTS_VOICE || "af_heart";
 const ttsAudioEncoding = process.env.VOICE_TTS_AUDIO_ENCODING || "MP3";
+const configuredTimeout = Number(process.env.VOICE_TTS_TIMEOUT_MS);
+const ttsTimeoutMs = Number.isFinite(configuredTimeout) && configuredTimeout > 0
+  ? configuredTimeout
+  : 120_000;
 
 function audioEncodingToMimeType(encoding: string): string {
   switch (encoding.toUpperCase()) {
@@ -39,7 +43,7 @@ export class VoiceService {
       info(`[voice] synthesizing speech with voice=${ttsVoiceName} audioEncoding=${encoding}`);
       const response = await axios.post(ttsUrl, requestBody, {
         headers: { "Content-Type": "application/json" },
-        timeout: 30000,
+        timeout: ttsTimeoutMs,
       });
 
       const audioContent = response.data?.audioContent;
