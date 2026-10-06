@@ -171,6 +171,24 @@ export class ArisService {
     return chunks;
   }
 
+  private splitTextWithoutLoss(text: string, maxChars: number): string[] {
+    const chunks: string[] = [];
+    let offset = 0;
+    while (offset < text.length) {
+      let end = Math.min(offset + maxChars, text.length);
+      if (end < text.length) {
+        const paragraphBreak = text.lastIndexOf("\n", end);
+        const wordBreak = text.lastIndexOf(" ", end);
+        const boundary = Math.max(paragraphBreak, wordBreak);
+        if (boundary > offset + maxChars * 0.5) end = boundary;
+      }
+      if (end <= offset) end = Math.min(offset + maxChars, text.length);
+      chunks.push(text.slice(offset, end));
+      offset = end;
+    }
+    return chunks;
+  }
+
   private extractBrowserMediaParts(toolResults: Array<{ invocation: ToolInvocation; result: ToolExecutionResult }>) {
     const parts: Array<{ inlineData: { mimeType: string; data: string } }> = [];
     for (const entry of toolResults) {
@@ -5077,41 +5095,49 @@ export class ArisService {
             memoryEntries: [],
           };
         }
-        const podcastContext = podcastEpisodes.map((episode: any) =>
-          `- ${episode.title || "Untitled episode"}${episode.feedName ? ` (${episode.feedName})` : ""}${episode.publishedAt ? `, published ${episode.publishedAt}` : ""}${episode.analysis ? `: ${String(episode.analysis).slice(0, 500)}` : ""}`
-        );
-        const sourceLines = toolResults.map((entry) => {
-          const source = JSON.stringify(entry.result.data ?? {});
-          return `SOURCE ${entry.invocation.tool}: ${source}`;
-        });
-        const briefPrompt = [
-          "Compose the complete morning brief from the supplied tool results.",
-          "Return only valid JSON with exactly these string fields: message and audioText.",
-          "message is the complete readable brief for the user's Aris app.",
-          "audioText is the same complete brief rewritten naturally for speech.",
-          "Include a concise 'Podcasts for today' section in message naming every attached episode and giving a factual one-sentence summary when provided. audioText should introduce the included podcast episodes briefly; their original audio files are delivered separately.",
-          "Do not mention tools, prompts, reasoning, missing context, or uncertainty.",
-          "Do not shorten, summarize away, or impose a word or duration limit.",
-          `User request: ${userMessage}`,
-          "PODCAST EPISODES ATTACHED SEPARATELY:",
-          ...podcastContext,
-          ...sourceLines,
-        ].join("\n");
-        let briefResponse = await this.gemmaService.requestArisAdvice(briefPrompt);
-        let brief = this.extractJsonObject(briefResponse.reply) as { message?: string; audioText?: string } | undefined;
-        if (!brief?.message?.trim() || !brief.audioText?.trim()) {
-          const retryPrompt = [
-            "Create a complete morning brief from these compact source notes.",
-            "Return ONLY valid JSON: {\"message\":\"...\",\"audioText\":\"...\"}.",
-            "Use the same facts in both fields. Include a concise Podcasts for today section naming every attached episode; the original audio files will be delivered separately.",
-            "PODCAST EPISODES ATTACHED SEPARATELY:",
-            ...podcastContext,
-            ...sourceLines,
-          ].join("\n");
-          briefResponse = await this.gemmaService.requestArisAdvice(retryPrompt);
-          brief = this.extractJsonObject(briefResponse.reply) as { message?: string; audioText?: string } | undefined;
+        const briefSections: string[] = [];
+        for (const entry of toolResults) {
+          if (entry.invocation.tool === "fetch_news_podcast") continue;
+          const source = JSON.stringify(entry.result.data ?? {}, null, 2);
+          if (!source || source === "{}") continue;
+          const sourceChunks = this.splitTextWithoutLoss(source, 6000);
+          const sectionParts: string[] = [];
+          for (let index = 0; index < sourceChunks.length; index += 1) {
+            onProgress?.(`Composing ${entry.invocation.tool.replace(/_/g, " ")} brief section (${index + 1}/${sourceChunks.length})...`);
+            const sectionPrompt = [
+              "Write a complete, readable morning-brief section from this source fragment.",
+              "Return plain text with Markdown bullets; do not return JSON.",
+              "Preserve the important specific facts, names, dates, times, amounts, and actionable details present in this fragment.",
+              "Do not invent facts. Do not add an introduction or conclusion. This may be one of several consecutive fragments from the same source.",
+              `Source: ${entry.invocation.tool}`,
+              `Fragment ${index + 1} of ${sourceChunks.length}:`,
+              sourceChunks[index],
+            ].join("\n");
+            const sectionResponse = await this.gemmaService.requestArisAdvice(sectionPrompt);
+            const sectionText = sectionResponse.reply.trim();
+            if (!sectionText) {
+              throw new Error(`The ${entry.invocation.tool} brief section was empty.`);
+            }
+            sectionParts.push(sectionText);
+          }
+          briefSections.push(`## ${entry.invocation.tool.replace(/_/g, " ")}\n${sectionParts.join("\n\n")}`);
         }
-        if (!brief?.message?.trim() || !brief.audioText?.trim()) {
+
+        if (podcastEpisodes.length) {
+          briefSections.push([
+            "## Podcasts for today",
+            ...podcastEpisodes.map((episode: any) =>
+              `- **${episode.title || "Untitled episode"}**${episode.feedName ? ` (${episode.feedName})` : ""}${episode.publishedAt ? `, published ${episode.publishedAt}` : ""}${episode.analysis ? `\n  ${String(episode.analysis)}` : ""}`
+            ),
+          ].join("\n"));
+        }
+
+        const briefText = [
+          `# Morning Brief${userMessage ? ` — ${new Date().toLocaleDateString()}` : ""}`,
+          ...briefSections,
+        ].join("\n\n").trim();
+        if (!briefSections.length || !briefText) {
+          error("[arisService] morning brief composer received no usable source content");
           return {
             status: "error",
             reply: "I gathered your morning brief but could not prepare the text and audio delivery.",
@@ -5120,7 +5146,7 @@ export class ArisService {
         }
         const pendingAction = {
           tool: "morning_brief_send",
-          payload: { message: brief.message, audioText: brief.audioText, podcastEpisodes },
+          payload: { message: briefText, audioText: briefText, podcastEpisodes },
         };
 
         const delivery = await this.executeToolCall(userId, pendingAction, sessionId, replyToWhatsappMessage);

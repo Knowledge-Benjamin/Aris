@@ -387,6 +387,12 @@ async function setup() {
   `).catch(() => undefined);
 
   await pool.query(`
+    ALTER TABLE whatsapp_outbox
+      ADD COLUMN IF NOT EXISTS media_gcs_uri TEXT,
+      ADD COLUMN IF NOT EXISTS media_mime_type TEXT;
+  `);
+
+  await pool.query(`
     CREATE INDEX IF NOT EXISTS whatsapp_outbox_status_idx ON whatsapp_outbox(status);
   `).catch(() => undefined);
 

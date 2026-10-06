@@ -98,7 +98,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.withContext
-import kotlinx.coroutines.withFrameNanos
+import kotlinx.coroutines.yield
 import java.io.File
 import java.io.IOException
 import java.text.SimpleDateFormat
@@ -155,7 +155,7 @@ fun ChatScreen(
                     val pageCount = minOf(CHAT_PAGE_SIZE, startIndex)
                     val oldOffset = listState.firstVisibleItemScrollOffset
                     visibleStartIndex = startIndex - pageCount
-                    withFrameNanos { }
+                    yield()
                     listState.scrollToItem(firstVisibleIndex + pageCount, oldOffset)
                 }
             }
@@ -169,7 +169,7 @@ fun ChatScreen(
                 (listState.layoutInfo.visibleItemsInfo.lastOrNull()?.index ?: -1) >= visibleCountBeforeUpdate - 3)
         if (messageCount > 0 && wasNearBottom) {
             visibleStartIndex = (messageCount - CHAT_PAGE_SIZE).coerceAtLeast(0)
-            withFrameNanos { }
+            yield()
             listState.animateScrollToItem((messageCount - visibleStartIndex - 1).coerceAtLeast(0))
             hasInitializedScroll = true
         }
