@@ -369,7 +369,11 @@ export class ArisService {
         summary: observation.summary.slice(0, 800),
         recordedAt: observation.recordedAt,
       }));
-    const history = conversationHistory.slice(-8).map((item) => item.slice(0, 500));
+    const history = conversationHistory.slice(-8).map((item) =>
+      item.startsWith("Aris:") && this.isFailureReply(item.slice("Aris:".length))
+        ? `${item.slice(0, 500)} [This was a failed attempt, not a successful answer; do not reuse it as one.]`
+        : item.slice(0, 500)
+    );
     const prompt = [
       "Classify the user's latest request for Aris's tool planner.",
       "Understand meaning, paraphrases, and implied requests; do not classify by isolated keyword matches.",
@@ -381,7 +385,7 @@ export class ArisService {
       "Memory-first policy: use the supplied timestamped answer memories and relevant facts before planning tools. Reuse a matching answer for stable facts by default. Do not make a tool call just because a request is worded differently.",
       "Before choosing tools, assess what relevant memory already establishes, what it only partially establishes, and what remains unknown. Ground this assessment only in supplied memories; use remembered names, facts, sources, and dates to narrow tool choice and query scope. Do not treat partial memory as a complete answer.",
       "Force a fresh tool call when the user requests a refresh/update/check-again/latest/current answer, says the facts have changed or are stale, explicitly requests web research, or the subject is inherently volatile (time, location, weather, traffic, inbox/messages, calendar, or live news).",
-      "Set reusePriorAnswer=true only when a supplied answer memory or prior Aris reply fully answers this request and a fresh lookup is not required. If reusing memory, return its exact reuseAnswerId. If refreshing a fact represented by a supplied answer memory, return that memory's id in refreshAnswerId so the fresh result replaces it rather than becoming a stale duplicate. Set forceRefresh=true for an explicit refresh or known changed/stale information.",
+      "Set reusePriorAnswer=true only when a supplied answer memory or successful prior Aris reply fully answers this request and a fresh lookup is not required. Never reuse an Aris message marked as a failed attempt or an answer memory that describes an error. If reusing memory, return its exact reuseAnswerId. If refreshing a fact represented by a supplied answer memory, return that memory's id in refreshAnswerId so the fresh result replaces it rather than becoming a stale duplicate. Set forceRefresh=true for an explicit refresh or known changed/stale information.",
       `Web search enabled: ${searchToolEnabled}. If disabled, do not select the search category.`,
       `Recent conversation:\n${history.join("\n") || "(none)"}`,
       `Recent tool observations:\n${JSON.stringify(observations) || "[]"}`,
@@ -557,7 +561,7 @@ export class ArisService {
   }
 
   private isAwaitingApproval(conversationHistory: string[]): boolean {
-    const latestReply = [...conversationversationHistory].reverse().find((item) => item.startsWith("Aris:"));
+    const latestReply = conversationHistory[conversationHistory.length - 1];
     return Boolean(latestReply && /\b(?:approve|approval|confirm|would you like me to|shall i|should i)\b/i.test(latestReply));
   }
 
@@ -892,8 +896,13 @@ export class ArisService {
     const storedAttachment = input.mediaData
       ? await this.storeChatAttachment(input.userId, sessionId, input.message, input.mediaData)
       : undefined;
+    const priorConversationHistoryPromise = this.memoryStore.getRecentConversationHistory(input.userId, sessionId, 12).catch(err => {
+      console.error("[arisService] Failed to load conversation history:", err);
+      return [] as string[];
+    });
     const approvalMessage = /^(approve|approved|yes|yes please|send it|do it|go ahead)$/i.test(input.message.trim());
-    const storedApproval = !input.approvedAction && approvalMessage
+    const approvalContext = approvalMessage ? await priorConversationHistoryPromise : [];
+    const storedApproval = !input.approvedAction && approvalMessage && this.isAwaitingApproval(approvalContext)
       ? this.getLastToolInvocation(input.userId, sessionId)
       : undefined;
     const approvalCandidate = input.approvedAction
@@ -955,10 +964,7 @@ export class ArisService {
     const isShortConversational = /^(hey|hi|hello|thanks|thank you|ok|okay|cool|got it)[\s\p{P}]*$/iu.test(input.message.trim());
     const historyLimit = isShortConversational ? 2 : 12;
     
-    const conversationHistoryPromise = this.memoryStore.getRecentConversationHistory(input.userId, sessionId, historyLimit).catch(err => {
-      console.error("[arisService] Failed to load conversation history:", err);
-      return [] as string[];
-    });
+    const conversationHistoryPromise = priorConversationHistoryPromise.then((history) => history.slice(-historyLimit));
 
     const [userProfile, conversationHistory] = await Promise.all([userProfilePromise, conversationHistoryPromise]);
     await this.memoryStore.saveConversationMessage({
@@ -1040,8 +1046,8 @@ export class ArisService {
           12,
           5,
         );
-        memoryContext = requestMemory.memories;
-        reusableAnswers = requestMemory.answers;
+        memoryContext = requestMemory.memories.filter((memory) => !this.isFailureMemoryEntry(memory));
+        reusableAnswers = requestMemory.answers.filter((answer) => !this.isFailureReply(answer.answer));
         requestEmbedding = requestMemory.queryEmbedding;
       } catch (memoryError) {
         error("[arisService] request memory retrieval failed; routing without cached memory", memoryError);
@@ -1155,7 +1161,12 @@ export class ArisService {
       role: "aris",
       content: arisReply,
     });
-    if (input.userId && arisReply.trim().length >= 80) {
+    if (
+      input.userId
+      && toolChainResult.status === "finished"
+      && !this.isFailureReply(arisReply)
+      && arisReply.trim().length >= 80
+    ) {
       void this.extractAndStoreEvidence(
         input.userId,
         sessionId,
@@ -1174,6 +1185,7 @@ export class ArisService {
       && !isShortConversational
       && toolChainResult.status === "finished"
       && !toolChainResult.answerMemoryReused
+      && !this.isFailureReply(arisReply)
       && arisReply.trim().length >= 40
       && requestEmbedding?.length
     ) {
@@ -4677,7 +4689,12 @@ export class ArisService {
       };
     }
 
-    if (retryKeywords.test(normalized) && lastToolInvocation) {
+    const immediatelyPreviousReply = conversationHistory[conversationHistory.length - 1];
+    const followsFailedReply = Boolean(
+      immediatelyPreviousReply?.startsWith("Aris:")
+      && this.isFailureReply(immediatelyPreviousReply.slice("Aris:".length))
+    );
+    if (retryKeywords.test(normalized) && followsFailedReply && lastToolInvocation) {
       return lastToolInvocation;
     }
 
