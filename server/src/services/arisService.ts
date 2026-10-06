@@ -650,7 +650,9 @@ export class ArisService {
     if (result.success && userId && invocation.tool !== "vault_retrieve" && invocation.tool !== "vault_store") {
       void this.extractAndStoreEvidence(userId, sessionId, invocation, result);
     }
-    return observationPromise;
+    return result.success
+      ? observationPromise
+      : Promise.all([observationPromise, this.recordLastToolInvocation(userId, sessionId, invocation)]).then(() => undefined);
   }
 
   private async extractAndStoreEvidence(
@@ -2472,6 +2474,8 @@ export class ArisService {
         error: payloadError,
       };
     }
+
+    await this.recordLastToolInvocation(userId, sessionId, invocation);
 
     if (toolName.startsWith("media_library_")) {
       return this.executeMediaLibraryTool(userId, toolName, invocation.payload);
