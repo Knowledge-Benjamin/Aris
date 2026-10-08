@@ -127,47 +127,6 @@ export async function saveWhatsappGroup(jid: string, subject: string) {
   `, [jid, subject]);
 }
 
-// ─── Outbox: messages queued by Aris to be sent out ─────────────────────────
-
-export interface OutboxRecord {
-  id: number;
-  toJid: string;
-  messageType: "text" | "audio";
-  body?: string;
-  mediaGcsUri?: string;
-  mediaMimeType?: string;
-}
-
-export async function getPendingOutboxMessages(limit = 10): Promise<OutboxRecord[]> {
-  const result = await pool.query(
-    `SELECT id, to_jid, message_type, body, media_gcs_uri, media_mime_type
-     FROM whatsapp_outbox WHERE status = 'pending' ORDER BY created_at ASC LIMIT $1`,
-    [limit]
-  );
-  return result.rows.map((row) => ({
-    id: row.id,
-    toJid: row.to_jid,
-    messageType: row.message_type as "text" | "audio",
-    body: row.body ?? undefined,
-    mediaGcsUri: row.media_gcs_uri ?? undefined,
-    mediaMimeType: row.media_mime_type ?? undefined,
-  }));
-}
-
-export async function markOutboxSent(id: number): Promise<void> {
-  await pool.query(
-    `UPDATE whatsapp_outbox SET status = 'sent', sent_at = NOW() WHERE id = $1`,
-    [id]
-  );
-}
-
-export async function markOutboxFailed(id: number): Promise<void> {
-  await pool.query(
-    `UPDATE whatsapp_outbox SET status = 'failed' WHERE id = $1`,
-    [id]
-  );
-}
-
 export async function enqueueWhatsappChat(
   userId: number,
   senderJid: string,
