@@ -2925,9 +2925,7 @@ export class ArisService {
         if (!userId) return { success: false, tool: toolName, error: "User not authenticated." };
         const body = invocation.payload?.message || invocation.payload?.body || invocation.payload?.text;
         if (!body) return { success: false, tool: toolName, error: "app_send_message requires a message string." };
-        const { whatsappOutboxStore } = await import("../db/whatsappOutboxStore");
-        // to_jid="app": app-bound row — Baileys skips it; Android polls /api/aris/outbox
-        await whatsappOutboxStore.enqueue("app", "text", String(body), undefined, undefined, userId, invocation.payload?.quotedMessage);
+        await appOutboxStore.enqueueAppMessage(userId, "text", String(body), undefined, undefined, invocation.payload?.quotedMessage);
         return { success: true, tool: toolName, data: { summary: "Message queued for delivery to your Aris app." } };
       } catch (err: any) {
         return { success: false, tool: toolName, error: err?.message || "Failed to queue message." };
@@ -2980,8 +2978,7 @@ export class ArisService {
           ...(mediaLibraryId === undefined ? {} : { mediaLibraryId }),
         }));
 
-        const { whatsappOutboxStore } = await import("../db/whatsappOutboxStore");
-        const queuedItems = await whatsappOutboxStore.enqueueAppPackage(
+        const queuedItems = await appOutboxStore.enqueueAppPackage(
           userId,
           [
             { messageType: "text", body: message },
@@ -3037,15 +3034,12 @@ export class ArisService {
         if (!userId) return { success: false, tool: toolName, error: "User not authenticated." };
         const driveRef = String(invocation.payload?.driveRef || "");
         if (!driveRef.startsWith("drive:")) return { success: false, tool: toolName, error: "app_send_audio requires a Google Drive media reference." };
-        const { whatsappOutboxStore } = await import("../db/whatsappOutboxStore");
-        // to_jid="app": app-bound row — Baileys skips it; Android polls /api/aris/outbox
-        const queued = await whatsappOutboxStore.enqueue(
-          "app",
+        const queued = await appOutboxStore.enqueueAppMessage(
+          userId,
           "audio",
           undefined,
           driveRef,
           String(invocation.payload?.mimeType || "audio/mpeg"),
-          userId,
           replyToWhatsappMessage
         );
         return { success: true, tool: toolName, data: { summary: "Audio queued for delivery to your Aris app.", outboxId: queued.id } };
@@ -3059,24 +3053,26 @@ export class ArisService {
         if (!userId) return { success: false, tool: toolName, error: "User not authenticated." };
         const episodes = Array.isArray(invocation.payload?.episodes) ? invocation.payload.episodes : [];
         if (!episodes.length) return { success: false, tool: toolName, error: "No podcast episodes were provided." };
-        const { whatsappOutboxStore } = await import("../db/whatsappOutboxStore");
-        const outboxIds: number[] = [];
-        for (const episode of episodes) {
-          // to_jid="app": app-bound row — Baileys skips it; Android polls /api/aris/outbox
-          const queued = await whatsappOutboxStore.enqueue("app", "audio", undefined, episode.storageUri, episode.mimeType || "audio/mpeg", userId, replyToWhatsappMessage);
-          outboxIds.push(queued.id);
-        }
+        const queued = await appOutboxStore.enqueueAppPackage(
+          userId,
+          episodes.map((episode: any) => ({
+            messageType: "audio" as const,
+            mediaGcsUri: episode.storageUri,
+            mediaMimeType: episode.mimeType || "audio/mpeg",
+          })),
+          replyToWhatsappMessage,
+        );
+        const outboxIds = queued.map((item) => item.id);
         return { success: true, tool: toolName, data: { summary: `Queued ${outboxIds.length} podcast episodes for Aris app delivery. After listening, ask the user which ones they enjoyed to build a custom podcast list.`, outboxIds } };
       } catch (err: any) {
         return { success: false, tool: toolName, error: err?.message || "Failed to deliver podcast episodes." };
       }
     }
 
-    if (toolName === "whatsapp_outbox_history") {
+    if (toolName === "app_outbox_history") {
       try {
         if (!userId) return { success: false, tool: toolName, error: "User not authenticated." };
-        const { whatsappOutboxStore } = await import("../db/whatsappOutboxStore");
-        const messages = await whatsappOutboxStore.getAllForUser(userId);
+        const messages = await appOutboxStore.getAllForUser(userId);
         const summary = messages.length === 0
           ? "Your Aris app outbox is empty."
           : messages.map((message) => {
@@ -3095,12 +3091,11 @@ export class ArisService {
       }
     }
 
-    if (toolName === "whatsapp_outbox_cleanup") {
+    if (toolName === "app_outbox_cleanup") {
       try {
         if (!userId) return { success: false, tool: toolName, error: "User not authenticated." };
-        const { whatsappOutboxStore } = await import("../db/whatsappOutboxStore");
-        const cleared = await whatsappOutboxStore.clearPending(userId);
-        return { success: true, tool: toolName, data: { summary: `Cleared ${cleared} pending WhatsApp outbox message(s).` } };
+        const cleared = await appOutboxStore.clearPending(userId);
+        return { success: true, tool: toolName, data: { summary: `Cleared ${cleared} pending Aris app message(s).` } };
       } catch (err: any) {
         return { success: false, tool: toolName, error: err?.message || "Failed to clear Aris app outbox." };
       }
@@ -3400,7 +3395,9 @@ export class ArisService {
     if (toolName === "audio_generate") {
       try {
         const requestedDestination = String(invocation.payload?.destination || "").toLowerCase();
-        const destination = requestedDestination || (sessionId === "whatsapp-direct" ? "whatsapp" : "download");
+        const destination = requestedDestination === "whatsapp"
+          ? "app"
+          : requestedDestination || (sessionId === "whatsapp-direct" ? "app" : "download");
         const rawText = String(invocation.payload.text);
         const text = this.cleanSpeechText(rawText);
         info(`[arisService] audio_generate cleaned speech rawChars=${rawText.length} speechChars=${text.length}`);
@@ -3408,8 +3405,8 @@ export class ArisService {
           return { success: false, tool: toolName, error: "Audio text must contain the actual brief or message, not a placeholder." };
         }
         const isAppSession = sessionId?.startsWith("aris-android") || sessionId === "aris-android-chat";
-        const encoding = (destination === "whatsapp") ? "OGG_OPUS" : "MP3";
-        const speechChunks = destination === "whatsapp" || destination === "app" || destination === "download"
+        const encoding = "MP3";
+        const speechChunks = destination === "app" || destination === "download"
           ? this.splitTextForSynthesis(text)
           : [text];
         if (destination === "email" && text.length > 11000) {
@@ -3421,10 +3418,11 @@ export class ArisService {
         }
 
         // Android chat receives the attachment inline; other app-targeted requests use the app outbox.
-        if (destination === "app" || destination === "download" || (isAppSession && destination !== "whatsapp" && destination !== "email")) {
+        if (destination === "app" || destination === "download" || (isAppSession && destination !== "email")) {
           if (!userId) throw new Error("Sign in before saving generated audio to your Aris Media Library.");
           const mediaAttachments: ReturnType<typeof this.toMediaLibraryAttachment>[] = [];
           const queuedOutboxIds: number[] = [];
+          const stableAudioType = this.getStableAudioType(String(invocation.payload?.requestText || ""));
           for (let index = 0; index < speechChunks.length; index += 1) {
             const voice = await this.voiceService.synthesizeSpeech(speechChunks[index], encoding);
             const mimeType = voice.mimeType.split(";")[0].toLowerCase();
@@ -3434,18 +3432,16 @@ export class ArisService {
               `aris-audio-${Date.now()}-${index + 1}${this.getExtensionForMimeType(mimeType)}`,
               mimeType,
               Buffer.from(voice.audioBase64, "base64"),
-              "aris_generated_audio",
+              stableAudioType || "aris_generated_audio",
               speechChunks[index],
             );
             if (destination === "app" && !isAppSession) {
-              const { whatsappOutboxStore } = await import("../db/whatsappOutboxStore");
-              const queued = await whatsappOutboxStore.enqueue(
-                "app",
+              const queued = await appOutboxStore.enqueueAppMessage(
+                userId,
                 "audio",
                 undefined,
                 `drive:${media.driveFileId}`,
                 mimeType,
-                userId,
                 replyToWhatsappMessage
               );
               queuedOutboxIds.push(queued.id);
@@ -3469,56 +3465,6 @@ export class ArisService {
         }
 
         const stableAudioType = this.getStableAudioType(String(invocation.payload?.requestText || ""));
-        if (destination === "whatsapp" && stableAudioType && userId) {
-          const existingAudio = await audioContextStore.getRecentForUser(userId, 50);
-          const matchingAudio = existingAudio.find((record) => this.isReusableAudioMatch(stableAudioType, record));
-          if (matchingAudio) {
-            const { getSelfJid } = await import("../db/whatsappAuthStore");
-            const selfJid = await getSelfJid();
-            if (!selfJid) {
-              return { success: false, tool: toolName, error: "Connect your WhatsApp self-chat before sending a voice note." };
-            }
-            if (!userId) {
-              return { success: false, tool: toolName, error: "Sign in before saving generated audio to your Aris Media Library." };
-            }
-            const { whatsappOutboxStore } = await import("../db/whatsappOutboxStore");
-            const referenceCreatedAt = matchingAudio.createdAt?.getTime() ?? 0;
-            const reusableAudio = existingAudio
-              .filter((record) => {
-                if (record.sourceType !== matchingAudio.sourceType || record.chunkCount !== matchingAudio.chunkCount) return false;
-                if (!referenceCreatedAt || !record.createdAt) return true;
-                return Math.abs(record.createdAt.getTime() - referenceCreatedAt) <= 5 * 60 * 1000;
-              })
-              .sort((left, right) => left.chunkIndex - right.chunkIndex);
-            const queuedIds: number[] = [];
-            for (const record of reusableAudio) {
-              const queued = await whatsappOutboxStore.enqueue(
-                selfJid,
-                "audio",
-                undefined,
-                record.storageUri,
-                record.mimeType,
-                userId,
-                replyToWhatsappMessage
-              );
-              queuedIds.push(queued.id);
-            }
-            info(`[arisService] Reusing stable audio type=${stableAudioType} chunks=${reusableAudio.length}`);
-            return {
-              success: true,
-              tool: toolName,
-              data: {
-                summary: reusableAudio.length > 1
-                  ? `Queued ${reusableAudio.length} existing voice-note parts for your connected WhatsApp self-chat.`
-                  : "Queued an existing voice note for your connected WhatsApp self-chat.",
-                outboxIds: queuedIds,
-                reused: true,
-                sourceType: stableAudioType,
-              },
-            };
-          }
-        }
-
         const account = await this.googleAccountStore.getGoogleAccount(userId);
         if (!account) {
           return { success: false, tool: toolName, error: "Connect your Google account before sending generated audio." };
@@ -3561,64 +3507,7 @@ export class ArisService {
           return { success: true, tool: toolName, data: { summary: `Audio emailed to ${to}.`, messageId: sent.id } };
         }
 
-        const { getSelfJid } = await import("../db/whatsappAuthStore");
-        const selfJid = await getSelfJid();
-        if (!selfJid) {
-          return { success: false, tool: toolName, error: "Connect your WhatsApp self-chat before sending a voice note." };
-        }
-        const { whatsappOutboxStore } = await import("../db/whatsappOutboxStore");
-        const queuedIds: number[] = [];
-        for (let index = 0; index < speechChunks.length; index += 1) {
-          const voice = await this.voiceService.synthesizeSpeech(speechChunks[index], encoding);
-          const mimeType = voice.mimeType.split(";")[0].toLowerCase();
-          const media = await this.archiveGeneratedMedia(
-            userId,
-            sessionId,
-            `aris-audio-${Date.now()}-${index + 1}${this.getExtensionForMimeType(mimeType)}`,
-            mimeType,
-            Buffer.from(voice.audioBase64, "base64"),
-            stableAudioType || "aris_generated_audio",
-            speechChunks[index],
-          );
-          const storageUri = `drive:${media.driveFileId}`;
-          await audioContextStore.upsert({
-            userId,
-            storageUri,
-            mimeType,
-            sourceType: stableAudioType || "aris_generated_audio",
-            sourceText: speechChunks[index],
-            chunkIndex: index + 1,
-            chunkCount: speechChunks.length,
-            sessionId,
-          }).catch((contextError) => error("[arisService] Generated audio mapping failed; delivery will continue", contextError));
-          const queued = await whatsappOutboxStore.enqueue(
-            selfJid,
-            "audio",
-            undefined,
-            storageUri,
-            mimeType,
-            userId,
-            replyToWhatsappMessage
-          );
-          queuedIds.push(queued.id);
-        }
-        await this.memoryStore.storeMemoryEntry(
-          userId,
-          sessionId,
-          `Generated Aris audio sent on ${new Date().toISOString()}. Source text: ${text.slice(0, 6000)}`
-        ).catch((memoryError) => error("[arisService] Generated audio context memory failed", memoryError));
-        return {
-          success: true,
-          tool: toolName,
-          data: {
-            summary: speechChunks.length > 1
-              ? `Queued ${speechChunks.length} ordered voice-note parts for your connected WhatsApp self-chat.`
-              : "Voice note queued for your connected WhatsApp self-chat.",
-            outboxIds: queuedIds,
-            sourceText: text,
-            sourceType: "aris_generated_audio",
-          },
-        };
+        return { success: false, tool: toolName, error: `Unsupported audio destination: ${destination}` };
       } catch (err: any) {
         return { success: false, tool: toolName, error: err?.message || "Audio generation failed." };
       }
