@@ -13,6 +13,14 @@ enum class MessageStatus {
     ERROR,
 }
 
+enum class ServerHealthStatus {
+    UNKNOWN,
+    CHECKING,
+    HEALTHY,
+    RESPONDING,
+    UNREACHABLE,
+}
+
 sealed class MediaAttachment {
     abstract val uri: Uri
     abstract val base64: String
@@ -114,6 +122,8 @@ data class ChatUiState(
     val inputText: String = "",
     val stagedAttachment: MediaAttachment? = null,
     val progressMessage: String? = null,
+    val serverHealthStatus: ServerHealthStatus = ServerHealthStatus.UNKNOWN,
+    val serverHealthMessage: String = "Tap to check server",
     val isRecordingVoice: Boolean = false,
     val recordingDurationMs: Long = 0L,
     val recordingAmplitudes: List<Float> = emptyList(),
@@ -142,12 +152,20 @@ sealed interface ChatUiEvent {
     data class SeekAudio(val messageId: String, val attachmentIndex: Int, val positionMs: Long) : ChatUiEvent
     data class ReplyToMessage(val messageId: String) : ChatUiEvent
     data class RetrySend(val messageId: String) : ChatUiEvent
+    data object CheckServerStatus : ChatUiEvent
     data object ClearReply : ChatUiEvent
 }
 
 data class LoginResult(
     val token: String,
     val email: String,
+)
+
+data class ServerHealthResult(
+    val healthy: Boolean,
+    val httpStatus: Int,
+    val elapsedMs: Long,
+    val message: String,
 )
 
 data class ArisChatResult(

@@ -13,6 +13,55 @@ import java.net.URL
 class ArisApiClient(serverUrl: String, private val token: String) {
     private val baseUrl = ServerConfig.normalizeBaseUrl(serverUrl)
 
+    suspend fun checkServerHealth(): ServerHealthResult = withContext(Dispatchers.IO) {
+        val endpoint = URL("$baseUrl/health")
+        val startedAt = System.nanoTime()
+        var lastError: IOException? = null
+        repeat(HEALTH_CHECK_ATTEMPTS) { attempt ->
+            val connection = (endpoint.openConnection() as HttpURLConnection).apply {
+                requestMethod = "GET"
+                connectTimeout = HEALTH_CHECK_TIMEOUT_MS
+                readTimeout = HEALTH_CHECK_TIMEOUT_MS
+                useCaches = false
+                setRequestProperty("Accept", "application/json")
+                setRequestProperty("Cache-Control", "no-cache")
+                setRequestProperty("Connection", "close")
+            }
+            try {
+                val statusCode = connection.responseCode
+                val responseStream = if (statusCode in 200..299) connection.inputStream else connection.errorStream
+                val responseText = responseStream?.bufferedReader()?.use(BufferedReader::readText).orEmpty()
+                val elapsedMs = (System.nanoTime() - startedAt) / 1_000_000
+                val response = runCatching { JSONObject(responseText) }.getOrNull()
+                val healthy = statusCode in 200..299
+                    && response != null
+                    && response.optString("status") == "ok"
+                    && response.optString("service") == "aris"
+                return@withContext ServerHealthResult(
+                    healthy = healthy,
+                    httpStatus = statusCode,
+                    elapsedMs = elapsedMs,
+                    message = when {
+                        healthy -> "Server healthy · ${elapsedMs} ms"
+                        statusCode !in 200..299 -> "Server responded · HTTP $statusCode"
+                        else -> "Server responded · health check failed"
+                    },
+                )
+            } catch (error: IOException) {
+                lastError = error
+                if (attempt == HEALTH_CHECK_ATTEMPTS - 1) {
+                    throw IOException(
+                        "Could not reach ${endpoint.host} after $HEALTH_CHECK_ATTEMPTS attempts: ${error.message}",
+                        error,
+                    )
+                }
+            } finally {
+                connection.disconnect()
+            }
+        }
+        throw IOException("Could not reach ${endpoint.host}.", lastError)
+    }
+
     suspend fun pollOutbox(): List<JSONObject> = withContext(Dispatchers.IO) {
         val response = request("GET", "/api/aris/outbox")
         val messages = response.optJSONArray("messages") ?: JSONArray()
@@ -45,11 +94,14 @@ class ArisApiClient(serverUrl: String, private val token: String) {
         val connection = openConnection("POST", "/api/aris/chat/stream").apply {
             setRequestProperty("Content-Type", "application/json")
             setRequestProperty("Accept", "application/x-ndjson")
+            readTimeout = CHAT_STREAM_READ_TIMEOUT_MS
             doOutput = true
         }
         try {
+            android.util.Log.i(TAG, "POST /api/aris/chat/stream host=${URL(baseUrl).host}")
             connection.outputStream.use { it.write(body.toString().toByteArray(Charsets.UTF_8)) }
             val statusCode = connection.responseCode
+            android.util.Log.i(TAG, "POST /api/aris/chat/stream response=$statusCode")
             val stream = if (statusCode in 200..299) connection.inputStream else connection.errorStream
             if (statusCode !in 200..299) {
                 val errorText = stream?.bufferedReader()?.use(BufferedReader::readText).orEmpty()
@@ -259,6 +311,10 @@ class ArisApiClient(serverUrl: String, private val token: String) {
     companion object {
         private const val CONNECT_TIMEOUT_MS = 15_000
         private const val STREAM_READ_TIMEOUT_MS = 0
+        private const val CHAT_STREAM_READ_TIMEOUT_MS = 90_000
+        private const val HEALTH_CHECK_TIMEOUT_MS = 5_000
+        private const val HEALTH_CHECK_ATTEMPTS = 2
+        private const val TAG = "ArisApiClient"
 
         suspend fun login(serverUrl: String, email: String, password: String): LoginResult =
             withContext(Dispatchers.IO) {

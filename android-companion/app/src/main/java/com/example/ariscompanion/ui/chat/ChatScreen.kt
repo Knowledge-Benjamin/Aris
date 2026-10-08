@@ -241,7 +241,12 @@ fun ChatScreen(
                 }
                 Column(modifier = Modifier.weight(1f).padding(start = 11.dp)) {
                     Text("Aris", color = Color(0xFFF3F7F8), fontSize = 17.sp, fontWeight = FontWeight.SemiBold)
-                    ChatHeaderStatus(state.progressMessage)
+                    ChatHeaderStatus(
+                        progressMessage = state.progressMessage,
+                        serverHealthStatus = state.serverHealthStatus,
+                        serverHealthMessage = state.serverHealthMessage,
+                        onCheckServer = { viewModel.onEvent(ChatUiEvent.CheckServerStatus) },
+                    )
                 }
                 Text("⋮", color = Color(0xFFB8C9CF), fontSize = 24.sp, modifier = Modifier.padding(horizontal = 8.dp))
             }
@@ -581,8 +586,20 @@ private fun ReplyAction(onReply: () -> Unit) {
 }
 
 @Composable
-private fun ChatHeaderStatus(progressMessage: String?) {
+private fun ChatHeaderStatus(
+    progressMessage: String?,
+    serverHealthStatus: ServerHealthStatus,
+    serverHealthMessage: String,
+    onCheckServer: () -> Unit,
+) {
     val isActive = !progressMessage.isNullOrBlank()
+    val healthColor = when (serverHealthStatus) {
+        ServerHealthStatus.CHECKING -> Color(0xFFFFD166)
+        ServerHealthStatus.HEALTHY -> Color(0xFF75E6A4)
+        ServerHealthStatus.RESPONDING -> Color(0xFFFFD166)
+        ServerHealthStatus.UNREACHABLE -> Color(0xFFFF8B8B)
+        ServerHealthStatus.UNKNOWN -> Color(0xFF9DAAC2)
+    }
     val transition = rememberInfiniteTransition()
     val sweepProgress by transition.animateFloat(
         initialValue = 0f,
@@ -642,6 +659,28 @@ private fun ChatHeaderStatus(progressMessage: String?) {
                     strokeWidth = size.height,
                 )
             }
+        }
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .clickable(onClick = onCheckServer)
+                .padding(top = 3.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(5.dp),
+        ) {
+            Box(
+                modifier = Modifier
+                    .size(5.dp)
+                    .alpha(if (serverHealthStatus == ServerHealthStatus.CHECKING) pulseAlpha else 1f)
+                    .background(healthColor, CircleShape),
+            )
+            Text(
+                text = serverHealthMessage,
+                color = healthColor,
+                fontSize = 10.sp,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
         }
     }
 }

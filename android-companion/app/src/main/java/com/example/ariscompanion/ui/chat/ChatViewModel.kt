@@ -46,6 +46,7 @@ private const val PREF_SERVER_URL = "server_url"
 private const val PREF_EMAIL = "email"
 private const val PREF_MESSAGES = "chat_messages"
 private const val SESSION_ID = "aris-android-chat"
+private const val SERVER_HEALTH_CHECK_INTERVAL_MS = 30_000L
 
 // Amplitudes to capture for waveform visualisation
 private const val WAVEFORM_SAMPLES = 40
@@ -82,16 +83,19 @@ class ChatViewModel(private val appContext: Context) : ViewModel() {
     val uiState: StateFlow<ChatUiState> = _uiState.asStateFlow()
 
     private var outboxPollJob: Job? = null
+    private var serverHealthJob: Job? = null
     private var authToken: String? = prefs.getString(PREF_AUTH_TOKEN, null)
 
     init {
         if (authToken != null) {
             startOutboxPolling()
+            startServerHealthChecks()
         }
         viewModelScope.launch {
             ChatSession.observeLogout {
                 authToken = null
                 outboxPollJob?.cancel()
+                serverHealthJob?.cancel()
                 cancelVoiceRecording()
                 stopPlayback()
                 persistMessages(emptyList())
@@ -104,6 +108,8 @@ class ChatViewModel(private val appContext: Context) : ViewModel() {
                         inputText = "",
                         stagedAttachment = null,
                         progressMessage = null,
+                        serverHealthStatus = ServerHealthStatus.UNKNOWN,
+                        serverHealthMessage = "Tap to check server",
                         replyingTo = null,
                     )
                 }
@@ -242,6 +248,7 @@ class ChatViewModel(private val appContext: Context) : ViewModel() {
                 _uiState.update { state -> state.copy(replyingTo = state.messages.firstOrNull { it.id == event.messageId }) }
             }
             is ChatUiEvent.RetrySend -> retryFailedMessage(event.messageId)
+            ChatUiEvent.CheckServerStatus -> startServerHealthChecks()
             is ChatUiEvent.ClearReply -> _uiState.update { it.copy(replyingTo = null) }
         }
     }
@@ -268,10 +275,59 @@ class ChatViewModel(private val appContext: Context) : ViewModel() {
                         loginError = null,
                     )
                 }
+                startServerHealthChecks()
                 addSystemMessage("Connected as ${result.email}. Say hi to Aris! 👋")
             } catch (e: Exception) {
                 Log.e(TAG, "Login failed", e)
                 _uiState.update { it.copy(isLoggingIn = false, loginError = e.message ?: "Login failed") }
+            }
+        }
+    }
+
+    private fun startServerHealthChecks() {
+        serverHealthJob?.cancel()
+        serverHealthJob = viewModelScope.launch {
+            while (isActive) {
+                val api = client
+                if (api == null) {
+                    _uiState.update {
+                        it.copy(
+                            serverHealthStatus = ServerHealthStatus.UNKNOWN,
+                            serverHealthMessage = "Sign in to check server",
+                        )
+                    }
+                    return@launch
+                }
+
+                _uiState.update {
+                    it.copy(
+                        serverHealthStatus = ServerHealthStatus.CHECKING,
+                        serverHealthMessage = "Checking server…",
+                    )
+                }
+                try {
+                    val result = api.checkServerHealth()
+                    _uiState.update {
+                        it.copy(
+                            serverHealthStatus = if (result.healthy) {
+                                ServerHealthStatus.HEALTHY
+                            } else {
+                                ServerHealthStatus.RESPONDING
+                            },
+                            serverHealthMessage = result.message,
+                        )
+                    }
+                } catch (e: Exception) {
+                    if (e is CancellationException) throw e
+                    Log.w(TAG, "Server health check failed", e)
+                    _uiState.update {
+                        it.copy(
+                            serverHealthStatus = ServerHealthStatus.UNREACHABLE,
+                            serverHealthMessage = "Server unreachable · ${e.message ?: "check connection"}",
+                        )
+                    }
+                }
+                delay(SERVER_HEALTH_CHECK_INTERVAL_MS)
             }
         }
     }
@@ -300,6 +356,7 @@ class ChatViewModel(private val appContext: Context) : ViewModel() {
         viewModelScope.launch {
             val arisId = beginAssistantReply(msgId)
             try {
+                _uiState.update { it.copy(progressMessage = "Connecting to Aris…") }
                 val visionFrame = if (VisionState.isCapturing.value) {
                     withContext(Dispatchers.IO) {
                         VisionState.captureService?.captureCurrentFrameBase64()
@@ -309,7 +366,8 @@ class ChatViewModel(private val appContext: Context) : ViewModel() {
                 }
 
                 var finalResult: ArisChatResult? = null
-                syncPhoneLocation()
+                updatePhoneLocationForRequest(text)
+                _uiState.update { it.copy(progressMessage = "Sending your message…") }
                 client?.chatStream(
                     text,
                     SESSION_ID,
@@ -349,7 +407,10 @@ class ChatViewModel(private val appContext: Context) : ViewModel() {
                     }
                 }
             } catch (e: Exception) {
-                if (e is CancellationException) throw e
+                if (e is CancellationException) {
+                    showSendFailure(msgId, arisId, e)
+                    throw e
+                }
                 Log.e(TAG, "sendTextMessage failed", e)
                 showSendFailure(msgId, arisId, e)
             }
@@ -510,7 +571,8 @@ class ChatViewModel(private val appContext: Context) : ViewModel() {
             try {
                 _uiState.update { it.copy(progressMessage = "🎧 Listening to your voice note…") }
 
-                syncPhoneLocation()
+                updatePhoneLocationForRequest("voice note")
+                _uiState.update { it.copy(progressMessage = "Sending your voice note…") }
                 val result = client?.sendVoice(
                     attachment.base64,
                     attachment.mimeType,
@@ -531,7 +593,10 @@ class ChatViewModel(private val appContext: Context) : ViewModel() {
                     )
                 }
             } catch (e: Exception) {
-                if (e is CancellationException) throw e
+                if (e is CancellationException) {
+                    showSendFailure(msgId, arisId, e)
+                    throw e
+                }
                 Log.e(TAG, "Voice note send failed", e)
                 showSendFailure(msgId, arisId, e)
             }
@@ -578,7 +643,8 @@ class ChatViewModel(private val appContext: Context) : ViewModel() {
                 }
 
                 var finalResult: ArisChatResult? = null
-                syncPhoneLocation()
+                updatePhoneLocationForRequest(caption)
+                _uiState.update { it.copy(progressMessage = "Sending your attachment…") }
                 client?.sendMediaChat(
                     caption,
                     base64,
@@ -604,7 +670,10 @@ class ChatViewModel(private val appContext: Context) : ViewModel() {
                     }
                 }
             } catch (e: Exception) {
-                if (e is CancellationException) throw e
+                if (e is CancellationException) {
+                    showSendFailure(msgId, arisId, e)
+                    throw e
+                }
                 Log.e(TAG, "Media send failed", e)
                 showSendFailure(msgId, arisId, e)
             }
@@ -661,6 +730,8 @@ class ChatViewModel(private val appContext: Context) : ViewModel() {
     }
 
     private fun friendlySendFailure(cause: Exception): String = when (cause) {
+        is CancellationException ->
+            "Sending was interrupted. Your message is saved—tap Retry to try again."
         is SocketTimeoutException ->
             "I’m taking longer than expected to respond. Your message is saved—tap Retry to try again."
         is UnknownHostException, is ConnectException ->
@@ -699,7 +770,8 @@ class ChatViewModel(private val appContext: Context) : ViewModel() {
             )
             try {
                 var finalResult: ArisChatResult? = null
-                syncPhoneLocation()
+                updatePhoneLocationForRequest("approved action")
+                _uiState.update { it.copy(progressMessage = "Sending your approval…") }
                 client?.chatStream("approved", SESSION_ID, approvedActionPayload) { event ->
                     when (event.type) {
                         "progress" -> _uiState.update { it.copy(progressMessage = event.message) }
@@ -715,7 +787,16 @@ class ChatViewModel(private val appContext: Context) : ViewModel() {
                     it.copy(text = result.arisReply, status = MessageStatus.SENT, memoryUpdates = result.memoryUpdates)
                 }
             } catch (e: Exception) {
-                if (e is CancellationException) throw e
+                if (e is CancellationException) {
+                    updateMessage(arisId) {
+                        it.copy(
+                            text = "Sending the approval was interrupted. Check whether the action completed before retrying.",
+                            status = MessageStatus.SENT,
+                        )
+                    }
+                    _uiState.update { it.copy(progressMessage = null) }
+                    throw e
+                }
                 Log.e(TAG, "Approval send failed", e)
                 updateMessage(arisId) {
                     it.copy(
@@ -890,6 +971,18 @@ class ChatViewModel(private val appContext: Context) : ViewModel() {
             Log.w(TAG, "Phone location sync failed; server will use its available fallback", e)
         }
     }
+
+    private suspend fun updatePhoneLocationForRequest(message: String) {
+        if (requiresCurrentPhoneLocation(message)) {
+            syncPhoneLocation()
+        } else {
+            viewModelScope.launch { syncPhoneLocation() }
+        }
+    }
+
+    private fun requiresCurrentPhoneLocation(message: String): Boolean =
+        Regex("""\b(where am i|my (?:current )?location|current location|near me|nearby)\b""", RegexOption.IGNORE_CASE)
+            .containsMatchIn(message)
 
     private fun appendMessage(msg: ChatMessage) {
         _uiState.update {
