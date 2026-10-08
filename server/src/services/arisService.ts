@@ -23,6 +23,7 @@ import { NewsResearchStore, NewsResearchArticle } from "../db/newsResearchStore"
 import { MediaLibraryStore, MediaLibraryRecord } from "../db/mediaLibraryStore";
 import { MediaLibraryService } from "./mediaLibraryService";
 import { MorningBriefStore } from "../db/morningBriefStore";
+import { appOutboxStore } from "../db/appOutboxStore";
 
 const searchToolEnabled = process.env.SEARCH_TOOL_ENABLED?.trim().toLowerCase() !== "false" &&
   process.env.SEARCH_TOOL_ENABLED?.trim() !== "0";
@@ -315,13 +316,13 @@ export class ArisService {
     "goal_set",
     "goal_update_state",
     "goal_view_tasks",
-    // WhatsApp outbox (send to self)
+    // Authenticated Android app delivery
     "app_send_message",
     "app_send_audio",
     "app_send_audio_batch",
     "morning_brief_send",
-    "whatsapp_outbox_history",
-    "whatsapp_outbox_cleanup",
+    "app_outbox_history",
+    "app_outbox_cleanup",
     // Internet reading
     "url_read",
     "browser_read",
@@ -1121,11 +1122,6 @@ export class ArisService {
       }
     }
 
-    if (!approvedAction && sessionId === "whatsapp-direct" && this.isWhatsappNewsAudioRequest(input.message)) {
-      info("[arisService] routing WhatsApp news audio after memory grounding");
-      return this.prepareWhatsappNewsAudioApproval(input.userId, input.message);
-    }
-      
     // Catch initial save errors so they don't block the chain
     void Promise.all([...profileSavePromises, ...directMemorySavePromises]).catch(err => {
       error("[arisService] Background save failed for profile/direct memories:", err);
@@ -1249,9 +1245,9 @@ export class ArisService {
     };
   }
 
-  private isWhatsappNewsAudioRequest(message: string): boolean {
+  private isNewsAudioRequest(message: string): boolean {
     const normalized = message.toLowerCase();
-    return /news|brief/.test(normalized) && /audio|voice|speak/.test(normalized) && /whatsapp|voice note/.test(normalized);
+    return /news|brief/.test(normalized) && /audio|voice|speak/.test(normalized);
   }
 
   private isWhatsappPodcastRequest(message: string): boolean {
@@ -1358,7 +1354,7 @@ export class ArisService {
       return [{ tool: "fetch_news_podcast", payload: { batch: true } }];
     }
 
-    if (this.isWhatsappNewsAudioRequest(userMessage)) {
+    if (this.isNewsAudioRequest(userMessage)) {
       return [{ tool: "fetch_news", payload: {} }];
     }
 
@@ -1560,7 +1556,7 @@ export class ArisService {
     if (normalize.includes("browser")) return ["url_read", "search"];
     if (normalize.includes("calendar")) return ["google_calendar_events", "goal_view_tasks"];
     if (normalize.includes("gmail")) return ["google_gmail_messages", "search"];
-    if (normalize.includes("whatsapp")) return ["whatsapp_outbox_history", "app_send_message", "app_send_audio_batch"];
+    if (normalize.includes("whatsapp")) return ["app_outbox_history", "app_send_message", "app_send_audio_batch"];
     if (normalize.includes("fetch_news")) return ["search", "url_read"];
     return ["search", "browser_read"];
   }
@@ -2064,6 +2060,8 @@ export class ArisService {
       generate_speech: "audio_generate",
       whatsapp_audio: "audio_generate",
       send_audio_on_whatsapp: "audio_generate",
+      whatsapp_outbox_history: "app_outbox_history",
+      whatsapp_outbox_cleanup: "app_outbox_cleanup",
       google_gmail_find_labels: "google_gmail_label",
       google_gmail_label_list: "google_gmail_label",
       google_gmail_settings_get: "google_gmail_settings",

@@ -1,5 +1,6 @@
 import { GemmaService } from "./gemmaService";
 import { getDatabasePool } from "../db/db";
+import { appOutboxStore } from "../db/appOutboxStore";
 import { info, error } from "../utils/logger";
 import OpenAI from "openai";
 import fsPromises from "fs/promises";
@@ -144,12 +145,8 @@ export class CompanionService {
 
   private async executeSilentAction(userId: number, actionStr: string) {
     if (actionStr.startsWith("REPLY:")) {
-      // For direct replies, we MUST message the user on WhatsApp
       const replyBody = actionStr.replace("REPLY:", "").trim();
-      await this.pool.query(
-        `INSERT INTO whatsapp_outbox (user_id, to_jid, message_type, body) VALUES ($1, 'self', 'text', $2)`,
-        [userId, replyBody]
-      );
+      await appOutboxStore.enqueueAppMessage(userId, "text", replyBody);
     } else {
       // For COMPLETED or SCHEDULED, we silently log it to the context store
       // (The plannerService cron job will ingest this later)

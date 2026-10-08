@@ -2,9 +2,7 @@ import { getPendingWhatsappMessages } from "../db/whatsappStore";
 import { googleService } from "./googleService";
 import { GoogleAccountRecord } from "../db/googleAccountStore";
 import { goalsStore } from "../db/goalsStore";
-import { whatsappOutboxStore } from "../db/whatsappOutboxStore";
-import { getSelfJid } from "../db/whatsappAuthStore";
-import { gcsService } from "./gcsService";
+import { appOutboxStore } from "../db/appOutboxStore";
 import { VoiceService } from "./voiceService";
 import { GemmaService } from "./gemmaService";
 import { WeatherService } from "./weatherService";
@@ -110,70 +108,41 @@ export class PlannerService {
 
       const actionLines = session.actionItems.map(formatAction).join("\n");
 
-      // 2. Email the PDF
-      if (account?.google_email && pdfBuffer) {
-        const summaryText = [
-          `Hi Benjamin,`,
-          ``,
-          `Your meeting has ended. Here are the AI-generated notes:`,
-          ``,
-          session.runningNotes,
-          ``,
-          `── Action Items ──`,
-          actionLines,
-          ``,
-          `— Aris`
-        ].join("\n");
-
-        await googleService.sendEmail(
-          account,
-          account.google_email,
-          title,
-          summaryText,
-          { filename: "meeting-notes.pdf", mimeType: "application/pdf", contentBase64: pdfBuffer.toString("base64") }
-        ).catch(e => error("[MeetingProcessor] Email send failed", e));
-        info("[MeetingProcessor] Email with PDF sent.");
-      }
-
-      // 3. Push text summary + PDF to WhatsApp via outbox
-      const waText = [
-        `📝 *Meeting Finished!*`,
-        ``,
-        `*Summary:*`,
-        session.runningNotes.slice(0, 500),
-        session.runningNotes.length > 500 ? `_...continued in PDF_` : ``,
-        ``,
-        `*Action Items:*`,
-        ...session.actionItems.map(item => {
-          let line = `• *[${item.assignee}]* ${item.task}`;
-          if (item.temporalAnchor) line += `\n  ⏰ ${item.temporalAnchor}`;
-          if (item.spatialAnchor)  line += `\n  📍 ${item.spatialAnchor}`;
-          return line;
-        })
+      const appText = [
+        "Meeting finished",
+        "",
+        "Summary:",
+        session.runningNotes,
+        "",
+        "Action Items:",
+        ...session.actionItems.map(formatAction),
       ].join("\n");
+      const appItems: Array<{ messageType: "text" | "document"; body?: string; mediaGcsUri?: string; mediaMimeType?: string }> = [
+        { messageType: "text", body: appText },
+      ];
 
-      await pool.query(
-        `INSERT INTO whatsapp_outbox (user_id, to_jid, message_type, body)
-         SELECT $1, sender_jid, 'text', $2 FROM whatsapp_chat_inbox
-         WHERE user_id = $1 AND status = 'processed' ORDER BY created_at DESC LIMIT 1`,
-        [this.meetingUserId, waText]
-      ).catch(() => {});
-
-      // Then upload PDF to GCS and enqueue as document
-      if (pdfBuffer && gcsService) {
+      if (pdfBuffer && account) {
         try {
-          const gcsUri = await gcsService.upload(pdfBuffer, `meeting-notes-${Date.now()}.pdf`, "application/pdf");
-          await pool.query(
-            `INSERT INTO whatsapp_outbox (user_id, to_jid, message_type, body, media_gcs_uri, media_mime_type)
-             SELECT $1, sender_jid, 'document', $2, $3, 'application/pdf' FROM whatsapp_chat_inbox
-             WHERE user_id = $1 AND status = 'processed' ORDER BY created_at DESC LIMIT 1`,
-            [this.meetingUserId, "meeting-notes.pdf", gcsUri]
-          ).catch(() => {});
-          info("[MeetingProcessor] PDF queued for WhatsApp delivery.");
+          const uploaded = await googleService.uploadDriveFile(
+            account,
+            `meeting-notes-${Date.now()}.pdf`,
+            "application/pdf",
+            pdfBuffer,
+          );
+          if (!uploaded.id) throw new Error("Google Drive did not return an ID for the meeting notes PDF.");
+          appItems.push({
+            messageType: "document",
+            body: "Meeting notes.pdf",
+            mediaGcsUri: `drive:${uploaded.id}`,
+            mediaMimeType: "application/pdf",
+          });
         } catch (e) {
-          error("[MeetingProcessor] GCS upload failed", e);
+          error("[MeetingProcessor] Failed to archive meeting PDF for app delivery", e);
         }
       }
+
+      await appOutboxStore.enqueueAppPackage(this.meetingUserId, appItems);
+      info("[MeetingProcessor] Meeting summary queued for Aris app delivery.");
 
       // 4. Add action items to Google Calendar — anchored to resolvedDateTime + location
       if (account && session.actionItems.length > 0) {
@@ -424,15 +393,11 @@ Respond ONLY in valid JSON. Example:
         info(`[PlannerService] Persona shifted to: ${reasoning.persona_shift}`);
       }
 
-      // Queue urgent actions as WhatsApp self-messages (text notification to user)
       if (Array.isArray(reasoning.urgent_actions) && reasoning.urgent_actions.length > 0) {
-        const selfJid = await getSelfJid();
-        if (selfJid) {
-          const body = `⚡ *Aris Alert* ⚡\n\nBased on your latest messages, here's what needs your attention now:\n\n` +
-            reasoning.urgent_actions.map((a: string, i: number) => `${i + 1}. ${a}`).join("\n");
-          await whatsappOutboxStore.enqueue(selfJid, "text", body, undefined, undefined, userId);
-          info(`[PlannerService] Queued ${reasoning.urgent_actions.length} urgent action(s) to WhatsApp outbox`);
-        }
+        const body = `Aris Alert\n\nBased on your latest messages, here's what needs your attention now:\n\n` +
+          reasoning.urgent_actions.map((a: string, i: number) => `${i + 1}. ${a}`).join("\n");
+        await appOutboxStore.enqueueAppMessage(userId, "text", body);
+        info(`[PlannerService] Queued ${reasoning.urgent_actions.length} urgent action(s) to app outbox`);
       }
 
     } catch (err) {
@@ -443,8 +408,7 @@ Respond ONLY in valid JSON. Example:
   // ─── 2. Daily Plan Generation + TTS Morning Brief ─────────────────────────
   /**
    * Generates today's plan, blocks it on Google Calendar, synthesizes a TTS
-   * voice note via Google Wavenet, uploads to GCS, and queues it to the
-   * WhatsApp outbox so the user receives it as a voice message on wake-up.
+   * voice note and queues the brief through the authenticated Aris app.
    */
   async generateDailyPlan(userId: number, googleAccount?: GoogleAccountRecord) {
     info(`[PlannerService] Generating daily plan for user ${userId}`);
@@ -559,38 +523,37 @@ Respond ONLY in valid JSON.`;
         info(`[PlannerService] Scheduled ${tasks.length} tasks for user ${userId}`);
       }
 
-      // 2c. Synthesize TTS voice note and deliver via WhatsApp outbox
-      const selfJid = await getSelfJid();
-      if (selfJid && briefScript) {
+      if (briefScript) {
+        const taskList = tasks.map((t: any, i: number) => `${i + 1}. ${t.title}`).join("\n");
+        const textBody = `Good Morning — Aris Daily Brief\n\nToday's Mission:\n${taskList}\n\nPersona Mode: ${state.coachPersona.toUpperCase()}`;
+        const appItems: Array<{ messageType: "text" | "audio"; body?: string; mediaGcsUri?: string; mediaMimeType?: string }> = [
+          { messageType: "text", body: textBody },
+        ];
         try {
-          const taskList = tasks.map((t: any, i: number) => `${i + 1}. ${t.title}`).join("\n");
-
-          // First send a text summary card
-          const textBody = `🌅 *Good Morning — Aris Daily Brief*\n\n` +
-            `*Today's Mission:*\n${taskList}\n\n` +
-            `*Persona Mode:* ${state.coachPersona.toUpperCase()}\n\n` +
-            `_Voice note incoming ↓_`;
-          await whatsappOutboxStore.enqueue(selfJid, "text", textBody, undefined, undefined, userId);
-
-          // Then synthesize the brief as a Wavenet voice note
-          const { audioBase64, mimeType } = await voiceService.synthesizeSpeech(briefScript, "OGG_OPUS");
+          const { audioBase64, mimeType } = await voiceService.synthesizeSpeech(briefScript, "MP3");
           const audioBuffer = Buffer.from(audioBase64, "base64");
-
-          // Upload to GCS
-          const destPath = `aris-briefs/${userId}/${Date.now()}.ogg`;
-          const gcsUri = await gcsService.upload(audioBuffer, destPath, "audio/ogg");
-
-          // Queue voice note in outbox
-          await whatsappOutboxStore.enqueue(selfJid, "audio", undefined, gcsUri, "audio/ogg", userId);
-          info(`[PlannerService] Morning brief voice note queued → ${gcsUri}`);
-
-        } catch (ttsErr) {
-          error("[PlannerService] TTS/GCS delivery failed, falling back to text", ttsErr);
-          // Fallback: send as plain text
-          if (selfJid) {
-            await whatsappOutboxStore.enqueue(selfJid, "text", `🎙️ *Morning Brief*\n\n${briefScript}`, undefined, undefined, userId);
+          if (googleAccount) {
+            const normalizedMimeType = mimeType.split(";")[0].toLowerCase();
+            const uploaded = await googleService.uploadDriveFile(
+              googleAccount,
+              `aris-brief-${Date.now()}.mp3`,
+              normalizedMimeType,
+              audioBuffer,
+            );
+            if (!uploaded.id) throw new Error("Google Drive did not return an ID for the morning brief audio.");
+            appItems.push({
+              messageType: "audio",
+              mediaGcsUri: `drive:${uploaded.id}`,
+              mediaMimeType: normalizedMimeType,
+            });
+          } else {
+            error("[PlannerService] Morning brief audio was synthesized but not queued: Google account is not connected.");
           }
+        } catch (ttsErr) {
+          error("[PlannerService] TTS/Drive delivery failed; queuing the morning brief text only", ttsErr);
         }
+        await appOutboxStore.enqueueAppPackage(userId, appItems);
+        info("[PlannerService] Morning brief queued for Aris app delivery.");
       }
 
     } catch (err) {

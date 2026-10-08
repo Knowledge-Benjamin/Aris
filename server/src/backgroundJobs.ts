@@ -7,6 +7,7 @@ import { info } from "./utils/logger";
 import { ArisService } from "./services/arisService";
 import { MemoryStore } from "./db/memoryStore";
 import { ContextStore } from "./db/contextStore";
+import { appOutboxStore } from "./db/appOutboxStore";
 import { getPendingWhatsappChat, markWhatsappChatProcessed } from "./db/whatsappStore";
 import { googleService } from "./services/googleService";
 
@@ -46,11 +47,7 @@ function startWhatsappChatPoller() {
           });
           
           if (res.arisReply) {
-            // Push the reply to the WhatsApp Outbox
-            await pool.query(
-              `INSERT INTO whatsapp_outbox (user_id, to_jid, message_type, body) VALUES ($1, $2, 'text', $3)`,
-              [chat.userId, chat.senderJid, res.arisReply]
-            );
+            await appOutboxStore.enqueueAppMessage(chat.userId, "text", res.arisReply);
           }
           await markWhatsappChatProcessed(chat.id, 'processed');
         } catch (err) {
@@ -104,23 +101,8 @@ function startMeetingAlertPoller() {
             ? new Date(event.start.dateTime).toLocaleTimeString("en-US", { hour: "2-digit", minute: "2-digit" })
             : "soon";
 
-          // Push WhatsApp alert to user's self JID via outbox
-          const alertText = `📅 *${title}* starts at *${startTime}* — in about 5 minutes.\n\nShould I join and take notes? Reply "join meeting" to confirm, or send me the link directly.`;
-
-          await pool.query(
-            `INSERT INTO whatsapp_outbox (user_id, to_jid, message_type, body)
-             SELECT $1, sender_jid, 'text', $2
-             FROM whatsapp_chat_inbox
-             WHERE user_id = $1 AND status = 'processed'
-             ORDER BY created_at DESC LIMIT 1`,
-            [userId, alertText]
-          ).catch(() => {
-            // If no prior chat session exists, fall back to inserting a generic self-JID row
-            pool.query(
-              `INSERT INTO whatsapp_outbox (user_id, to_jid, message_type, body) VALUES ($1, 'self', 'text', $2)`,
-              [userId, alertText]
-            ).catch(() => {});
-          });
+          const alertText = `📅 ${title} starts at ${startTime} — in about 5 minutes.\n\nShould I join and take notes? Confirm in the Aris app, or send me the link there.`;
+          await appOutboxStore.enqueueAppMessage(userId, "text", alertText);
 
           info(`[MeetingAlertPoller] Notified user ${userId} about upcoming meeting: ${title}`);
         }
