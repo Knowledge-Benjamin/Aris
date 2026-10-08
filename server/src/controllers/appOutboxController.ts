@@ -15,9 +15,9 @@ import { appOutboxStore } from "../db/appOutboxStore";
  * {
  *   messages: Array<{
  *     id: number;
- *     messageType: "text" | "audio";
+ *     messageType: "text" | "audio" | "document";
  *     body?: string;          // for text messages
- *     mediaDriveRef?: string; // for audio: "drive:<fileId>"
+ *     mediaDriveRef?: string; // for audio/documents: "drive:<fileId>"
  *     mediaMimeType?: string;
  *     createdAt: string;      // ISO timestamp
  *   }>

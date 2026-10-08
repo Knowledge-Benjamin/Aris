@@ -163,7 +163,7 @@ class ChatViewModel(private val appContext: Context) : ViewModel() {
                 val fileId = mediaDriveRef.removePrefix("drive:")
                 try {
                     val bytes = withContext(Dispatchers.IO) {
-                        val api = client ?: throw IOException("Sign in again to retrieve this audio.")
+                        val api = client ?: throw IOException("Sign in again to retrieve this attachment.")
                         api.downloadDriveMedia(fileId)
                     }
                     val base64 = android.util.Base64.encodeToString(bytes, android.util.Base64.DEFAULT)
@@ -186,7 +186,7 @@ class ChatViewModel(private val appContext: Context) : ViewModel() {
                         )
                     }
                 } catch (e: Exception) {
-                    Log.e(TAG, "Failed to download drive audio", e)
+                    Log.e(TAG, "Failed to download app outbox attachment", e)
                 }
             }
 
