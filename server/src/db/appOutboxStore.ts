@@ -2,13 +2,12 @@ import { getDatabasePool } from "./db";
 
 const pool = getDatabasePool();
 
-export type OutboxMessageType = "text" | "audio";
+export type AppOutboxMessageType = "text" | "audio" | "document";
 
-export interface OutboxMessage {
+export interface AppOutboxMessage {
   id: number;
   userId?: number;
-  toJid: string;
-  messageType: OutboxMessageType;
+  messageType: AppOutboxMessageType;
   body?: string;
   mediaGcsUri?: string;
   mediaMimeType?: string;
@@ -19,41 +18,40 @@ export interface OutboxMessage {
 }
 
 export interface AppOutboxPackageItem {
-  messageType: OutboxMessageType;
+  messageType: AppOutboxMessageType;
   body?: string;
   mediaGcsUri?: string;
   mediaMimeType?: string;
 }
 
-export const whatsappOutboxStore = {
-  async enqueue(
-    toJid: string,
-    messageType: OutboxMessageType,
+export const appOutboxStore = {
+  async enqueueAppMessage(
+    userId: number,
+    messageType: AppOutboxMessageType,
     body?: string,
     mediaGcsUri?: string,
     mediaMimeType?: string,
-    userId?: number,
     quotedMessage?: unknown
-  ): Promise<OutboxMessage> {
-    const res = await pool.query(
+  ): Promise<AppOutboxMessage> {
+    const result = await pool.query(
       `INSERT INTO whatsapp_outbox (user_id, to_jid, message_type, body, media_gcs_uri, media_mime_type, quoted_message, status)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, 'pending') RETURNING *`,
-      [userId ?? null, toJid, messageType, body ?? null, mediaGcsUri ?? null, mediaMimeType ?? null,
+       VALUES ($1, 'app', $2, $3, $4, $5, $6, 'pending') RETURNING *`,
+      [userId, messageType, body ?? null, mediaGcsUri ?? null, mediaMimeType ?? null,
         quotedMessage === undefined ? null : JSON.stringify(quotedMessage)]
     );
-    return mapRow(res.rows[0]);
+    return mapRow(result.rows[0]);
   },
 
   async enqueueAppPackage(
     userId: number,
     items: AppOutboxPackageItem[],
     quotedMessage?: unknown
-  ): Promise<OutboxMessage[]> {
+  ): Promise<AppOutboxMessage[]> {
     if (!items.length) throw new Error("An app delivery package must contain at least one item.");
     const client = await pool.connect();
     try {
       await client.query("BEGIN");
-      const rows: OutboxMessage[] = [];
+      const rows: AppOutboxMessage[] = [];
       for (const item of items) {
         const result = await client.query(
           `INSERT INTO whatsapp_outbox (user_id, to_jid, message_type, body, media_gcs_uri, media_mime_type, quoted_message, status)
@@ -79,72 +77,49 @@ export const whatsappOutboxStore = {
     }
   },
 
-  async getAllForUser(userId: number): Promise<OutboxMessage[]> {
-    const res = await pool.query(
-      `SELECT * FROM whatsapp_outbox WHERE user_id = $1 ORDER BY created_at DESC`,
+  async getAllForUser(userId: number): Promise<AppOutboxMessage[]> {
+    const result = await pool.query(
+      `SELECT * FROM whatsapp_outbox WHERE user_id = $1 AND to_jid = 'app' ORDER BY created_at DESC`,
       [userId]
     );
-    return res.rows.map(mapRow);
+    return result.rows.map(mapRow);
   },
 
-  async getPendingForApp(userId: number, limit = 50): Promise<OutboxMessage[]> {
-    const res = await pool.query(
+  async getPendingForApp(userId: number, limit = 50): Promise<AppOutboxMessage[]> {
+    const result = await pool.query(
       `SELECT * FROM whatsapp_outbox
        WHERE user_id = $1 AND to_jid = 'app' AND status = 'pending'
        ORDER BY created_at ASC, id ASC
        LIMIT $2`,
       [userId, Math.max(1, Math.min(limit, 100))]
     );
-    return res.rows.map(mapRow);
+    return result.rows.map(mapRow);
   },
 
   async markAppSent(userId: number, id: number): Promise<boolean> {
-    const res = await pool.query(
+    const result = await pool.query(
       `UPDATE whatsapp_outbox
        SET status = 'sent', sent_at = NOW()
        WHERE id = $1 AND user_id = $2 AND to_jid = 'app' AND status = 'pending'`,
       [id, userId]
     );
-    return (res.rowCount ?? 0) > 0;
+    return (result.rowCount ?? 0) > 0;
   },
 
   async clearPending(userId: number): Promise<number> {
-    const res = await pool.query(
-      `DELETE FROM whatsapp_outbox WHERE user_id = $1 AND status = 'pending'`,
+    const result = await pool.query(
+      `DELETE FROM whatsapp_outbox WHERE user_id = $1 AND to_jid = 'app' AND status = 'pending'`,
       [userId]
     );
-    return res.rowCount ?? 0;
-  },
-
-  async getPending(limit = 20): Promise<OutboxMessage[]> {
-    const res = await pool.query(
-      `SELECT * FROM whatsapp_outbox WHERE status = 'pending' ORDER BY created_at ASC, id ASC LIMIT $1`,
-      [limit]
-    );
-    return res.rows.map(mapRow);
-  },
-
-  async markSent(id: number): Promise<void> {
-    await pool.query(
-      `UPDATE whatsapp_outbox SET status = 'sent', sent_at = NOW() WHERE id = $1`,
-      [id]
-    );
-  },
-
-  async markFailed(id: number): Promise<void> {
-    await pool.query(
-      `UPDATE whatsapp_outbox SET status = 'failed' WHERE id = $1`,
-      [id]
-    );
+    return result.rowCount ?? 0;
   },
 };
 
-function mapRow(row: any): OutboxMessage {
+function mapRow(row: any): AppOutboxMessage {
   return {
     id: row.id,
     userId: row.user_id ?? undefined,
-    toJid: row.to_jid,
-    messageType: row.message_type as OutboxMessageType,
+    messageType: row.message_type as AppOutboxMessageType,
     body: row.body ?? undefined,
     mediaGcsUri: row.media_gcs_uri ?? undefined,
     mediaMimeType: row.media_mime_type ?? undefined,
