@@ -2238,7 +2238,7 @@ export class ArisService {
           return "audio_generate requires a non-empty 'text' string.";
         }
         if (payload.destination && !["download", "app", "email", "whatsapp"].includes(String(payload.destination).toLowerCase())) {
-          return "audio_generate destination must be download, app, email, or whatsapp.";
+          return "audio_generate destination must be download, app, or email.";
         }
         break;
       case "fetch_news":
@@ -3036,7 +3036,7 @@ export class ArisService {
               const createdAt = new Date(message.createdAt).toLocaleString("en-US");
               const sentAt = message.sentAt ? new Date(message.sentAt).toLocaleString("en-US") : "not sent";
               const body = message.body || `[${message.messageType}]`;
-              return `#${message.id} [${message.status}] ${createdAt} -> ${message.toJid}\n${body}\nSent: ${sentAt}`;
+              return `#${message.id} [${message.status}] -> Aris app\n${body}\nSent: ${sentAt}`;
             }).join("\n\n");
         return {
           success: true,
@@ -3421,7 +3421,6 @@ export class ArisService {
           };
         }
 
-        const stableAudioType = this.getStableAudioType(String(invocation.payload?.requestText || ""));
         const account = await this.googleAccountStore.getGoogleAccount(userId);
         if (!account) {
           return { success: false, tool: toolName, error: "Connect your Google account before sending generated audio." };
@@ -5179,11 +5178,11 @@ export class ArisService {
         }
       }
 
-      if (this.isWhatsappNewsAudioRequest(userMessage) && initialResults[0]?.success) {
+      if (this.isNewsAudioRequest(userMessage) && initialResults[0]?.success) {
         const newsData = initialResults[0].data?.items ?? initialResults[0].data;
         const summaryPrompt = [
-          "Write a detailed, natural spoken news brief for a WhatsApp voice note.",
-          "Use only the supplied headlines and source data. Do not mention tools, contacts, phone numbers, or inability to send WhatsApp.",
+          "Write a detailed, natural spoken news brief for delivery in the authenticated Aris Android app.",
+          "Use only the supplied headlines and source data. Do not mention tools or internal reasoning.",
           "Return only the spoken script, about 90 to 150 seconds long.",
           `User request: ${userMessage}`,
           `Stories: ${JSON.stringify(newsData)}`,
@@ -5191,15 +5190,25 @@ export class ArisService {
         const scriptResponse = await this.gemmaService.requestArisAdvice(summaryPrompt);
         const script = scriptResponse.reply.trim();
         if (script.length >= 40) {
-          const pendingAction: ToolInvocation = {
+          const invocation: ToolInvocation = {
             tool: "audio_generate",
-            payload: { destination: "whatsapp", text: script },
+            payload: { destination: "app", text: script, requestText: userMessage },
           };
+          const delivery = await this.executeToolCall(userId, invocation, sessionId, replyToWhatsappMessage);
+          toolResults.push({ invocation, result: delivery });
+          if (!delivery.success) {
+            return {
+              status: "error",
+              reply: `I prepared today's news brief, but delivery to the Aris app failed: ${delivery.error || "unknown error"}`,
+              memoryEntries: [],
+            };
+          }
+          await this.finalizeSuccessfulToolChain(userId, userMessage, toolResults);
           return {
-            status: "awaiting_approval",
-            reply: "I prepared today's detailed news brief as a WhatsApp voice note. Reply APPROVE and I will send it.",
+            status: "finished",
+            reply: "I've queued today's detailed news brief in the Aris app.",
             memoryEntries: [],
-            pendingAction,
+            mediaAttachments: this.extractMediaAttachments(toolResults),
           };
         }
       }
@@ -5594,7 +5603,7 @@ export class ArisService {
     const destructiveToolPatterns = [
       /^google_calendar_(create|batch_create|update|delete|import|move|patch|clear_calendar|delete_calendar|update_acl|delete_acl)$/,
       /^google_gmail_(send|draft_send)$/,
-      /^whatsapp_outbox_cleanup$/,
+      /^app_outbox_cleanup$/,
     ];
 
     if (destructiveToolPatterns.some((pattern) => pattern.test(normalizedTool))) {
@@ -5604,11 +5613,11 @@ export class ArisService {
     if (normalizedTool === "audio_generate") {
       const requestedDestination = String(invocation.payload?.destination || "").toLowerCase();
       const isAppSession = sessionId?.startsWith("aris-android");
-      const destination = requestedDestination || (sessionId === "whatsapp-direct" ? "whatsapp" : (isAppSession ? "app" : "download"));
-      // "app" and "download" destinations return inline audio — no approval needed
-      // Email always needs approval; WhatsApp only when it's an actual WhatsApp session
+      const destination = requestedDestination === "whatsapp"
+        ? "app"
+        : requestedDestination || (sessionId === "whatsapp-direct" || isAppSession ? "app" : "download");
       if (destination === "app" || destination === "download") return false;
-      return ["email", "whatsapp"].includes(destination);
+      return destination === "email";
     }
 
     if (normalizedTool === "skill_run") {
@@ -5779,7 +5788,7 @@ export class ArisService {
       `MEETING BOT TOOL:`,
       `Use 'join_meeting' if the user asks you to join a Google Meet or Zoom meeting to take notes. Example: {"tool":"join_meeting","url":"https://meet.google.com/xyz"}`,
       `APP SEND: Use 'app_send_message' to queue a text message to the authenticated user's Aris Android app. The tool enqueues it in the outbox for the connected app session — no phone number needed. Example: {"tool":"app_send_message","message":"Don't forget your 3pm meeting!"}`,
-      `AUDIO TOOL: Use 'audio_generate' when the user asks Aris to speak, create an audio file, email audio, or send audio. Available destinations: "app" — returns the audio inline to the Android chat (no approval needed, use this when the session is the Android companion app); "download" — same as app, inline base64 return; "email" — email the file (requires approval); "whatsapp" — queues a voice note to the connected WhatsApp self-chat (requires approval). When responding in an Android app session (sessionId starts with "aris-android"), always default to destination "app". Example: {"tool":"audio_generate","text":"Here is your news brief...","destination":"app"}`,
+      `AUDIO TOOL: Use 'audio_generate' when the user asks Aris to speak or create audio. Destinations: "app" queues audio in the authenticated Aris Android app; "download" returns audio inline; "email" sends an email attachment and requires approval. Default to "app" for authenticated users, including requests originating from WhatsApp. WhatsApp is read-only and must never be used as an outbound destination. Example: {"tool":"audio_generate","text":"Here is your news brief...","destination":"app"}`,
       ...(activeCategories.has("media_library") ? [
         `ARIS MEDIA LIBRARY: User uploads and Aris-generated media are privately stored in the authenticated user's Google Drive under "Aris Media Library" and indexed with searchable descriptions. Use media_library_search for semantic lookups, media_library_list for recent items, and media_library_download to retrieve a specific mediaId or query. Set analyze=true and provide question when the user asks about file contents; this downloads and analyzes the original. Downloading without analyze attaches the original file to the response. Never claim a file is available unless a library tool returned it.`,
         `For user-uploaded media, reuse its archive reference and summary in the conversation context. Do not search the public web for a user's personal photo, video, audio, or document. If no matching item is found, say so rather than guessing.`,
@@ -5787,10 +5796,10 @@ export class ArisService {
         `Example: {"tool":"media_library_download","mediaId":42,"analyze":true,"question":"What is the invoice total and due date?"}`,
         `Example: {"tool":"media_library_download","query":"the photo of my blue bicycle"}`,
       ] : []),
-      `AUDIO NEWS RULE: When the user asks for today's news in audio on WhatsApp, first use fetch_news if no same-day result is available, then summarize the returned items into real spoken text and call audio_generate with destination "whatsapp". For an Android app request, use destination "app" instead. For a news podcast request, use fetch_news_podcast first and summarize its transcript. Never call audio_generate with "...", a placeholder.`,
+      `AUDIO NEWS RULE: For any request for today's news in audio, first use fetch_news if no same-day result is available, summarize the returned items into real spoken text, then call audio_generate with destination "app". WhatsApp is read-only; never send there. For a news podcast request, use fetch_news_podcast first and summarize its transcript. Never call audio_generate with "...", a placeholder.`,
       `Never invent tools named text_to_speech, send_audio_on_whatsapp, send_whatsapp_message, or similar. Use the exact registered tools audio_generate and app_send_message only. Never ask for a phone number or recipient — the outbox resolves the delivery target automatically.`,
-      `OUTBOX HISTORY: Use 'whatsapp_outbox_history' when the user asks to see, list, review, or retrieve all queued messages (text, audio, podcasts) for the Aris app. Returns every message regardless of pending, sent, or failed status. Example: {"tool":"whatsapp_outbox_history"}`,
-      `OUTBOX CLEANUP: Use 'whatsapp_outbox_cleanup' when the user explicitly asks to clear, cancel, or remove pending queued messages from the Aris app outbox. It takes no recipient or message field and permanently prevents pending messages from being delivered. This action requires user approval.`,
+      `OUTBOX HISTORY: Use 'app_outbox_history' when the user asks to see, list, review, or retrieve all queued messages (text, audio, podcasts) for the Aris app. Returns every app message regardless of pending, sent, or failed status. Example: {"tool":"app_outbox_history"}`,
+      `OUTBOX CLEANUP: Use 'app_outbox_cleanup' when the user explicitly asks to clear, cancel, or remove pending queued messages from the Aris app outbox. It takes no recipient or message field and permanently prevents pending app messages from being delivered. This action requires user approval.`,
       `SECURE VAULT TOOLS:`,
       `The vault is an AES-256-GCM encrypted store for any sensitive information. Use it proactively whenever the user shares or asks about sensitive data.`,
       `Use 'vault_store' to encrypt and save any sensitive value. Examples of when to use it:`,
