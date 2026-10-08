@@ -1800,49 +1800,6 @@ export class ArisService {
     info(`[arisService] completed ${taskTitleMatches.length} pending task(s) by request match userId=${userId}`);
   }
 
-  private async prepareWhatsappNewsAudioApproval(userId: number | undefined, request: string): Promise<ArisResponse> {
-    if (!userId) {
-      return { arisReply: "I need an authenticated WhatsApp user before I can send the audio brief.", memoryUpdates: [], status: "error" };
-    }
-
-    try {
-      const cacheKey = `${userId}:`;
-      const day = new Date().toISOString().slice(0, 10);
-      const cached = this.newsCache.get(cacheKey);
-      const news = cached?.day === day
-        ? cached.data
-        : await this.newsService.getTopNews(undefined, 5);
-      if (!cached || cached.day !== day) {
-        this.newsCache.set(cacheKey, { day, data: news });
-      }
-      const summaryPrompt = [
-        "Write a detailed but natural spoken news brief for an audio voice note.",
-        "Use only the supplied headlines and sources. Do not mention tools, phone numbers, or inability to send WhatsApp.",
-        "Return only the spoken script, about 90 to 150 seconds long.",
-        `User request: ${request}`,
-        `Stories: ${JSON.stringify(news)}`,
-      ].join("\n");
-      const scriptResponse = await this.gemmaService.requestArisAdvice(summaryPrompt);
-      const script = this.cleanSpeechText(scriptResponse.reply);
-      if (!script || script.length < 40) {
-        throw new Error("News brief script generation returned too little text.");
-      }
-
-      return {
-        arisReply: "I have prepared today's detailed news brief as a WhatsApp voice note. Reply APPROVE and I will send it.",
-        memoryUpdates: [],
-        status: "awaiting_approval",
-        pendingAction: {
-          tool: "audio_generate",
-          payload: { destination: "whatsapp", text: script },
-        },
-      };
-    } catch (error: any) {
-      error && console.error("[arisService] WhatsApp news audio preparation failed:", error);
-      return { arisReply: "I couldn't prepare the news audio brief right now.", memoryUpdates: [], status: "error" };
-    }
-  }
-
   private extractDirectMemoryEntries(userMessage: string): string[] {
     const normalized = userMessage.trim();
     const patterns: Array<[RegExp, (match: RegExpMatchArray) => string]> = [
