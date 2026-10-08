@@ -1,6 +1,6 @@
 import { getPendingWhatsappMessages } from "../db/whatsappStore";
 import { googleService } from "./googleService";
-import { GoogleAccountRecord } from "../db/googleAccountStore";
+import { GoogleAccountRecord, GoogleAccountStore } from "../db/googleAccountStore";
 import { goalsStore } from "../db/goalsStore";
 import { appOutboxStore } from "../db/appOutboxStore";
 import { VoiceService } from "./voiceService";
@@ -95,8 +95,7 @@ export class PlannerService {
 
     if (this.meetingUserId) {
       const pool = getDatabasePool();
-      const accountResult = await pool.query(`SELECT * FROM google_accounts WHERE user_id = $1 LIMIT 1`, [this.meetingUserId]).catch(() => null);
-      const account = accountResult?.rows?.[0];
+      const account = await new GoogleAccountStore(pool).getGoogleAccount(this.meetingUserId);
 
       // Helper: format a single ActionItem as a human-readable string
       const formatAction = (item: ActionItem) => {
@@ -105,8 +104,6 @@ export class PlannerService {
         if (item.spatialAnchor)  line += ` 📍 ${item.spatialAnchor}`;
         return line;
       };
-
-      const actionLines = session.actionItems.map(formatAction).join("\n");
 
       const appText = [
         "Meeting finished",

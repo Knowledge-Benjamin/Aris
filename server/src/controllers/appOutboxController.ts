@@ -1,5 +1,5 @@
 import { Request, Response } from "express";
-import { whatsappOutboxStore } from "../db/whatsappOutboxStore";
+import { appOutboxStore } from "../db/appOutboxStore";
 
 /**
  * GET /api/aris/outbox
@@ -30,7 +30,7 @@ export async function pollAppOutbox(req: Request, res: Response) {
       return res.status(401).json({ error: "Not authenticated." });
     }
 
-    const appPending = await whatsappOutboxStore.getPendingForApp(userId);
+    const appPending = await appOutboxStore.getPendingForApp(userId);
 
     console.log(`[appOutbox] user=${userId} pending=${appPending.length}`);
 
@@ -60,7 +60,7 @@ export async function acknowledgeAppOutboxMessage(req: Request, res: Response) {
     if (!Number.isSafeInteger(messageId) || messageId < 1) {
       return res.status(400).json({ error: "A valid outbox message ID is required." });
     }
-    const acknowledged = await whatsappOutboxStore.markAppSent(userId, messageId);
+    const acknowledged = await appOutboxStore.markAppSent(userId, messageId);
     if (!acknowledged) {
       return res.status(404).json({ error: "Pending app outbox message was not found." });
     }

@@ -147,6 +147,12 @@ class ChatViewModel(private val appContext: Context) : ViewModel() {
             val type = msg.optString("messageType", "")
             val content = msg.optString("body", msg.optString("content", ""))
             val mediaDriveRef = msg.optString("mediaDriveRef", "")
+            val mediaMimeType = msg.optString("mediaMimeType").ifBlank {
+                if (type == "document") "application/pdf" else "audio/mpeg"
+            }
+            val mediaFileName = content.ifBlank {
+                if (type == "document") "Aris document" else "Aris audio"
+            }
             val quoted = msg.optJSONObject("quotedMessage")
             val quotedText = quoted?.optString("text")?.ifEmpty { quoted.optString("body") }
 
@@ -161,22 +167,31 @@ class ChatViewModel(private val appContext: Context) : ViewModel() {
                         api.downloadDriveMedia(fileId)
                     }
                     val base64 = android.util.Base64.encodeToString(bytes, android.util.Base64.DEFAULT)
-                    val mimeType = msg.optString("mediaMimeType").ifBlank { "audio/mpeg" }
-                    val tempFile = File(appContext.cacheDir, "$fileId.audio")
+                    val isDocument = type == "document" || !mediaMimeType.startsWith("audio/")
+                    val tempFile = File(appContext.cacheDir, "$fileId${if (isDocument) ".document" else ".audio"}")
                     tempFile.writeBytes(bytes)
-                    attachment = MediaAttachment.Audio(
-                        uri = Uri.fromFile(tempFile),
-                        base64 = base64,
-                        mimeType = mimeType,
-                        fileName = msg.optString("body").ifBlank { "Aris audio" },
-                    )
+                    attachment = if (isDocument) {
+                        MediaAttachment.Document(
+                            uri = Uri.fromFile(tempFile),
+                            base64 = base64,
+                            mimeType = mediaMimeType,
+                            fileName = mediaFileName,
+                        )
+                    } else {
+                        MediaAttachment.Audio(
+                            uri = Uri.fromFile(tempFile),
+                            base64 = base64,
+                            mimeType = mediaMimeType,
+                            fileName = mediaFileName,
+                        )
+                    }
                 } catch (e: Exception) {
                     Log.e(TAG, "Failed to download drive audio", e)
                 }
             }
 
-            if (type == "audio" && attachment == null) {
-                Log.e(TAG, "Skipping undeliverable audio outbox message; ref=$mediaDriveRef")
+            if (type in setOf("audio", "document") && attachment == null) {
+                Log.e(TAG, "Skipping undeliverable media outbox message; type=$type ref=$mediaDriveRef")
                 continue
             }
 

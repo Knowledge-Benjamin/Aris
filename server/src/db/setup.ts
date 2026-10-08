@@ -397,6 +397,12 @@ async function setup() {
   `).catch(() => undefined);
 
   await pool.query(`
+    UPDATE whatsapp_outbox
+    SET status = 'failed'
+    WHERE status = 'pending' AND to_jid <> 'app';
+  `);
+
+  await pool.query(`
     CREATE TABLE IF NOT EXISTS whatsapp_chat_inbox (
       id SERIAL PRIMARY KEY,
       user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
